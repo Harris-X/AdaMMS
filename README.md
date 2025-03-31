@@ -1,6 +1,3 @@
-
-
-~~~markdown
 <h1 align="center">🚀 AdaMMS: Adaptive Model Merging for Heterogeneous Multimodal LLMs</h1>
 <p align="center">
   <img src="https://img.shields.io/badge/CVPR-2025-blue.svg" alt="CVPR 2025"/>
@@ -11,7 +8,7 @@
 
 <p align="center">🔥 Accepted to CVPR 2025!</p>
 
----
+~~~markdown
 
 ## 📘 项目简介
 
