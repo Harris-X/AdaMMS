@@ -16,10 +16,6 @@
   <a href="#中文版说明">🇨🇳 中文</a>
 </p>
 
-
-
-~~~markdown
-
 ## Introduction
 
 Recent advancements in model merging have shown great potential in combining capabilities from multiple large language models (LLMs). However, existing methods primarily focus on merging **homogeneous models** with identical architectures, struggling when applied to **heterogeneous Multimodal Large Language Models (MLLMs)** that differ in both architecture and parameter space.
@@ -37,12 +33,29 @@ We propose **AdaMMS**: **Ada**ptive **M**apping, **M**erging, and **S**earching 
 
 📊 Extensive experiments show that AdaMMS consistently outperforms previous model merging methods on various vision-language benchmarks.
 
+Here is the illustration of three steps in AdaMMS:
+
+<img src="assets/crop_head.jpg" alt="!Result" style="zoom: 33%;" />
+
+Here is the average results from different mnerging methods:
+
+<img src="assets/radar_compare.jpg" alt="!Result" style="zoom:50%;" />
+
+This is a visualization of the model outputs obtained with different alpha values：
+
+<img src="assets/crop_diff.jpg" alt="Result" style="zoom:50%;" />
+
+
+
 ---
 
 ## 🛠️ Environment Setup
 
 > ⚠️ It's recommended to set up environments **individually for each model**, then install the `lmms-eval` evaluation framework.
+>
+> 
 
+~~~markdown
 ### ✅ Example: CogVLM
 
 ```bash
@@ -102,7 +115,7 @@ pip install deepspeed  # Optional for inference acceleration
 
 ## ⚙️ Merging + Inference
 
-> 📝 Refer to `runs/` for example scripts. Logging results helps identify the best alpha.
+> 📝 Refer to `runs/` for example scripts. Logging results helps identify the best alpha. You can find more details for inference in https://github.com/EvolvingLMMs-Lab/lmms-eva .
 
 ### 🧪 Run Merge Script
 
@@ -126,7 +139,7 @@ for alpha in 1.0 0.9 0.8 0.7 0.6 0.5 0.4; do
         --base COGVLM_PATH --llava_base LLAVA_PATH
 
     # Evaluate
-    for task in "mme" "mmmu_val" "nocaps_val" "vizwiz_vqa_val" ...; do
+    for task in "mme" "mmmu_val" "nocaps_val" "vizwiz_vqa_val" "seedbench"  "gqa" "ok_vqa" "refcoco_bbox_testA" "refcocog_bbox_test" "refcoco+_bbox_testA" "mmbench" "ocrbench" ; do
         CUDA_VISIBLE_DEVICES=$GPU accelerate launch \
             --num_processes=1 \
             -m lmms_eval \
