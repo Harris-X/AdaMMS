@@ -12,8 +12,8 @@
 
 <p align="center">
   <b>🌐 Language:</b>
-  <a href="#english-version">🇺🇸 English</a> | 
-  <a href="#中文版说明">🇨🇳 中文</a>
+  <a href="https://github.com/THUNLP-MT/AdaMMS/blob/main/README.md">🇺🇸 English</a> | 
+  <a href="https://github.com/THUNLP-MT/AdaMMS/blob/main/README_CH.md">🇨🇳 中文</a>
 </p>
 
 ## Introduction
@@ -208,11 +208,14 @@ We welcome PRs and issues! 🌟
 If you find this project helpful, please cite:
 
 ```bibtex
-@misc{adamms2025,
-  title={AdaMMS: Model Merging for Heterogeneous Multimodal Large Language Models with Unsupervised Coefficient Optimization},
-  author={Yiyang Du and Xiaochan Wang},
-  booktitle={CVPR},
-  year={2025}
+@misc{du2025adamms,
+      title={AdaMMS: Model Merging for Heterogeneous Multimodal Large Language Models with Unsupervised Coefficient Optimization}, 
+      author={Yiyang Du and Xiaochen Wang and Chi Chen and Jiabo Ye and Yiru Wang and Peng Li and Ming Yan and Ji Zhang and Fei Huang and Zhifang Sui and Maosong Sun and Yang Liu},
+      year={2025},
+      eprint={2503.23733},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2503.23733}, 
 }
 ```
 
@@ -220,4 +223,4 @@ If you find this project helpful, please cite:
 
 ## 🇨🇳 中文版说明
 
-👉 请点击此链接跳转 [中文版 README](https://poe.com/chat/3b1s7x5f490w9n5qpy7#项目简介)
+👉 请点击此链接跳转 [中文版 README](https://github.com/THUNLP-MT/AdaMMS/blob/main/README_CH.md)
