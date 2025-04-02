@@ -1,8 +1,8 @@
 <h1 align="center">🚀 AdaMMS: Adaptive Model Merging for Heterogeneous Multimodal LLMs</h1>
 <p align="center">
   <img src="https://img.shields.io/badge/CVPR-2025-blue.svg" alt="CVPR 2025"/>
-  <img src="https://img.shields.io/github/stars/your-org-name/AdaMMS?style=social" alt="GitHub stars"/>
-  <img src="https://img.shields.io/github/issues/your-org-name/AdaMMS" alt="Issues"/>
+  <img src="https://img.shields.io/github/stars/THUNLP-MT/AdaMMS?style=social" alt="GitHub stars"/>
+  <img src="https://img.shields.io/github/issues/THUNLP-MT/AdaMMS" alt="Issues"/>
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"/>
 </p>
 
@@ -187,11 +187,13 @@ python search/view_log_delta_perdata_search_limit.py
 如果本项目对你有帮助，请引用我们的论文：
 
 ```bibtex
-@misc{adamms2025,
-  title={AdaMMS: Model Merging for Heterogeneous Multimodal Large Language Models with Unsupervised Coefficient Optimization},
-  author={Yiyang Du, Xioachen Wang},
-  booktitle={CVPR},
-  year={2025}
+@misc{du2025adamms,
+      title={AdaMMS: Model Merging for Heterogeneous Multimodal Large Language Models with Unsupervised Coefficient Optimization}, 
+      author={Yiyang Du and Xiaochen Wang and Chi Chen and Jiabo Ye and Yiru Wang and Peng Li and Ming Yan and Ji Zhang and Fei Huang and Zhifang Sui and Maosong Sun and Yang Liu},
+      year={2025},
+      eprint={2503.23733},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2503.23733}, 
 }
-
 ```
