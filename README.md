@@ -1,8 +1,8 @@
 <h1 align="center">🚀 AdaMMS: Adaptive Model Merging for Heterogeneous Multimodal LLMs</h1>
 <p align="center">
   <img src="https://img.shields.io/badge/CVPR-2025-blue.svg" alt="CVPR 2025"/>
-  <img src="https://img.shields.io/github/stars/your-org-name/AdaMMS?style=social" alt="GitHub stars"/>
-  <img src="https://img.shields.io/github/issues/your-org-name/AdaMMS" alt="Issues"/>
+  <img src="https://img.shields.io/github/stars/THUNLP-MT/AdaMMS?style=social" alt="GitHub stars"/>
+  <img src="https://img.shields.io/github/issues/THUNLP-MT/AdaMMS" alt="Issues"/>
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"/>
 </p>
 
