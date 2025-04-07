@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"/>
 </p>
 
-<p align="center">🔥 Accepted to CVPR 2025!</p>
+<p align="center">🔥 Accepted to CVPR 2025! <a href="https://arxiv.org/abs/2503.23733">[Paper]</a></p>
 
 ---
 
