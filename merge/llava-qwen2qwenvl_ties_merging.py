@@ -26,6 +26,19 @@ CKPT_PATH = {
     "llava-onevision-qwen" : "/yeesuanAI05/thumt/dyy/model/llava-onevision-qwen2-7b-si"
 }
 
+CKPT_PATH = {
+    "cogvlm_chat": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/THUDM_cogvlm-base-490-hf", #"/yeesuanAI05/thumt/dyy/model/cogvlm-chat-hf",
+    "cogvlm_grounding": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/THUDM_cogvlm-grounding-generalist-hf",
+    "llava": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/liuhaotian_llava-v1.5-7b",
+    "sharegpt": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Lin-Chen_ShareGPT4V-7B",
+    "vicuna-v1.5": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/lmsys_vicuna-7b-v1.5",
+    "qwen2-7B": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Qwen_Qwen2-7B-Instruct",
+    "qwen2_vl" : "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Qwen_Qwen2-VL-7B-Instruct",
+    "llava-onevision-qwen" : "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/lmms-lab_llava-onevision-qwen2-7b-si",
+}
+
+
+
 INDEX_FILENAME = {
     "cogvlm_chat": "model.safetensors.index.json",
     "cogvlm_grounding": "model.safetensors.index.json",
@@ -234,7 +247,7 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    args.output=f"/yeesuanAI05/thumt/dyy/model/checkpoints/debug/{args.strategy}-K-{str(args.K)}-llava2qwen"
+    # args.output=f"/yeesuanAI05/thumt/dyy/model/checkpoints/debug/{args.strategy}-K-{str(args.K)}-llava2qwen"
     print(args)
     # if args.reverse:
     #     CKPT_PATH['llava'] ="/yeesuanAI05/thumt/dyy/model/ShareGPT4V-7B-llava"

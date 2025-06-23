@@ -5,7 +5,7 @@
 # ==============================================================================
 
 # --- 1. 基本设置 ---
-GPU=4 # 请设置为你希望使用的 GPU ID
+GPU=2 # 请设置为你希望使用的 GPU ID
 PORT=29516 # 建议为每个独立脚本使用不同端口，避免冲突
 EVAL_BASE=./eval_results_table1 # 为本次复现创建一个独立的评测结果目录
 
@@ -14,7 +14,7 @@ QWEN2_VL_PATH="/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Qwen_Qwen2-VL-7B
 LLAVA_ONEVISION_PATH="/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/lmms-lab_llava-onevision-qwen2-7b-si"
 
 # 评测任务列表 (请根据 Table 1 的实际任务进行调整)
-TASK_LIST="mme mmmu_val seedbench gqa ok_vqa mmbench ocrbench"
+TASK_LIST="mmmu_val gqa textvqa_val vizwiz_vqa_val " # 缺少 mme seedbench ok_vqa  ocrbench
 
 # --- 2. 环境准备 ---
 echo "--- Preparing environment and directories ---"
@@ -24,10 +24,10 @@ conda activate lmms-cogvlm # 确保已激活包含 lmms-eval 和模型依赖的�
 date +"%Y-%m-%d %H:%M:%S"
 SECONDS=0
 
-# --- 3. 评测原始模型 (Baselines) ---
-echo "===================================================="
-echo "           PART 1: Evaluating Base Models"
-echo "===================================================="
+# # --- 3. 评测原始模型 (Baselines) ---
+# echo "===================================================="
+# echo "           PART 1: Evaluating Base Models"
+# echo "===================================================="
 
 # 评测 Qwen2-VL-7B (原始模型)
 echo "--- Evaluating Base Model: Qwen2-VL-7B ---"
@@ -35,17 +35,17 @@ output_path_qwen=${EVAL_BASE}/baseline_qwen2_vl
 for task in $TASK_LIST; do
     CUDA_VISIBLE_DEVICES=$GPU accelerate launch --num_processes=1 --gpu_ids $GPU --main_process_port $PORT -m lmms_eval \
         --model qwen2_vl --model_args pretrained=$QWEN2_VL_PATH \
-        --tasks $task --batch_size 2 --log_samples --output_path $output_path_qwen
+        --tasks $task --batch_size 1 --log_samples --output_path $output_path_qwen 
 done
 
-# 评测 LLaVA-OneVision-7B (原始模型)
-echo "--- Evaluating Base Model: LLaVA-OneVision-7B ---"
-output_path_onevision=${EVAL_BASE}/baseline_llava_onevision
-for task in $TASK_LIST; do
-    CUDA_VISIBLE_DEVICES=$GPU accelerate launch --num_processes=1 --gpu_ids $GPU --main_process_port $PORT -m lmms_eval \
-        --model qwen2_vl --model_args pretrained=$LLAVA_ONEVISION_PATH \
-        --tasks $task --batch_size 2 --log_samples --output_path $output_path_onevision
-done
+# # 评测 LLaVA-OneVision-7B (原始模型) 分开测
+# echo "--- Evaluating Base Model: LLaVA-OneVision-7B ---"
+# output_path_onevision=${EVAL_BASE}/baseline_llava_onevision
+# for task in $TASK_LIST; do
+#     CUDA_VISIBLE_DEVICES=$GPU accelerate launch --num_processes=1 --gpu_ids $GPU --main_process_port $PORT -m lmms_eval \
+#         --model llava_onevision --model_args pretrained=$LLAVA_ONEVISION_PATH \
+#         --tasks $task --batch_size 1 --log_samples --output_path $output_path_onevision
+# done
 
 
 # --- 4. 评测线性插值 (Linear Interpolation) ---
@@ -54,7 +54,7 @@ echo "        PART 2: Evaluating Linear Interpolation"
 echo "===================================================="
 MERGE_SCRIPT_INTERP=merge/llava-qwen2qwenvl.py
 
-for alpha in 1.0 0.9 0.8 0.7 0.6 0.5 0.4 ; do
+for alpha in 1.0 0.9 0.8 0.7 0.6 0.5 0.4  ; do #1.0 0.9 0.8 0.7 0.6 0.5 0.4
     echo "--- Merging & Evaluating with Interpolation, alpha=$alpha ---"
     ckpt_path="checkpoints/qwens-interp-alpha-${alpha}"
     
@@ -64,16 +64,16 @@ for alpha in 1.0 0.9 0.8 0.7 0.6 0.5 0.4 ; do
     for task in $TASK_LIST; do
         CUDA_VISIBLE_DEVICES=$GPU accelerate launch --num_processes=1 --gpu_ids $GPU --main_process_port $PORT -m lmms_eval \
             --model qwen2_vl --model_args pretrained=$ckpt_path \
-            --tasks $task --batch_size 8 --log_samples --output_path $output_path
+            --tasks $task --batch_size 1 --log_samples --output_path $output_path 
     done
     rm -rf $ckpt_path # 清理检查点
 done
 
 
-# --- 5. 评测非线性融合 (TIES-Merging & others) ---
-echo "===================================================="
-echo "        PART 3: Evaluating Non-Linear Merging"
-echo "===================================================="
+# # --- 5. 评测非线性融合 (TIES-Merging & others) ---
+# echo "===================================================="
+# echo "        PART 3: Evaluating Non-Linear Merging"
+# echo "===================================================="
 MERGE_SCRIPT_TIES=merge/llava-qwen2qwenvl_ties_merging.py
 
 for strategy in "task_arithmetic" "dare_ties" "metagpt"; do
@@ -88,11 +88,15 @@ for strategy in "task_arithmetic" "dare_ties" "metagpt"; do
     for task in $TASK_LIST; do
         CUDA_VISIBLE_DEVICES=$GPU accelerate launch --num_processes=1 --gpu_ids $GPU --main_process_port $PORT -m lmms_eval \
             --model qwen2_vl --model_args pretrained=$ckpt_path \
-            --tasks $task --batch_size 8 --log_samples --output_path $output_path
+            --tasks $task --batch_size 1 --log_samples --output_path $output_path
     done
     rm -rf $ckpt_path # 清理检查点
 done
 
+# 运行搜索脚本，找到最佳 alpha
+# 假设 view_log_delta_perdata_search_limit.py 可以接受一个参数来指定日志目录
+echo "==> Searching for the best alpha in logs..."
+python search/view_log_delta_perdata_search_limit.py --log_path $EVAL_BASE
 
 # --- 6. 结束 ---
 echo "===================================================="

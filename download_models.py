@@ -6,6 +6,7 @@ from huggingface_hub import snapshot_download
 MODELS_TO_DOWNLOAD = [
     # --- 主要的多模态模型 ---
     "Qwen/Qwen2-VL-7B-Instruct",
+    "Qwen/Qwen2-VL-7B",
     "llava-hf/llava-onevision-qwen2-7b-si-hf",
     "lmms-lab/llava-onevision-qwen2-7b-si",
     "THUDM/cogvlm-chat-hf",
