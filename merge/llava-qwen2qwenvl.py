@@ -25,6 +25,17 @@ CKPT_PATH = {
     "llava-onevision-qwen" : "/yeesuanAI05/thumt/dyy/model/llava-onevision-qwen2-7b-si"
 }
 
+CKPT_PATH = {
+    "cogvlm_chat": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/THUDM_cogvlm-base-490-hf", #"/yeesuanAI05/thumt/dyy/model/cogvlm-chat-hf",
+    "cogvlm_grounding": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/THUDM_cogvlm-grounding-generalist-hf",
+    "llava": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/liuhaotian_llava-v1.5-7b",
+    "sharegpt": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Lin-Chen_ShareGPT4V-7B",
+    "vicuna-v1.5": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/lmsys_vicuna-7b-v1.5",
+    "qwen2-7B": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Qwen_Qwen2-7B-Instruct",
+    "qwen2_vl" : "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Qwen_Qwen2-VL-7B-Instruct",
+    "llava-onevision-qwen" : "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/lmms-lab_llava-onevision-qwen2-7b-si",
+}
+
 INDEX_FILENAME = {
     "cogvlm_chat": "model.safetensors.index.json",
     "cogvlm_grounding": "model.safetensors.index.json",
@@ -107,14 +118,9 @@ def create_soft_link(source_path, link_path):
         source_item = os.path.join(source_path, item)
         link_item = os.path.join(link_path, item)
 
-        # # Skip files that end with '.bin'
-        # if item.endswith('.bin'):
-        #     print(f"Skipping '{item}' as it ends with '.bin'")
-        #     continue
-
-        # TODO 修改处
-        # 跳过模型权重文件和索引文件
-        if item.endswith('.safetensors') or item.endswith('.bin'):
+        # Skip files that end with '.bin'
+        if item.endswith('.bin'):
+            print(f"Skipping '{item}' as it ends with '.bin'")
             continue
 
         # If it's a file, create a symbolic link
@@ -141,7 +147,7 @@ def need_merge(name:str) -> bool:
     return False
 
 def convert(args):
-    OUTPUT_PATH = "./checkpoints/qwens"
+    OUTPUT_PATH = "/yeesuanAI05/thumt/dyy/model/checkpoints/qwens"
     alpha = args.alpha
     interpolation = args.interpolation
     print("interpolation----",interpolation)
