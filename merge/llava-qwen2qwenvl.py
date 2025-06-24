@@ -114,7 +114,7 @@ def create_soft_link(source_path, link_path):
 
         # TODO 修改处
         # 跳过模型权重文件和索引文件
-        if item.endswith('.safetensors') or item.endswith('.bin') or item.endswith('.index.json'):
+        if item.endswith('.safetensors') or item.endswith('.bin'):
             continue
 
         # If it's a file, create a symbolic link
@@ -141,7 +141,7 @@ def need_merge(name:str) -> bool:
     return False
 
 def convert(args):
-    OUTPUT_PATH = "/yeesuanAI05/thumt/dyy/model/checkpoints/qwens"
+    OUTPUT_PATH = "./checkpoints/qwens"
     alpha = args.alpha
     interpolation = args.interpolation
     print("interpolation----",interpolation)
