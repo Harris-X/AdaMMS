@@ -172,7 +172,7 @@ def convert(args):
     cogvlm_diff={}
     # re-scale by alpha
     if args.strategy:
-        vicuna = load_llama_weights(CKPT_PATH["qwen2-7B"], file_list=llava-onevision-qwen_file_list)
+        vicuna = load_llama_weights(CKPT_PATH["qwen2-7B"], file_list=llava_onevision_qwen_file_list)
         llava_merge = {}
         sharegpt_merge = {}
         for key in llava:

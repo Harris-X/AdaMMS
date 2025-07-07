@@ -10,7 +10,7 @@ MODELS_TO_DOWNLOAD = [
     "llava-hf/llava-onevision-qwen2-7b-si-hf",
     "lmms-lab/llava-onevision-qwen2-7b-si",
     "THUDM/cogvlm-chat-hf",
-    "llava-hf/llava-v1.5-7b-hf",
+    "llava-hf/llava-1.5-7b-hf",
     "liuhaotian/llava-v1.5-7b",
     "MAGAer13/mplug-owl2-llama2-7b",
     "THUDM/cogvlm-grounding-generalist-hf", # 新增
