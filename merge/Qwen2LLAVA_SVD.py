@@ -17,8 +17,8 @@ from datasets import load_dataset
 # --- Model Paths and Configs ---
 # Updated to focus on the two chosen heterogeneous models
 CKPT_PATH = {
-    "llava": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/liuhaotian_llava-v1.5-7b",
-    "qwen2": "/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Qwen_Qwen2-7B-Instruct",
+    "llava": "./downloaded_models/liuhaotian_llava-v1.5-7b",
+    "qwen2": "./downloaded_models/Qwen_Qwen2-7B-Instruct",
 }
 
 # =======================================================================================
