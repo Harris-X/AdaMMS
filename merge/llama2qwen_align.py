@@ -191,41 +191,42 @@ def match_tensors_zipit(reps_a, reps_b, target_dim):
 
 def apply_hetero_merge_to_layer(base_layer, donor_layer, Tm_b, Tm_d, Tu_b, Tu_d, alpha):
     """
-    对单个注意力层应用完整的异构合并。
-    这个函数现在正确地处理权重变换，以避免维度不匹配。
+    最终修正版：将donor权重变换到base空间，然后进行平均。
+    这能从根本上保证维度匹配。
     """
-    # 将变换矩阵移动到计算设备并设置正确的类型
     dtype = base_layer.q_proj.weight.dtype
     Tm_b, Tm_d = Tm_b.to(COMPUTE_DEVICE, dtype=dtype), Tm_d.to(COMPUTE_DEVICE, dtype=dtype)
     Tu_b, Tu_d = Tu_b.to(COMPUTE_DEVICE, dtype=dtype), Tu_d.to(COMPUTE_DEVICE, dtype=dtype)
+
+    # 1. Q, K, V 投影层 (输出空间对齐)
+    # 变换路径: Donor Space -> Shared Space -> Base Space
+    # T_d_to_b = T_unmerge_d @ T_merge_b
+    T_d_to_b = Tu_d @ Tm_b
     
-    # --- 变换和合并Q, K, V投影层 (输出变换) ---
-    # W'_donor = W_donor @ T_unmerge_donor
-    # W'_base  = W_base @ T_unmerge_base
     for proj in ['q_proj', 'k_proj', 'v_proj']:
         base_proj = getattr(base_layer, proj)
         donor_proj = getattr(donor_layer, proj)
         
-        W_b_transformed = base_proj.weight.data @ Tu_b
-        W_d_transformed = donor_proj.weight.data @ Tu_d
-
-        # 加权平均
-        base_proj.weight.data = (1 - alpha) * W_b_transformed + alpha * W_d_transformed
+        # 将donor的权重变换到base的空间
+        W_d_transformed = donor_proj.weight.data @ T_d_to_b
+        
+        # 现在 W_d_transformed 和 base_proj.weight.data 维度完全相同
+        base_proj.weight.data = (1 - alpha) * base_proj.weight.data + alpha * W_d_transformed
+        
         if base_proj.bias is not None and donor_proj.bias is not None:
-             base_proj.bias.data = (1-alpha) * base_proj.bias.data + alpha * donor_proj.bias.data
+             base_proj.bias.data = (1 - alpha) * base_proj.bias.data + alpha * donor_proj.bias.data
 
-    # --- 变换和合并输出投影层 o_proj (输入变换) ---
-    # W'_donor = T_merge_donor @ W_donor
-    # W'_base  = T_merge_base @ W_base
-    base_o_proj = base_layer.o_proj
-    donor_o_proj = donor_layer.o_proj
+    # 2. 输出投影层 o_proj (输入空间对齐)
+    # 变换路径: Base Space -> Shared Space -> Donor Space
+    # T_b_to_d = T_unmerge_b @ T_merge_d
+    T_b_to_d = Tu_b @ Tm_d
 
-    W_b_transformed = Tm_b @ base_o_proj.weight.data
-    W_d_transformed = Tm_d @ donor_o_proj.weight.data
-
-    base_o_proj.weight.data = (1 - alpha) * W_b_transformed + alpha * W_d_transformed
-    if base_o_proj.bias is not None and donor_o_proj.bias is not None:
-        base_o_proj.bias.data = (1 - alpha) * base_o_proj.bias.data + alpha * donor_o_proj.bias.data
+    # W_d_transformed = (T_b_to_d)^-1 @ W_d = T_d_to_b.T @ W_d
+    W_d_transformed = T_d_to_b.T @ donor_layer.o_proj.weight.data
+    
+    base_layer.o_proj.weight.data = (1 - alpha) * base_layer.o_proj.weight.data + alpha * W_d_transformed
+    if base_layer.o_proj.bias is not None and donor_layer.o_proj.bias is not None:
+        base_layer.o_proj.bias.data = (1 - alpha) * base_layer.o_proj.bias.data + alpha * donor_layer.o_proj.bias.data
 
 # --- 5. 主执行流程 ---
 
