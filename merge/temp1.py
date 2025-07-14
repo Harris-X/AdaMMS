@@ -66,7 +66,7 @@ def create_transformer_graph(model, model_config):
     # We define the module names that the graph will hook into
     module_map = {
         'emb': 'model.embed_tokens',
-        'emb_ln': 'model.norm',
+        'emb_ln': 'norm',
         'q': 'self_attn.q_proj',
         'k': 'self_attn.k_proj',
         'v': 'self_attn.v_proj',
@@ -110,7 +110,9 @@ def main():
 
     # 1. Create model graphs
     # Use deepcopy as the merger will modify the models in place
-    model_a, model_b = deepcopy(model_llama), deepcopy(model_qwen)
+    # model_a, model_b = deepcopy(model_llama), deepcopy(model_qwen)
+    model_a = model_llama
+    model_b = model_qwen
     graph_a = create_transformer_graph(model_a, {"name": "llama2"})
     graph_b = create_transformer_graph(model_b, {"name": "qwen2"})
     
