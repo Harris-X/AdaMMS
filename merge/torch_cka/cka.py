@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-from models.resnets import BasicBlock
-from torchvision.models.resnet import Bottleneck
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from functools import partial
@@ -10,77 +8,44 @@ from typing import List, Dict
 import matplotlib.pyplot as plt
 from .utils import add_colorbar
 
-
 class CKA:
     def __init__(self,
                  model1: nn.Module,
                  model2: nn.Module,
                  model1_name: str = None,
                  model2_name: str = None,
-                 model1_blocks: List[str] = None,
-                 model2_blocks: List[str] = None,
-                 device: str ='cpu',
-                 modeltype: str = 'ResNet',
-                 BlockorLayer: bool = True):
+                 model1_layers: List[str] = None, # 修改：直接接收层的名字列表
+                 model2_layers: List[str] = None, # 修改：直接接收层的名字列表
+                 device: str ='cpu'):
         """
+        一个通用的、与模型架构无关的CKA实现。
 
-        :param model1: (nn.Module) Neural Network 1
-        :param model2: (nn.Module) Neural Network 2
-        :param model1_name: (str) Name of model 1
-        :param model2_name: (str) Name of model 2
-        :param model1_blocks: (List) List of layers to extract features from
-        :param model2_blocks: (List) List of layers to extract features from
-        :param device: Device to run the model
-        :param modeltype: (str) Type of model. (default = 'ResNet', options = ['ResNet', 'VGG'])
-        :param BlockorLayer: (bool) If True, compares the blocks. If False, compares the layers. (default = True)
+        :param model1: (nn.Module) 神经网络 1
+        :param model2: (nn.Module) 神经网络 2
+        :param model1_name: (str) 模型1的名称
+        :param model2_name: (str) 模型2的名称
+        :param model1_layers: (List[str]) 需要从模型1中提取特征的层的名称列表
+        :param model2_layers: (List[str]) 需要从模型2中提取特征的层的名称列表
+        :param device: (str) 运行模型的设备
         """
-
         self.model1 = model1
         self.model2 = model2
-
         self.device = device
-
         self.model1_info = {}
         self.model2_info = {}
 
-        self.model_type = modeltype
-        self.BlockorLayer = BlockorLayer
-        print(f"Model type: {self.model_type}")
-
-        if model1_name is None:
-            self.model1_info['Name'] = model1.__repr__().split('(')[0]
-        else:
-            self.model1_info['Name'] = model1_name
-
-        if model2_name is None:
-            self.model2_info['Name'] = model2.__repr__().split('(')[0]
-        else:
-            self.model2_info['Name'] = model2_name
+        self.model1_info['Name'] = model1_name or model1.__repr__().split('(')[0]
+        self.model2_info['Name'] = model2_name or model2.__repr__().split('(')[0]
 
         if self.model1_info['Name'] == self.model2_info['Name']:
-            warn(f"BOTH model have identical names - {self.model2_info['Name']}. " \
-                 "It may cause confusion when interpreting the results. " \
-                 "Consider giving unique names to the models :)")
+            warn(f"两个模型名称相同: {self.model2_info['Name']}。这可能会在解释结果时引起混淆。")
 
-        self.model1_info['Blocks'] = []
-        self.model2_info['Blocks'] = []
-
+        # 直接使用传入的层列表
+        self.model1_layers = model1_layers
+        self.model2_layers = model2_layers
+        
         self.model1_features = {}
         self.model2_features = {}
-
-        if len(list(model1.modules())) > 150 and model1_blocks is None:
-            warn("Model 1 seems to have a lot of layers. " \
-                 "Consider giving a list of layers whose features you are concerned with " \
-                 "through the 'model1_blocks' parameter. Your CPU/GPU will thank you :)")
-
-        self.model1_blocks = model1_blocks
-
-        if len(list(model2.modules())) > 150 and model2_blocks is None:
-            warn("Model 2 seems to have a lot of layers. " \
-                 "Consider giving a list of layers whose features you are concerned with " \
-                 "through the 'model2_blocks' parameter. Your CPU/GPU will thank you :)")
-
-        self.model2_blocks = model2_blocks
 
         self._insert_hooks()
 
@@ -96,153 +61,164 @@ class CKA:
                    layer: nn.Module,
                    inp: torch.Tensor,
                    out: torch.Tensor):
+        """Hook函数，用于记录指定层的输出特征"""
+        # 对于Transformer，输出通常是元组 (hidden_states, ...)，我们只取 hidden_states
+        if isinstance(out, tuple):
+            feature = out[0]
+        else:
+            feature = out
 
         if model == "model1":
-            self.model1_features[name] = out
-
+            self.model1_features[name] = feature
         elif model == "model2":
-            self.model2_features[name] = out
-
+            self.model2_features[name] = feature
         else:
-            raise RuntimeError("Unknown model name for _log_layer.")
+            raise RuntimeError("未知的模型名称 for _log_layer.")
+
+    def _get_module_by_name(self, model, name):
+        """通过字符串名称获取模块"""
+        names = name.split('.')
+        module = model
+        for n in names:
+            module = getattr(module, n)
+        return module
 
     def _insert_hooks(self):
-        if self.model_type == 'ResNet':
-            metrix = BasicBlock
-        elif self.model_type == "ResNet50":
-            metrix = Bottleneck
-        else:
-            metrix = nn.ReLU
-        # Model 1
-        for name, layer in self.model1.named_modules():
-            if isinstance(layer, metrix):
-                if self.model1_blocks is not None:
-                    if name in self.model1_blocks:
-                        self.model1_info['Blocks'] += [name]
-                        layer.register_forward_hook(partial(self._log_layer, "model1", name))
-                else:
-                    self.model1_info['Blocks'] += [name]
-                    layer.register_forward_hook(partial(self._log_layer, "model1", name))
+        """
+        为self.model1_layers和self.model2_layers中指定的层注册前向钩子。
+        """
+        if self.model1_layers is None or self.model2_layers is None:
+            raise ValueError("必须提供 model1_layers 和 model2_layers 列表。")
 
-        # Model 2
-        for name, layer in self.model2.named_modules():
-            if isinstance(layer, metrix):
-                if self.model2_blocks is not None:
-                    if name in self.model2_blocks:
-                        self.model2_info['Blocks'] += [name]
-                        layer.register_forward_hook(partial(self._log_layer, "model2", name))
-                else:
+        # 为模型1注册钩子
+        for name in self.model1_layers:
+            try:
+                layer = self._get_module_by_name(self.model1, name)
+                layer.register_forward_hook(partial(self._log_layer, "model1", name))
+            except AttributeError:
+                warn(f"警告: 在模型1中未找到层 '{name}'。跳过。")
 
-                    self.model2_info['Blocks'] += [name]
-                    layer.register_forward_hook(partial(self._log_layer, "model2", name))
+
+        # 为模型2注册钩子
+        for name in self.model2_layers:
+            try:
+                layer = self._get_module_by_name(self.model2, name)
+                layer.register_forward_hook(partial(self._log_layer, "model2", name))
+            except AttributeError:
+                warn(f"警告: 在模型2中未找到层 '{name}'。跳过。")
+        
+        print(f"已为模型1的 {len(self.model1_layers)} 个层注册钩子。")
+        print(f"已为模型2的 {len(self.model2_layers)} 个层注册钩子。")
+
 
     def _HSIC(self, K, L):
         """
-        Computes the unbiased estimate of HSIC metric.
-
-        Reference: https://arxiv.org/pdf/2010.15327.pdf Eq (3)
+        计算HSIC度量的无偏估计。
+        参考: https://arxiv.org/pdf/2010.15327.pdf Eq (3)
         """
         N = K.shape[0]
-        ones = torch.ones(N, 1).to(self.device)
+        if N < 4:
+            # HSIC的无偏估计要求 N > 3
+            return 0.0
+            
+        ones = torch.ones(N, 1, device=self.device)
         result = torch.trace(K @ L)
         result += ((ones.t() @ K @ ones @ ones.t() @ L @ ones) / ((N - 1) * (N - 2))).item()
         result -= ((ones.t() @ K @ L @ ones) * 2 / (N - 2)).item()
         return (1 / (N * (N - 3)) * result).item()
 
-    def compare(self,
-                dataloader1: DataLoader,
-                dataloader2: DataLoader = None) -> None:
-        """
-        Computes the feature similarity between the models on the
-        given datasets.
-        :param dataloader1: (DataLoader)
-        :param dataloader2: (DataLoader) If given, model 2 will run on this
-                            dataset. (default = None)
-        """
+    def _center_gram(self, gram, unbiased=False):
+        """中心化Gram矩阵"""
+        if unbiased:
+            # HSIC的无偏估计不需要中心化，因为其公式内部已经处理了
+            return gram
 
+        gram = gram.clone()
+        mean = torch.mean(gram, dim=0, keepdim=True)
+        gram = gram - mean
+        gram = gram - torch.mean(gram, dim=1, keepdim=True)
+        return gram
+
+    def _cka(self, gram_x, gram_y, unbiased=False):
+        """计算两个Gram矩阵之间的CKA相似度"""
+        gram_x = self._center_gram(gram_x, unbiased)
+        gram_y = self._center_gram(gram_y, unbiased)
+        
+        # CKA score is HSIC(K, L) / sqrt(HSIC(K, K) * HSIC(L, L))
+        # 我们使用有偏估计来保持稳定性
+        scaled_hsic = (gram_x.T @ gram_y).sum()
+        norm_x = (gram_x.T @ gram_x).sum()
+        norm_y = (gram_y.T @ gram_y).sum()
+        
+        # 加上一个很小的eps防止除以零
+        eps = 1e-6
+        return scaled_hsic / (torch.sqrt(norm_x * norm_y) + eps)
+
+
+    def compare(self, dataloader1: DataLoader, dataloader2: DataLoader = None):
+        """
+        在给定的数据集上计算模型之间的特征相似度。
+        """
         if dataloader2 is None:
-            warn("Dataloader for Model 2 is not given. Using the same dataloader for both models.")
+            warn("模型2的Dataloader未提供。将为两个模型使用相同的Dataloader。")
             dataloader2 = dataloader1
 
-        self.model1_info['Dataset'] = dataloader1.dataset.__repr__().split('\n')[0]
-        self.model2_info['Dataset'] = dataloader2.dataset.__repr__().split('\n')[0]
+        self.model1_info['Dataset'] = dataloader1.dataset.__class__.__name__
+        self.model2_info['Dataset'] = dataloader2.dataset.__class__.__name__
 
-        if self.model_type == 'ResNet':
-            metrix = BasicBlock
-        elif self.model_type == "ResNet50":
-            metrix = Bottleneck
-        else:
-            metrix = nn.ReLU
-
-        n = 0
-        m = 0
-        for module in self.model1.modules():
-            if isinstance(module, metrix):
-                n += 1
+        N = len(self.model1_layers)
+        M = len(self.model2_layers)
         
-        for module in self.model2.modules():
-            if isinstance(module, metrix):
-                m += 1
+        print(f"正在比较来自 '{self.model1_info['Name']}' 的 {N} 个层和来自 '{self.model2_info['Name']}' 的 {M} 个层。")
 
-        N = len(self.model1_blocks) if self.model1_blocks is not None else n
-        M = len(self.model2_blocks) if self.model2_blocks is not None else m
-        print(f"Comparing {N} blocks from {self.model1_info['Name']} with {M} blocks from {self.model2_info['Name']}")
+        self.similarity_matrix = torch.zeros(N, M, device=self.device)
+        
+        # 使用自定义的collate_fn来处理异构tokenizer
+        def collate_for_compare(batch):
+            # 假设batch是一个元组 (batch_for_model1, batch_for_model2)
+            return batch[0], batch[1]
 
-        self.hsic_matrix = torch.zeros(N, M, 3)
+        # 这里的dataloader应该是一个能同时产出两个模型输入的迭代器
+        num_batches = len(dataloader1)
 
-        num_batches = min(len(dataloader1), len(dataloader1))
+        for (x1, *_), (x2, *_) in tqdm(zip(dataloader1, dataloader2), desc="| CKA | 比较特征", total=num_batches):
+            
+            self.model1_features.clear()
+            self.model2_features.clear()
+            
+            with torch.no_grad():
+                _ = self.model1(x1.to(self.device))
+                _ = self.model2(x2.to(self.device))
+            
+            for i, name1 in enumerate(self.model1_layers):
+                if name1 not in self.model1_features: continue
+                X = self.model1_features[name1].flatten(1) # [Batch, Features]
+                
+                # 计算Gram矩阵 K = X @ X.T
+                K = X @ X.T
+                
+                for j, name2 in enumerate(self.model2_layers):
+                    if name2 not in self.model2_features: continue
+                    Y = self.model2_features[name2].flatten(1) # [Batch, Features]
 
-        for (x1, *_), (x2, *_) in tqdm(zip(dataloader1, dataloader2), desc="| Comparing features |", total=num_batches):
+                    # 计算Gram矩阵 L = Y @ Y.T
+                    L = Y @ Y.T
+                    
+                    # 累加每个批次的CKA值
+                    self.similarity_matrix[i, j] += self._cka(K, L)
+        
+        # 对所有批次的结果取平均
+        self.similarity_matrix /= num_batches
 
-            self.model1_features = {}
-            self.model2_features = {}
-            _ = self.model1(x1.to(self.device))
-            _ = self.model2(x2.to(self.device))
+        assert not torch.isnan(self.similarity_matrix).any(), "CKA 计算结果中出现NAN"
+        return self.similarity_matrix.cpu()
 
-            for i, (name1, feat1) in enumerate(self.model1_features.items()):
-                X = feat1.flatten(1)
-                K = X @ X.t()
-                K.fill_diagonal_(0.0)
-                self.hsic_matrix[i, :, 0] += self._HSIC(K, K) / num_batches
 
-                for j, (name2, feat2) in enumerate(self.model2_features.items()):
-                    Y = feat2.flatten(1)
-                    L = Y @ Y.t()
-                    L.fill_diagonal_(0)
-                    assert K.shape == L.shape, f"Feature shape mistach! {K.shape}, {L.shape}"
-
-                    self.hsic_matrix[i, j, 1] += self._HSIC(K, L) / num_batches
-                    self.hsic_matrix[i, j, 2] += self._HSIC(L, L) / num_batches
-
-        self.hsic_matrix = self.hsic_matrix[:, :, 1] / (self.hsic_matrix[:, :, 0].sqrt() *
-                                                        self.hsic_matrix[:, :, 2].sqrt())
-
-        assert not torch.isnan(self.hsic_matrix).any(), "HSIC computation resulted in NANs"
-        return self.hsic_matrix
-
-    def export(self) -> Dict:
-        """
-        Exports the CKA data along with the respective model layer names.
-        :return:
-        """
-        return {
-            "model1_name": self.model1_info['Name'],
-            "model2_name": self.model2_info['Name'],
-            "CKA": self.hsic_matrix,
-            "model1_blocks": self.model1_info['Blocks'],
-            "model2_blocks": self.model2_info['Blocks'],
-            "dataset1_name": self.model1_info['Dataset'],
-            "dataset2_name": self.model2_info['Dataset'],
-
-        }
-
-    def plot_results(self,
-                     save_path: str = None,
-                     title: str = None):
+    def plot_results(self, save_path: str = None, title: str = None):
         fig, ax = plt.subplots()
-        im = ax.imshow(self.hsic_matrix, origin='lower', cmap='magma')
-        ax.set_xlabel(f"Blocks {self.model2_info['Name']}", fontsize=15)
-        ax.set_ylabel(f"Blocks {self.model1_info['Name']}", fontsize=15)
+        im = ax.imshow(self.similarity_matrix.cpu().numpy(), origin='lower', cmap='magma', vmin=0.0, vmax=1.0)
+        ax.set_xlabel(f"Layers {self.model2_info['Name']}", fontsize=15)
+        ax.set_ylabel(f"Layers {self.model1_info['Name']}", fontsize=15)
 
         if title is not None:
             ax.set_title(f"{title}", fontsize=18)
