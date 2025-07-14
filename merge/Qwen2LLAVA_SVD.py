@@ -28,7 +28,8 @@ CKPT_PATH = {
 # 此处以QWEN2:28层为BASE.
 
 # 确定运行设备 (如果可用，则使用 GPU)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cpu")  # 强制使用 CPU 进行调试
 print(f"使用的设备: {device}")
 
 
@@ -50,10 +51,10 @@ def register_hooks_for_model(model):
     
     # 关键组件列表 - 这些是我们特别关注的模块
     key_components = [
-        "input_layernorm",
-        "post_attention_layernorm",
+        # "input_layernorm",
+        # "post_attention_layernorm",
         "self_attn",
-        "mlp"
+        # "mlp"
     ]
     
     # 关键子组件列表 - 这些是我们想要深入捕获的子模块
@@ -284,18 +285,11 @@ def compute_cka(layer_reps1, layer_reps2, device='cuda'):
     return cka_matrix, layer_names1, layer_names2
 
 def plot_cka_heatmap(cka_matrix, layer_names1, layer_names2, title="CKA相似度", save_path=None):
-    """
-    绘制CKA相似度热图
-    
-    参数:
-    cka_matrix: CKA相似度矩阵
-    layer_names1: 第一个模型的层名列表
-    layer_names2: 第二个模型的层名列表
-    title: 图表标题
-    save_path: 保存路径，如果为None则不保存
-    """
     import matplotlib.pyplot as plt
     import numpy as np
+    
+    # 设置英文标题，避免中文渲染问题
+    english_title = title.replace("相似度", "Similarity").replace("模型", "Model").replace("层", "Layers")
     
     # 简化层名以便显示
     def simplify_name(name):
@@ -310,9 +304,9 @@ def plot_cka_heatmap(cka_matrix, layer_names1, layer_names2, title="CKA相似度
     plt.figure(figsize=(10, 8))
     plt.imshow(cka_matrix.cpu().numpy(), cmap='viridis', aspect='auto')
     plt.colorbar()
-    plt.xlabel('模型2层')
-    plt.ylabel('模型1层')
-    plt.title(title)
+    plt.xlabel('Model 2 Layers')
+    plt.ylabel('Model 1 Layers')
+    plt.title(english_title)
     
     # 如果层数不多，显示所有层名
     if len(simple_names2) <= 20:
@@ -338,7 +332,7 @@ def plot_cka_heatmap(cka_matrix, layer_names1, layer_names2, title="CKA相似度
     
     plt.show()
 
-def find_layer_mappings(cka_matrix, layer_names1, layer_names2, threshold=0.7):
+def find_layer_mappings(cka_matrix, layer_names1, layer_names2, threshold=0.1):
     """
     根据CKA相似度找到两个模型之间的层级映射关系
     
@@ -404,6 +398,15 @@ def test_cka_alignment():
     plot_cka_heatmap(cka_matrix, layer_names1, layer_names2, 
                     title=f"CKA相似度: {model_id1.split('/')[-1]} vs {model_id2.split('/')[-1]}")
     
+    print(f"CKA矩阵统计: 最小值={cka_matrix.min().item():.4f}, 最大值={cka_matrix.max().item():.4f}, 平均值={cka_matrix.mean().item():.4f}")
+    
+    # 打印前10个最高相似度的层对
+    flat_indices = torch.argsort(cka_matrix.flatten(), descending=True)[:10]
+    rows = flat_indices // cka_matrix.shape[1]
+    cols = flat_indices % cka_matrix.shape[1]
+    print("\n前10个相似度最高的层对:")
+    for i, (r, c) in enumerate(zip(rows, cols)):
+        print(f"{i+1}. {layer_names1[r]} - {layer_names2[c]}: {cka_matrix[r, c].item():.4f}")
     # 找到层级映射关系
     mappings = find_layer_mappings(cka_matrix, layer_names1, layer_names2)
     
@@ -478,7 +481,7 @@ def test_cka_alignment_sequential():
     plot_cka_heatmap(cka_matrix, layer_names1, layer_names2, title=plot_title)
     
     # 找到层级映射关系
-    mappings = find_layer_mappings(cka_matrix, layer_names1, layer_names2, threshold=0.6)
+    mappings = find_layer_mappings(cka_matrix, layer_names1, layer_names2, threshold=0.1)
     
     print("\n层级映射关系:")
     for layer1, (layer2, sim) in mappings.items():
@@ -492,9 +495,9 @@ def test_cka_alignment_sequential():
 
 # 修改主函数调用
 if __name__ == "__main__":
-    # test_cka_alignment()  # 原始函数 - 会导致内存错误
-    test_cka_alignment_sequential()  # 使用顺序处理的新函数
-
+    test_cka_alignment()  # 原始函数 - 会导致内存错误
+    # test_cka_alignment_sequential()  # 使用顺序处理的新函数
+    # test()
 
 
 
