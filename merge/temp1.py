@@ -43,7 +43,7 @@ def load_model_and_tokenizer(model_id):
     print(f"{model_id.split('/')[-1]} model loaded.")
     return tokenizer, model
 
-def prepare_dataloader(dataset_name="wikitext", split="test", max_samples=32, batch_size=4, max_length=128):
+def prepare_dataloader(dataset_name="wikitext", split="test", max_samples=32, batch_size=1, max_length=128):
     """Loads and prepares a dataset for feature extraction."""
     print(f"Loading dataset: {dataset_name}...")
     dataset = load_dataset(dataset_name, "wikitext-2-raw-v1", split=split)
