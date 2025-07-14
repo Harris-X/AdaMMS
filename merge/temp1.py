@@ -1,187 +1,361 @@
+################################################################################
+#
+#       完整、独立的异构大语言模型合并脚本 (直接操作层版本)
+#       LLaMA2-7B & Qwen2-7B
+#
+################################################################################
+
 import os
-import gc
+import random
 import torch
 import torch.nn as nn
+import gc
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset, Dataset
-from torch.utils.data import DataLoader
+from datasets import load_dataset
+import numpy as np
 from copy import deepcopy
 
-# --- Import from the provided repository files ---
-# Ensure these files are in the correct directories as specified in the setup
-from torch_cka.cka import CKA
-from graphs.transformer_enc_graph import TransformerEncoderGraph
-from model_merger import ModelMerge
-from matching_functions import match_tensors_zipit
-from metric_calculators import CovarianceMetric
-
-# --- 1. Core Configuration ---
+# --- 1. 核心配置 ---
 CKPT_PATH = {
     "llama2": "./downloaded_models/Llama-2-7b-hf",
     "qwen2": "./downloaded_models/Qwen2-7B-Instruct",
 }
-# Automatically select CUDA if available
-device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+# 定义计算设备。如果显存不足，可将一个模型加载到CPU
+MODEL_DEVICE_A = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
+MODEL_DEVICE_B = torch.device("cuda:5" if torch.cuda.is_available() else "cpu") # 也可设置为 "cpu"
+COMPUTE_DEVICE = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
+print(f"模型A设备: {MODEL_DEVICE_A}, 模型B设备: {MODEL_DEVICE_B}, 计算设备: {COMPUTE_DEVICE}")
 
+# --- 2. 辅助函数 (模型与数据加载) ---
 
-# --- 2. Helper Functions (Model Loading, Dataset, Graph Creation) ---
-
-def load_model_and_tokenizer(model_id):
-    """Loads a model and tokenizer, using bfloat16 for memory efficiency."""
-    print(f"Loading model: {model_id}...")
+def load_model_and_tokenizer(model_id, device):
+    """通用模型加载函数"""
+    print(f"正在加载模型: {model_id} -> {device}...")
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
+        model_id, 
+        torch_dtype=torch.bfloat16, 
         trust_remote_code=True,
         low_cpu_mem_usage=True
-    ).to(device).eval()
+    ).to(device)
+    model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    print(f"{model_id.split('/')[-1]} model loaded.")
+    print(f"{model_id.split('/')[-1]} 模型加载完成。")
     return tokenizer, model
 
-def prepare_dataloader(dataset_name="wikitext", split="test", max_samples=32, batch_size=1, max_length=128):
-    """Loads and prepares a dataset for feature extraction."""
-    print(f"Loading dataset: {dataset_name}...")
-    dataset = load_dataset(dataset_name, "wikitext-2-raw-v1", split=split)
-    
-    # Use a subset for efficiency
-    if len(dataset) > max_samples:
-        dataset = dataset.select(range(max_samples))
-    
-    # Filter out empty or whitespace-only texts
-    dataset = dataset.filter(lambda example: example['text'] and example['text'].strip())
-    
-    # We only need the raw text for this dataloader
-    return DataLoader(dataset, batch_size=batch_size)
-    
-def create_transformer_graph(model, model_config):
-    """Creates a graph representation for a given transformer model."""
-    print(f"Creating graph for {model_config['name']}...")
+def prepare_dataloader(tokenizer_a, tokenizer_b, dataset_name="wikitext", max_samples=32, batch_size=2, max_length=256):
+    """加载并为两个不同的分词器准备数据集"""
+    print(f"正在加载并准备数据集: {dataset_name}...")
+    dataset = load_dataset(dataset_name, "wikitext-2-raw-v1", split="test").select(range(max_samples))
+    dataset = dataset.filter(lambda ex: ex.get('text') and ex['text'].strip())
 
-    # Adapt the 'bert' graph function from the repository for our models
-    # We define the module names that the graph will hook into
-    module_map = {
-        'emb': 'model.embed_tokens',
-        'emb_ln': 'norm',
-        'q': 'self_attn.q_proj',
-        'k': 'self_attn.k_proj',
-        'v': 'self_attn.v_proj',
-        'lin_attn': 'self_attn.o_proj',
-        'attn_ln': 'post_attention_layernorm',
-        'fc1': 'mlp.gate_proj', # Using gate_proj as one of the FF layers
-        'fc2': 'mlp.down_proj',
-        'final_ln': 'input_layernorm',
-        'head_pref': None,
-        'pooler': None,
-        'classifier': 'lm_head',
-    }
-
-    return TransformerEncoderGraph(
-        model,
-        modules=module_map,
-        layer_name='model.layers',
-        enc_prefix='model',
-        merge_type='all',
-        num_layers=model.config.num_hidden_layers,
-        num_heads=model.config.num_attention_heads,
-        qk=True, # Assumes Q and K are processed together for similarity
-        name=model_config['name'],
-        classifier=True
-    ).graphify()
-
-
-# --- 3. Main Execution ---
-
-def main():
-    # --- Load Models and Tokenizers ---
-    tokenizer_llama, model_llama = load_model_and_tokenizer(CKPT_PATH["llama2"])
-    tokenizer_qwen, model_qwen = load_model_and_tokenizer(CKPT_PATH["qwen2"])
-
-    # --- Prepare DataLoader ---
-    # The dataloader will yield batches of raw text. We'll tokenize on the fly.
-    dataloader_raw = prepare_dataloader(max_samples=64, batch_size=4, max_length=256)
-
-    # --- Model Merging Process ---
-    print("\n--- Starting Heterogeneous Model Merging ---")
-
-    # 1. Create model graphs
-    # Use deepcopy as the merger will modify the models in place
-    # model_a, model_b = deepcopy(model_llama), deepcopy(model_qwen)
-    model_a = model_llama
-    model_b = model_qwen
-    graph_a = create_transformer_graph(model_a, {"name": "llama2"})
-    graph_b = create_transformer_graph(model_b, {"name": "qwen2"})
-    
-    # 2. Initialize the ModelMerge class
-    merger = ModelMerge(graph_a, graph_b, device=device)
-
-    # 3. Create a custom dataloader for the merger
-    # This loader tokenizes each batch for both models
     def collate_fn(batch):
         texts = [item['text'] for item in batch]
-        inputs_a = tokenizer_llama(texts, padding=True, truncation=True, return_tensors="pt", max_length=256)
-        inputs_b = tokenizer_qwen(texts, padding=True, truncation=True, return_tensors="pt", max_length=256)
-        # The merger expects a tuple of (inputs, labels or None)
-        return (inputs_a.to(device), inputs_b.to(device)), None
+        inputs_a = tokenizer_a(texts, padding=True, truncation=True, return_tensors="pt", max_length=max_length)
+        inputs_b = tokenizer_b(texts, padding=True, truncation=True, return_tensors="pt", max_length=max_length)
+        return {"inputs_a": inputs_a, "inputs_b": inputs_b}
 
-    merger_dataloader = DataLoader(dataloader_raw.dataset, batch_size=dataloader_raw.batch_size, collate_fn=collate_fn)
+    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
+
+def get_module_by_name(model, module_name):
+    """通过字符串名称安全地获取模块"""
+    for part in module_name.split('.'):
+        model = getattr(model, part, None)
+        if model is None: return None
+    return model
+
+def register_hooks_for_reps(model, layer_names):
+    """为指定层注册钩子以捕获输出激活，并立即转移到CPU以节省显存"""
+    reps = {name: [] for name in layer_names}
+    hooks = []
     
-    # Override the default compute_intermediates to handle two different tokenizations
-    def custom_compute_intermediates(self, x):
-        x_a, x_b = x
-        self.graphs[0].model.eval()
-        self.graphs[1].model.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast():
-            self.graphs[0].intermediates = {}
-            self.graphs[0].model(**x_a)
+    def hook_fn(name):
+        def hook(module, input, output):
+            # Transformer层的输出通常是元组 (hidden_states, ...)
+            hidden_states = output[0] if isinstance(output, tuple) else output
+            reps[name].append(hidden_states.detach().cpu())
+        return hook
+
+    for name in layer_names:
+        module = get_module_by_name(model, name)
+        if module:
+            hooks.append(module.register_forward_hook(hook_fn(name)))
+        else:
+            print(f"警告: 在模型中未找到层 '{name}'，无法注册钩子。")
             
-            self.graphs[1].intermediates = {}
-            self.graphs[1].model(**x_b)
+    return reps, hooks
 
-            return [self.graphs[0].intermediates, self.graphs[1].intermediates]
+
+# --- 3. 核心算法：CKA & 深度对齐 (LMA) ---
+
+def center_gram(gram):
+    """中心化Gram矩阵"""
+    if gram.shape[0] == 0: return gram
+    gram = gram.clone()
+    gram -= gram.mean(dim=0, keepdim=True)
+    gram -= gram.mean(dim=1, keepdim=True)
+    return gram
+
+def cka(gram_k, gram_l):
+    """计算中心核对齐(CKA)"""
+    gram_k = center_gram(gram_k.float())
+    gram_l = center_gram(gram_l.float())
+    
+    # CKA score = HSIC(K, L) / sqrt(HSIC(K, K) * HSIC(L, L))
+    scaled_hsic = torch.sum(gram_k * gram_l)
+    norm_k = torch.norm(gram_k)
+    norm_l = torch.norm(gram_l)
+    
+    return scaled_hsic / (norm_k * norm_l) if norm_k != 0 and norm_l != 0 else torch.tensor(0.0)
+
+def compute_cka_matrix(reps1, reps2, names1, names2, max_tokens=4096):
+    """高效计算CKA相似度矩阵，通过采样token来管理内存"""
+    print("开始计算CKA矩阵...")
+    cka_matrix = torch.zeros(len(names1), len(names2))
+    
+    # 将所有批次的激活值拼接起来，并移动到CPU
+    processed_reps1 = {name: torch.cat(reps1[name], dim=0).flatten(0, 1).to(torch.float32) for name in names1 if reps1[name]}
+    processed_reps2 = {name: torch.cat(reps2[name], dim=0).flatten(0, 1).to(torch.float32) for name in names2 if reps2[name]}
+
+    for i, name1 in enumerate(tqdm(names1, desc="计算 CKA (Deep Model)")):
+        if name1 not in processed_reps1: continue
+        feat1_full = processed_reps1[name1]
+        # 随机采样token以减少计算量和内存占用
+        feat1 = feat1_full[torch.randperm(feat1_full.shape[0])[:max_tokens]].to(COMPUTE_DEVICE)
+        gram_k = feat1 @ feat1.T
+        
+        for j, name2 in enumerate(names2):
+            if name2 not in processed_reps2: continue
+            feat2_full = processed_reps2[name2]
+            feat2 = feat2_full[torch.randperm(feat2_full.shape[0])[:max_tokens]].to(COMPUTE_DEVICE)
+            gram_l = feat2 @ feat2.T
             
-    merger.compute_intermediates = custom_compute_intermediates.__get__(merger, ModelMerge)
+            # 保证Gram矩阵是方形的
+            min_dim = min(gram_k.shape[0], gram_l.shape[0])
+            if min_dim > 0:
+              cka_matrix[i, j] = cka(gram_k[:min_dim, :min_dim], gram_l[:min_dim, :min_dim])
+        
+        # 释放计算设备内存
+        del gram_k, feat1
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    # 4. Compute transformations
-    print("Computing transformations (this may take a while)...")
-    merger.transform(
-        model=deepcopy(model_a),  # Base architecture for the merged model
-        dataloader=merger_dataloader,
-        transform_fn=match_tensors_zipit,
-        metric_classes=(CovarianceMetric,),
-        # fix_rate controls the final dimension after zipping
-        fix_rate=0.5  # Retain 50% of combined neuron dimension
-    )
+    print("CKA矩阵计算完成。")
+    return cka_matrix.cpu()
 
-    # 5. Get and load the merged state dictionary
-    print("Averaging weights and creating merged model...")
-    merged_state_dict = merger.get_merged_state_dict()
+def align_layers_lma(C):
+    """使用论文中的LMA算法进行深度对齐"""
+    m, n = C.shape # m: deep, n: shallow
+    F = torch.full((n + 1, m + 1), -torch.inf)
+    F[0, :] = 0
+    path = torch.zeros((n + 1, m + 1), dtype=torch.long)
     
-    merged_model = deepcopy(model_llama)  # Use LLaMA2 as the base architecture
-    merged_model.load_state_dict(merged_state_dict, strict=False)
-    
-    print("\n--- Model Merging Complete ---")
+    for i in range(1, n + 1):
+        for j in range(i, m + 1):
+            max_val, best_k = -torch.inf, -1
+            # 找到最佳的分割点 k
+            for k in range(i - 1, j):
+                # 将 deep 模型中从 k 到 j-1 的层作为一个段
+                segment_sim = C[k:j, i - 1].sum()
+                current_val = F[i - 1, k] + segment_sim
+                if current_val > max_val:
+                    max_val, best_k = current_val, k
+            F[i, j] = max_val
+            path[i, j] = best_k
 
-    # --- 6. Test the Merged Model ---
-    prompt = "The future of artificial intelligence is"
-    print(f"\nTesting merged model with prompt: '{prompt}'")
-    
-    inputs = tokenizer_llama(prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = merged_model.generate(**inputs, max_new_tokens=50, do_sample=True, top_k=10, top_p=0.95)
-    
-    generated_text = tokenizer_llama.decode(outputs[0], skip_special_tokens=True)
-    print("\n--- Merged Model Generation ---")
-    print(generated_text)
+    # 回溯以找到对齐路径
+    alignment, i_idx, j_idx = [], n, m
+    while i_idx > 0:
+        k_idx = path[i_idx, j_idx]
+        alignment.insert(0, list(range(k_idx, j_idx)))
+        j_idx = k_idx
+        i_idx -= 1
+        
+    return alignment
 
-    # --- Cleanup ---
-    del model_llama, model_qwen, model_a, model_b, merged_model, merger, dataloader_raw, merger_dataloader
+
+# --- 4. 宽度异构合并：弹性神经元压缩 (ZipIt!) ---
+def match_tensors_zipit(reps_a, reps_b, target_dim):
+    """在CPU上执行ZipIt!算法，以节省GPU显存"""
+    dim_a, dim_b = reps_a.shape[1], reps_b.shape[1]
+    
+    # 移动到CPU并归一化
+    reps_a_cpu = (reps_a / (torch.norm(reps_a, p=2, dim=0, keepdim=True) + 1e-6)).cpu().to(torch.float32)
+    reps_b_cpu = (reps_b / (torch.norm(reps_b, p=2, dim=0, keepdim=True) + 1e-6)).cpu().to(torch.float32)
+    
+    all_reps = torch.cat([reps_a_cpu, reps_b_cpu], dim=1)
+    sim_matrix = all_reps.T @ all_reps
+    sim_matrix.fill_diagonal_(-torch.inf)
+    
+    total_dim = dim_a + dim_b
+    perm_matrix = torch.eye(total_dim, device='cpu', dtype=torch.bfloat16)
+
+    num_merges = total_dim - target_dim
+    for _ in tqdm(range(num_merges), desc=f"Zipping to {target_dim} dims", leave=False):
+        flat_idx = torch.argmax(sim_matrix)
+        idx1, idx2 = np.unravel_index(flat_idx.item(), sim_matrix.shape)
+        
+        if sim_matrix[idx1, idx2] == -torch.inf: break
+
+        # 合并神经元
+        perm_matrix[:, idx1] += perm_matrix[:, idx2]
+        # 平均化相似度
+        sim_matrix[:, idx1] = (sim_matrix[:, idx1] + sim_matrix[:, idx2]) / 2
+        sim_matrix[idx1, :] = (sim_matrix[idx1, :] + sim_matrix[idx2, :]) / 2
+        
+        # 移除已合并的神经元
+        perm_matrix[:, idx2] = 0
+        sim_matrix[idx2, :] = -torch.inf
+        sim_matrix[:, idx2] = -torch.inf
+        sim_matrix[idx1, idx1] = -torch.inf
+
+    # 提取变换矩阵
+    unmerge_matrix = perm_matrix[:, perm_matrix.sum(dim=0) != 0]
+    merge_matrix = unmerge_matrix.T
+    merge_matrix = merge_matrix / (torch.sum(merge_matrix, dim=1, keepdim=True) + 1e-6)
+
+    # 分割成对应每个模型的矩阵
+    Tm_a, Tm_b = merge_matrix[:, :dim_a], merge_matrix[:, dim_a:]
+    Tu_a, Tu_b = unmerge_matrix[:dim_a, :], unmerge_matrix[dim_a:, :]
+
+    return Tm_a, Tm_b, Tu_a, Tu_b
+
+def apply_transform_and_merge(base_proj, donor_proj, T_out, T_in_inv, alpha):
+    """
+    应用变换 W_donor' = T_out @ W_donor @ T_in⁻¹ 并与 W_base 合并。
+    智能处理偏置项。
+    """
+    dtype, device = base_proj.weight.dtype, base_proj.weight.device
+    T_out, T_in_inv = T_out.to(device, dtype=dtype), T_in_inv.to(device, dtype=dtype)
+
+    # 变换donor模型的权重
+    w_d_transformed = T_out @ donor_proj.weight.data @ T_in_inv
+    
+    # 确保维度匹配
+    assert base_proj.weight.data.shape == w_d_transformed.shape, "权重维度不匹配"
+    
+    # 加权平均合并权重
+    base_proj.weight.data = (1 - alpha) * base_proj.weight.data + alpha * w_d_transformed
+
+    # 如果两个模型都有偏置项，则合并偏置项
+    if base_proj.bias is not None and donor_proj.bias is not None:
+        # 偏置只受输出变换 T_out 影响
+        bias_d_transformed = T_out @ donor_proj.bias.data
+        assert base_proj.bias.data.shape == bias_d_transformed.shape, "偏置维度不匹配"
+        base_proj.bias.data = (1 - alpha) * base_proj.bias.data + alpha * bias_d_transformed
+
+def set_seed(seed: int):
+    """为CPU和GPU设置随机种子以确保可复现性。"""
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # 确保卷积操作的可复现性
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+# --- 5. 主执行流程 ---
+
+def main(alpha=0.5):
+    """执行模型对齐与合并的主函数"""
+    set_seed(42)
+
+    # --- 步骤 1: 加载模型和数据 ---
+    tokenizer_llama, model_llama = load_model_and_tokenizer(CKPT_PATH["llama2"], MODEL_DEVICE_A)
+    tokenizer_qwen, model_qwen = load_model_and_tokenizer(CKPT_PATH["qwen2"], MODEL_DEVICE_B)
+    
+    if model_llama.config.num_hidden_layers >= model_qwen.config.num_hidden_layers:
+        model_deep, model_shallow = model_llama, model_qwen
+        tok_deep, tok_shallow = tokenizer_llama, tokenizer_qwen
+        deep_name, shallow_name = "llama2", "qwen2"
+        deep_device, shallow_device = MODEL_DEVICE_A, MODEL_DEVICE_B
+    else:
+        model_deep, model_shallow = model_qwen, model_llama
+        tok_deep, tok_shallow = tokenizer_qwen, tokenizer_llama
+        deep_name, shallow_name = "qwen2", "llama2"
+        deep_device, shallow_device = MODEL_DEVICE_B, MODEL_DEVICE_A
+
+    names_deep = [f"model.layers.{i}" for i in range(model_deep.config.num_hidden_layers)]
+    names_shallow = [f"model.layers.{i}" for i in range(model_shallow.config.num_hidden_layers)]
+    
+    dataloader = prepare_dataloader(tok_deep, tok_shallow)
+
+    # --- 步骤 2: 提取激活值 ---
+    print("\n--- 步骤 2: 为两个模型收集特征表示 ---")
+    reps_deep, hooks_deep = register_hooks_for_reps(model_deep, names_deep)
+    reps_shallow, hooks_shallow = register_hooks_for_reps(model_shallow, names_shallow)
+    
+    for batch in tqdm(dataloader, desc="特征提取"):
+        with torch.no_grad():
+            model_deep(batch["inputs_a"].to(deep_device))
+            model_shallow(batch["inputs_b"].to(shallow_device))
+    
+    for hook in hooks_deep + hooks_shallow: hook.remove()
+
+    # --- 步骤 3: 深度对齐 ---
+    print(f"\n--- 步骤 3: 深度异构对齐 (LMA) ---")
+    cka_matrix = compute_cka_matrix(reps_deep, reps_shallow, names_deep, names_shallow)
+    layer_alignment = align_layers_lma(cka_matrix)
+    
+    print("\n找到的层级映射关系 (Shallow Layer -> Deep Segment):")
+    for i, segment in enumerate(layer_alignment):
+        print(f"  {names_shallow[i]} -> {[names_deep[j] for j in segment]}")
+
+    # --- 步骤 4: 宽度对齐与权重合并 ---
+    print(f"\n--- 步骤 4: 宽度异构合并 (alpha={alpha}) ---")
+    merged_model = deepcopy(model_shallow) # 我们将权重合并到层数较少的模型架构上
+
+    for i, deep_segment_indices in enumerate(tqdm(layer_alignment, desc="合并所有层段")):
+        shallow_layer_name = names_shallow[i]
+        
+        # 使用段的最后一层激活作为整个段的代表
+        last_deep_layer_idx = deep_segment_indices[-1]
+        reps_deep_segment = torch.cat(reps_deep[names_deep[last_deep_layer_idx]], dim=0).flatten(0, 1)
+        reps_shallow_layer = torch.cat(reps_shallow[shallow_layer_name], dim=0).flatten(0, 1)
+        
+        # ZipIt! 计算变换矩阵
+        Tm_s, Tm_d, Tu_s, Tu_d = match_tensors_zipit(reps_shallow_layer, reps_deep_segment, merged_model.config.hidden_size)
+
+        base_target_layer = get_module_by_name(merged_model, shallow_layer_name)
+        
+        with torch.no_grad():
+            # 累积合并：将段内所有层的贡献融合到base模型的一层中
+            for k, deep_layer_idx in enumerate(deep_segment_indices):
+                donor_layer = get_module_by_name(model_deep, names_deep[deep_layer_idx])
+                
+                # 定义变换矩阵
+                T_in_inv = torch.linalg.pinv(Tu_d @ Tm_s) # (d_donor, d_base) -> (d_base, d_donor)
+                T_out = Tu_s @ Tm_d                    # (d_base, d_donor)
+
+                # 合并注意力层
+                apply_transform_and_merge(base_target_layer.self_attn, donor_layer.self_attn, T_out, T_in_inv, alpha / len(deep_segment_indices))
+                # 合并MLP层
+                apply_transform_and_merge(base_target_layer.mlp, donor_layer.mlp, T_out, T_in_inv, alpha / len(deep_segment_indices))
+
+    # --- 步骤 5: 保存并测试 ---
+    output_dir = f"./merged_{shallow_name}_as_base_alpha_{alpha}"
+    print(f"\n--- 正在保存合并后的模型到 {output_dir} ---")
+    merged_model.save_pretrained(output_dir)
+    tok_shallow.save_pretrained(output_dir)
+    print("模型保存完成。")
+
+    del model_donor, model_base, reps_deep, reps_shallow, dataset, dataloader, merged_model
     gc.collect()
     torch.cuda.empty_cache()
 
+    print("\n--- 测试合并后的模型 ---")
+    tokenizer_merged, model_merged = load_model_and_tokenizer(output_dir, COMPUTE_DEVICE)
+    prompt = "The capital of France is"
+    inputs = tokenizer_merged(prompt, return_tensors="pt").to(COMPUTE_DEVICE)
+    with torch.no_grad():
+        outputs = model_merged.generate(**inputs, max_new_tokens=10, pad_token_id=tokenizer_merged.eos_token_id)
+    print("输入:", prompt)
+    print("合并后模型输出:", tokenizer_merged.decode(outputs[0], skip_special_tokens=True))
+
+
 if __name__ == "__main__":
-    main()
+    main(alpha=0.5)
