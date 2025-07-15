@@ -145,6 +145,150 @@ def match_tensors_zipit(reps_a, reps_b, target_dim):
     Tu_a, Tu_b = unmerge_matrix[:dim_a, :], unmerge_matrix[dim_a:, :]
     return Tm_a, Tm_b, Tu_a, Tu_b
 
+def match_tensors_zipit_optimized(reps_a, reps_b, target_dim, use_svd_init=True, batch_merges=True):
+    """
+    优化版的ZipIt算法实现，使用SVD进行初始降维并批量处理合并操作
+    
+    参数:
+    - reps_a, reps_b: 需要对齐的两个表示
+    - target_dim: 目标维度
+    - use_svd_init: 是否使用SVD进行初始降维，加速后续迭代
+    - batch_merges: 是否批量处理合并操作
+    
+    返回:
+    - 变换矩阵: Tm_a, Tm_b, Tu_a, Tu_b
+    """
+    dim_a, dim_b = reps_a.shape[1], reps_b.shape[1]
+    total_dim = dim_a + dim_b
+    num_merges = total_dim - target_dim
+    
+    # 如果目标维度已满足或超过总维度，无需压缩
+    if num_merges <= 0:
+        # 直接返回单位变换矩阵
+        Tm_a = torch.eye(target_dim, dim_a, dtype=torch.float32)
+        Tm_b = torch.eye(target_dim, dim_b, dtype=torch.float32)
+        Tu_a = torch.eye(dim_a, target_dim, dtype=torch.float32)
+        Tu_b = torch.eye(dim_b, target_dim, dtype=torch.float32)
+        return Tm_a, Tm_b, Tu_a, Tu_b
+    
+    # 转移到CPU并标准化
+    reps_a_norm = reps_a.cpu().to(torch.float32)
+    reps_b_norm = reps_b.cpu().to(torch.float32)
+    
+    # 按列标准化
+    reps_a_norm = reps_a_norm / (torch.norm(reps_a_norm, p=2, dim=0, keepdim=True) + 1e-6)
+    reps_b_norm = reps_b_norm / (torch.norm(reps_b_norm, p=2, dim=0, keepdim=True) + 1e-6)
+    
+    # 合并所有表示
+    all_reps = torch.cat([reps_a_norm, reps_b_norm], dim=1)
+    
+    # 初始化置换矩阵
+    perm_matrix = torch.eye(total_dim, device='cpu', dtype=torch.float32)
+    
+    # 使用SVD初始降维（如果启用）
+    if use_svd_init and num_merges > total_dim // 3:  # 当需要大幅降维时，使用SVD
+        print(f"使用SVD进行初始降维，从{total_dim}降至{target_dim*2}")
+        try:
+            # 计算协方差矩阵
+            cov_matrix = all_reps.T @ all_reps
+            
+            # 进行特征值分解(SVD的简化版)
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)
+            
+            # 选择最大的target_dim*2个特征向量
+            # 保留2倍的目标维度，以便后续细化
+            keep_indices = torch.argsort(eigenvalues, descending=True)[:target_dim*2]
+            reduced_basis = eigenvectors[:, keep_indices]
+            
+            # 使用SVD结果初始化置换矩阵
+            # 此处不直接将维度降至target_dim，而是降至更大一些，然后再通过迭代细化
+            perm_matrix = reduced_basis @ reduced_basis.T @ perm_matrix
+            
+            # 更新需要合并的数量
+            num_merges = 2*target_dim - target_dim
+            
+            # 重新计算相似度矩阵
+            sim_matrix = perm_matrix.T @ cov_matrix @ perm_matrix
+            sim_matrix.fill_diagonal_(-torch.inf)
+            
+            del cov_matrix, eigenvalues, eigenvectors, reduced_basis
+            torch.cuda.empty_cache() if torch.cuda.is_available() else gc.collect()
+            
+        except Exception as e:
+            print(f"SVD初始化失败，回退到标准方法: {str(e)}")
+            # 计算相似度矩阵
+            sim_matrix = all_reps.T @ all_reps
+            sim_matrix.fill_diagonal_(-torch.inf)
+    else:
+        # 标准方法：直接计算相似度矩阵
+        sim_matrix = all_reps.T @ all_reps
+        sim_matrix.fill_diagonal_(-torch.inf)
+    
+    # 批量合并处理
+    if batch_merges and num_merges > 100:
+        # 每次批量合并10%的神经元
+        batch_size = max(int(num_merges * 0.1), 10)
+        iterations = num_merges // batch_size
+        
+        for iteration in tqdm(range(iterations), desc=f"批量Zipping到{target_dim}维", leave=False):
+            # 找出相似度最高的batch_size对神经元
+            flat_indices = torch.topk(sim_matrix.flatten(), batch_size).indices
+            
+            # 转换为2D索引
+            idx_pairs = [(idx // total_dim, idx % total_dim) for idx in flat_indices]
+            
+            # 过滤掉已经是-inf的对
+            valid_pairs = [(i, j) for i, j in idx_pairs if sim_matrix[i, j] != -torch.inf]
+            
+            # 批量合并
+            for idx1, idx2 in valid_pairs:
+                # 合并操作
+                perm_matrix[:, idx1] += perm_matrix[:, idx2]
+                sim_matrix[:, idx1] = (sim_matrix[:, idx1] + sim_matrix[:, idx2]) / 2
+                sim_matrix[idx1, :] = (sim_matrix[idx1, :] + sim_matrix[idx2, :]) / 2
+                perm_matrix[:, idx2] = 0
+                sim_matrix[idx2, :], sim_matrix[:, idx2] = -torch.inf, -torch.inf
+                sim_matrix[idx1, idx1] = -torch.inf
+        
+        # 处理剩余的合并
+        remaining = num_merges - batch_size * iterations
+    else:
+        remaining = num_merges
+    
+    # 处理剩余的合并（或所有合并，如果不使用批处理）
+    for _ in tqdm(range(remaining), desc=f"精细Zipping到{target_dim}维", leave=False):
+        # 找出相似度最高的一对神经元
+        flat_idx = torch.argmax(sim_matrix)
+        idx1, idx2 = flat_idx // total_dim, flat_idx % total_dim
+        
+        # 如果找不到有效的对，提前退出
+        if sim_matrix[idx1, idx2] == -torch.inf:
+            break
+            
+        # 合并操作
+        perm_matrix[:, idx1] += perm_matrix[:, idx2]
+        sim_matrix[:, idx1] = (sim_matrix[:, idx1] + sim_matrix[:, idx2]) / 2
+        sim_matrix[idx1, :] = (sim_matrix[idx1, :] + sim_matrix[idx2, :]) / 2
+        perm_matrix[:, idx2] = 0
+        sim_matrix[idx2, :], sim_matrix[:, idx2] = -torch.inf, -torch.inf
+        sim_matrix[idx1, idx1] = -torch.inf
+    
+    # 保留非零列构建变换矩阵
+    nonzero_cols = perm_matrix.sum(dim=0) != 0
+    unmerge_matrix = perm_matrix[:, nonzero_cols]
+    
+    # 转置得到合并矩阵
+    merge_matrix = unmerge_matrix.T
+    
+    # 归一化
+    merge_matrix = merge_matrix / (torch.sum(merge_matrix, dim=1, keepdim=True) + 1e-6)
+    
+    # 拆分为A和B的变换矩阵
+    Tm_a, Tm_b = merge_matrix[:, :dim_a], merge_matrix[:, dim_a:]
+    Tu_a, Tu_b = unmerge_matrix[:dim_a, :], unmerge_matrix[dim_a:, :]
+    
+    return Tm_a, Tm_b, Tu_a, Tu_b
+
 # --- 5. 最终修复的核心函数：权重变换与合并 ---
 def transform_and_merge_weights(base_proj, donor_proj, reps_in_b, reps_in_d, reps_out_b, reps_out_d, alpha):
     """对一对具体的投影层进行宽度对齐和合并, 使用输入和输出激活"""
@@ -153,12 +297,12 @@ def transform_and_merge_weights(base_proj, donor_proj, reps_in_b, reps_in_d, rep
 
     # 1. 计算输出空间的变换矩阵 (基于输出激活)
     target_dim_out = base_proj.out_features
-    Tm_b_out, Tm_d_out, Tu_b_out, Tu_d_out = match_tensors_zipit(reps_out_b, reps_out_d, target_dim_out)
+    Tm_b_out, Tm_d_out, Tu_b_out, Tu_d_out = match_tensors_zipit_optimized(reps_out_b, reps_out_d, target_dim_out)
     T_out_d_to_b = (Tu_b_out @ Tm_d_out).to(device, dtype=dtype)
 
     # 2. 计算输入空间的变换矩阵 (基于输入激活)
     target_dim_in = base_proj.in_features
-    Tm_b_in, Tm_d_in, Tu_b_in, Tu_d_in = match_tensors_zipit(reps_in_b, reps_in_d, target_dim_in)
+    Tm_b_in, Tm_d_in, Tu_b_in, Tu_d_in = match_tensors_zipit_optimized(reps_in_b, reps_in_d, target_dim_in)
     T_in_b_to_d = (Tu_d_in @ Tm_b_in).to(device, dtype=dtype)
     T_in_inv = torch.linalg.pinv(T_in_b_to_d.to(torch.float32)).to(dtype)
 
