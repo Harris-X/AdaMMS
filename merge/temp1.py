@@ -13,9 +13,9 @@ CKPT_PATH = {
     "qwen2": "./downloaded_models/Qwen2-7B-Instruct",
 }
 # 定义计算设备。如果显存不足，可将一个模型加载到CPU
-MODEL_DEVICE_A = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
-MODEL_DEVICE_B = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
-COMPUTE_DEVICE = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
+MODEL_DEVICE_A = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+MODEL_DEVICE_B = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+COMPUTE_DEVICE = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
 print(f"模型A设备: {MODEL_DEVICE_A}, 模型B设备: {MODEL_DEVICE_B}, 计算设备: {COMPUTE_DEVICE}")
 
 # --- 2. 辅助函数 (模型与数据加载) ---
@@ -294,6 +294,16 @@ def transform_and_merge_weights(base_proj, donor_proj, reps_in_b, reps_in_d, rep
     """对一对具体的投影层进行宽度对齐和合并, 使用输入和输出激活"""
     device = base_proj.weight.device
     dtype = base_proj.weight.dtype
+    
+    # 添加维度检查
+    print(f"特征维度 - 输入基础: {reps_in_b.shape}, 输入捐赠: {reps_in_d.shape}")
+    print(f"特征维度 - 输出基础: {reps_out_b.shape}, 输出捐赠: {reps_out_d.shape}")
+    
+    # 确保激活至少是2维的
+    assert reps_in_b.dim() >= 2, f"输入基础特征维度不足: {reps_in_b.shape}"
+    assert reps_in_d.dim() >= 2, f"输入捐赠特征维度不足: {reps_in_d.shape}"
+    assert reps_out_b.dim() >= 2, f"输出基础特征维度不足: {reps_out_b.shape}"
+    assert reps_out_d.dim() >= 2, f"输出捐赠特征维度不足: {reps_out_d.shape}"
 
     # 1. 计算输出空间的变换矩阵 (基于输出激活)
     target_dim_out = base_proj.out_features
@@ -304,7 +314,12 @@ def transform_and_merge_weights(base_proj, donor_proj, reps_in_b, reps_in_d, rep
     target_dim_in = base_proj.in_features
     Tm_b_in, Tm_d_in, Tu_b_in, Tu_d_in = match_tensors_zipit_optimized(reps_in_b, reps_in_d, target_dim_in)
     T_in_b_to_d = (Tu_d_in @ Tm_b_in).to(device, dtype=dtype)
-    T_in_inv = torch.linalg.pinv(T_in_b_to_d.to(torch.float32)).to(dtype)
+    # T_in_inv = torch.linalg.pinv(T_in_b_to_d.to(torch.float32)).to(dtype)
+    T_in_inv = T_in_b_to_d
+
+    device = donor_proj.weight.device
+    T_in_inv = T_in_inv.to(device, dtype=dtype)
+    T_out_d_to_b = T_out_d_to_b.to(device, dtype=dtype)
 
     # 3. 应用正确的双向变换: W'_d = T_out @ W_d @ T_in⁻¹
     W_d_transformed = T_out_d_to_b @ donor_proj.weight.data @ T_in_inv
@@ -312,6 +327,8 @@ def transform_and_merge_weights(base_proj, donor_proj, reps_in_b, reps_in_d, rep
     assert base_proj.weight.data.shape == W_d_transformed.shape, \
         f"维度不匹配: base({base_proj.weight.data.shape}) vs transformed donor({W_d_transformed.shape})"
 
+    device = base_proj.weight.device
+    W_d_transformed = W_d_transformed.to(device, dtype=dtype)
     # 4. 加权平均权重
     base_proj.weight.data = (1 - alpha) * base_proj.weight.data + alpha * W_d_transformed
     
@@ -321,6 +338,8 @@ def transform_and_merge_weights(base_proj, donor_proj, reps_in_b, reps_in_d, rep
         bias_d_transformed = T_out_d_to_b @ donor_proj.bias.data
         assert base_proj.bias.data.shape == bias_d_transformed.shape, "bias 维度不匹配"
         base_proj.bias.data = (1 - alpha) * base_proj.bias.data + alpha * bias_d_transformed
+    
+    del W_d_transformed, T_in_inv, T_out_d_to_b, Tm_b_out, Tm_d_out, Tu_b_out, Tu_d_out
 
 # --- 6. 主执行流程 (已重构)---
 def main(alpha=0.5, alignment_type='LMA'):
@@ -383,17 +402,26 @@ def main(alpha=0.5, alignment_type='LMA'):
                 base_proj = get_module_by_name(merged_model, f"{shallow_layer_name}.self_attn.{proj_name}")
                 donor_proj = get_module_by_name(model_deep, f"{deep_layer_name}.self_attn.{proj_name}")
                 
+                # 修复：使用不同的变量名存储处理后的特征
+                key_shallow = f"{shallow_layer_name}.self_attn.{proj_name}"
+                key_deep = f"{deep_layer_name}.self_attn.{proj_name}"
+                
+                # 检查键是否存在
+                if key_shallow not in reps_in_s or key_deep not in reps_in_d:
+                    print(f"警告：找不到 {key_shallow} 或 {key_deep} 的特征，跳过此合并")
+                    continue
+                    
                 # 提取对应的输入和输出激活
-                reps_in_b = torch.cat(reps_in_s[f"{shallow_layer_name}.self_attn.{proj_name}"], dim=0).flatten(0, 1)
-                reps_in_d = torch.cat(reps_in_d[f"{deep_layer_name}.self_attn.{proj_name}"], dim=0).flatten(0, 1)
-                reps_out_b = torch.cat(reps_out_s[f"{shallow_layer_name}.self_attn.{proj_name}"], dim=0).flatten(0, 1)
-                reps_out_d = torch.cat(reps_out_d[f"{deep_layer_name}.self_attn.{proj_name}"], dim=0).flatten(0, 1)
+                processed_reps_in_b = torch.cat(reps_in_s[key_shallow], dim=0).flatten(0, 1)
+                processed_reps_in_d = torch.cat(reps_in_d[key_deep], dim=0).flatten(0, 1)
+                processed_reps_out_b = torch.cat(reps_out_s[key_shallow], dim=0).flatten(0, 1)
+                processed_reps_out_d = torch.cat(reps_out_d[key_deep], dim=0).flatten(0, 1)
 
                 # 每个子层独立进行宽度合并
                 transform_and_merge_weights(
                     base_proj, donor_proj,
-                    reps_in_b, reps_in_d,
-                    reps_out_b, reps_out_d,
+                    processed_reps_in_b, processed_reps_in_d,
+                    processed_reps_out_b, processed_reps_out_d,
                     alpha / len(deep_segment_indices) # 平均分配alpha
                 )
 
