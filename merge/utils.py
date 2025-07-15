@@ -9,7 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 from inspect import getmembers, isfunction # <-- **ADDED THIS IMPORT**
-
+from transformers import AutoModelForCausalLM
 # 从项目中的其他文件中导入必要的类和函数
 # 确保这些文件与您的主脚本位于正确的目录结构中
 from graphs.transformer_enc_graph import TransformerEncoderGraph
@@ -256,3 +256,38 @@ def add_custom_merger_logic(merger_instance):
     merger_instance.compute_metrics = MethodType(custom_compute_metrics, merger_instance)
 
     return merger_instance
+
+
+def prepare_decoder_models(config, device):
+    """ 加载 Llama2 和 Qwen2 模型 """
+    bases = []
+    for model_id in config['bases']:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        ).to(device)
+        bases.append(model)
+    
+    # 创建一个新模型作为合并的目标，这里我们以第一个模型作为模板
+    new_model = AutoModelForCausalLM.from_config(bases[0].config).to(device)
+    
+    return {'bases': bases, 'new': new_model}
+
+
+def prepare_models(config, device='cuda'):
+    """ Load all pretrained models in config. """
+    if config['name'].startswith('decoder'): # 新增的处理分支
+        return prepare_decoder_models(config, device)
+    else:
+        raise NotImplementedError(config['name'])
+
+def get_config_from_name(name, device=None):
+    """ Load config based on its name. """
+    out = deepcopy(getattr(__import__('configs.' + name), name).config)
+    if device is None and 'device' not in out:
+        out['device'] = 'cuda'
+    elif device is not None:
+        out['device'] = device
+    return out

@@ -192,8 +192,8 @@ def main():
     # **注意**: 减小 batch_size 和 max_samples 可以显著降低内存消耗
     dataloader = prepare_dataloader(
         tokenizer_llama, tokenizer_qwen, 
-        batch_size=2,          # 内存不足时请减小
-        max_samples=16,        # 内存不足时请减小
+        batch_size=1,          # 内存不足时请减小
+        max_samples=2,        # 内存不足时请减小
         max_length=128
     )
 
