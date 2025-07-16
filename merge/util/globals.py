@@ -2,7 +2,7 @@ from pathlib import Path
 
 import yaml
 
-with open("globals.yml", "r") as stream:
+with open("/home/user/xieqiuhao/AdaMMS/merge/globals.yml", "r") as stream:
     data = yaml.safe_load(stream)
 
 (RESULTS_DIR, DATA_DIR, STATS_DIR, HPARAMS_DIR, KV_DIR) = (

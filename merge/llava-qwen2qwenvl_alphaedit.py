@@ -25,10 +25,10 @@ except ImportError:
 
 # --- 模型路径配置 (保持不变) ---
 CKPT_PATH = {
-    'qwen2_vl': "your/path/to/Qwen2-VL-7B-Instruct",
-    'llava-onevision-qwen': "your/path/to/llava-onevision-qwen-7b"
+    'qwen2_vl': "/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct",
+    'llava-onevision-qwen': "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si"
 }
-# 请将上面的 "your/path/to/..." 替换为您的实际模型路径
+# 请将上面的 "/home/user/xieqiuhao/AdaMMS/..." 替换为您的实际模型路径
 
 # 用于缓存协方差统计数据和投影矩阵的目录
 STATS_DIR = "hparams_cache"
@@ -106,14 +106,58 @@ def compute_covariance_and_projector(
     
     return projector
 
-# --- 原始脚本中的模型加载和辅助函数 ---
-def load_qwenvl_weights(ckpt_path):
-    # (此函数内容保持不变)
-    return safetensors.torch.load_file(os.path.join(ckpt_path, "model.safetensors"))
+# # --- 原始脚本中的模型加载和辅助函数 ---
+# def load_qwenvl_weights(ckpt_path):
+#     # (此函数内容保持不变)
+#     return safetensors.torch.load_file(os.path.join(ckpt_path, "model.safetensors"))
 
-def load_minicpm_weights(ckpt_path):
-    # (此函数内容保持不变)
-    return safetensors.torch.load_file(os.path.join(ckpt_path, "model.safetensors"))
+# def load_minicpm_weights(ckpt_path):
+#     # (此函数内容保持不变)
+#     return safetensors.torch.load_file(os.path.join(ckpt_path, "model.safetensors"))
+
+
+
+def load_pytorch_weights(base_path, file_list):
+    weights = {}
+    for file in file_list:
+        path = os.path.join(base_path, file)
+        x = torch.load(path)
+        weights.update(x)
+    return weights
+def load_safetensors_weights(base_path, file_list):
+    weights = {}
+    for file in file_list:
+        path = os.path.join(base_path, file)
+        x = safetensors.torch.load_file(path)
+        weights.update(x)
+    return weights
+
+vicuna_file_list = ['pytorch_model-00001-of-00002.bin', 'pytorch_model-00002-of-00002.bin']
+llama_file_list = ['pytorch_model-00001-of-00003.bin', 'pytorch_model-00002-of-00003.bin', 'pytorch_model-00003-of-00003.bin']
+def load_llama_weights(base_path, file_list=llama_file_list):
+    return load_pytorch_weights(base_path, file_list)
+
+llava_file_list = ['pytorch_model-00001-of-00002.bin', 'pytorch_model-00002-of-00002.bin']
+def load_llava_weights(base_path, file_list=llava_file_list):
+    return load_pytorch_weights(base_path, file_list)
+
+mplug_owl_file_list_template = "pytorch_model-{}-of-33.bin"
+mplug_owl_file_list = [mplug_owl_file_list_template.format(str(i+1)) for i in range(33)]
+def load_mplug_owl_weights(base_path, file_list=mplug_owl_file_list):
+    return load_pytorch_weights(base_path, file_list)
+
+cogvlm_file_list = ['model-00001-of-00008.safetensors', 'model-00002-of-00008.safetensors', 'model-00003-of-00008.safetensors', 'model-00004-of-00008.safetensors', 'model-00005-of-00008.safetensors', 'model-00006-of-00008.safetensors', 'model-00007-of-00008.safetensors', 'model-00008-of-00008.safetensors']
+def load_cogvlm_weights(base_path, file_list=cogvlm_file_list):
+    return load_safetensors_weights(base_path, file_list)
+
+qwenvl_file_list = ['model-00001-of-00005.safetensors', 'model-00002-of-00005.safetensors', 'model-00003-of-00005.safetensors', 'model-00004-of-00005.safetensors', 'model-00005-of-00005.safetensors']
+def load_qwenvl_weights(base_path, file_list=qwenvl_file_list):
+    return load_safetensors_weights(base_path, file_list)
+
+llava_onevision_qwen_file_list = ['model-00001-of-00004.safetensors', 'model-00002-of-00004.safetensors', 'model-00003-of-00004.safetensors', 'model-00004-of-00004.safetensors']
+def load_minicpm_weights(base_path, file_list=llava_onevision_qwen_file_list):
+    return load_safetensors_weights(base_path, file_list)
+
 
 def need_merge(name:str) -> bool:
     # 这个函数保持不变，用于识别需要合并的层
