@@ -39,24 +39,45 @@ INDEX_FILENAME = {
 STATS_DIR = "hparams_cache"
 os.makedirs(STATS_DIR, exist_ok=True)
 
-# --- 权重加载函数 (遵循您提供的脚本) ---
+def load_pytorch_weights(base_path, file_list):
+    weights = {}
+    for file in file_list:
+        path = os.path.join(base_path, file)
+        x = torch.load(path)
+        weights.update(x)
+    return weights
 def load_safetensors_weights(base_path, file_list):
     weights = {}
-    for file in tqdm(file_list, desc=f"Loading weights from {os.path.basename(base_path)}"):
+    for file in file_list:
         path = os.path.join(base_path, file)
-        weights.update(safetensors.torch.load_file(path))
+        x = safetensors.torch.load_file(path)
+        weights.update(x)
     return weights
 
-def load_qwenvl_weights(base_path):
-    with open(os.path.join(base_path, INDEX_FILENAME["qwen2_vl"]), 'r') as f:
-        index = json.load(f)
-    file_list = sorted(list(set(index["weight_map"].values())))
+vicuna_file_list = ['pytorch_model-00001-of-00002.bin', 'pytorch_model-00002-of-00002.bin']
+llama_file_list = ['pytorch_model-00001-of-00003.bin', 'pytorch_model-00002-of-00003.bin', 'pytorch_model-00003-of-00003.bin']
+def load_llama_weights(base_path, file_list=llama_file_list):
+    return load_pytorch_weights(base_path, file_list)
+
+llava_file_list = ['pytorch_model-00001-of-00002.bin', 'pytorch_model-00002-of-00002.bin']
+def load_llava_weights(base_path, file_list=llava_file_list):
+    return load_pytorch_weights(base_path, file_list)
+
+mplug_owl_file_list_template = "pytorch_model-{}-of-33.bin"
+mplug_owl_file_list = [mplug_owl_file_list_template.format(str(i+1)) for i in range(33)]
+def load_mplug_owl_weights(base_path, file_list=mplug_owl_file_list):
+    return load_pytorch_weights(base_path, file_list)
+
+cogvlm_file_list = ['model-00001-of-00008.safetensors', 'model-00002-of-00008.safetensors', 'model-00003-of-00008.safetensors', 'model-00004-of-00008.safetensors', 'model-00005-of-00008.safetensors', 'model-00006-of-00008.safetensors', 'model-00007-of-00008.safetensors', 'model-00008-of-00008.safetensors']
+def load_cogvlm_weights(base_path, file_list=cogvlm_file_list):
     return load_safetensors_weights(base_path, file_list)
 
-def load_minicpm_weights(base_path):
-    with open(os.path.join(base_path, INDEX_FILENAME["llava-onevision-qwen"]), 'r') as f:
-        index = json.load(f)
-    file_list = sorted(list(set(index["weight_map"].values())))
+qwenvl_file_list = ['model-00001-of-00005.safetensors', 'model-00002-of-00005.safetensors', 'model-00003-of-00005.safetensors', 'model-00004-of-00005.safetensors', 'model-00005-of-00005.safetensors']
+def load_qwenvl_weights(base_path, file_list=qwenvl_file_list):
+    return load_safetensors_weights(base_path, file_list)
+
+llava_onevision_qwen_file_list = ['model-00001-of-00004.safetensors', 'model-00002-of-00004.safetensors', 'model-00003-of-00004.safetensors', 'model-00004-of-00004.safetensors']
+def load_minicpm_weights(base_path, file_list=llava_onevision_qwen_file_list):
     return load_safetensors_weights(base_path, file_list)
 
 # --- 新增：AlphaEdit 核心逻辑实现 ---

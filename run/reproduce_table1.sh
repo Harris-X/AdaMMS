@@ -10,8 +10,8 @@ PORT=29516 # 建议为每个独立脚本使用不同端口，避免冲突
 EVAL_BASE=./eval_results_table1 # 为本次复现创建一个独立的评测结果目录
 
 # 模型路径 (从融合脚本中获取)
-QWEN2_VL_PATH="/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Qwen_Qwen2-VL-7B-Instruct"
-LLAVA_ONEVISION_PATH="/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/lmms-lab_llava-onevision-qwen2-7b-si"
+QWEN2_VL_PATH="/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct"
+LLAVA_ONEVISION_PATH="/home/data2t1/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si"
 
 # 评测任务列表 (请根据 Table 1 的实际任务进行调整)
 TASK_LIST="ok_vqa mme mmmu_val " # 缺少  textvqa_val vizwiz_vqa_val gqa mme seedbench ok_vqa  ocrbench
