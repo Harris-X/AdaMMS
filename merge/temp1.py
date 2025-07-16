@@ -432,7 +432,7 @@ def main(alpha=0.5, alignment_type='LMA'):
     tok_shallow.save_pretrained(output_dir)
     print("模型保存完成。")
 
-    del model_donor, model_base, reps_deep, reps_shallow, dataset, dataloader, merged_model
+    del model_donor, model_base, merged_model
     gc.collect()
     torch.cuda.empty_cache()
 
