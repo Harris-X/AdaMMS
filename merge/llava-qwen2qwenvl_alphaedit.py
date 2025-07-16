@@ -24,11 +24,31 @@ except ImportError:
     sys.exit(1)
 
 # --- 模型路径配置 (保持不变) ---
+# CKPT_PATH = {
+#     'qwen2_vl': "/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct",
+#     'llava-onevision-qwen': "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si"
+# }
+# # 请将上面的 "/home/user/xieqiuhao/AdaMMS/..." 替换为您的实际模型路径
+
 CKPT_PATH = {
-    'qwen2_vl': "/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct",
-    'llava-onevision-qwen': "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si"
+    "cogvlm_chat": "/home/user/xieqiuhao/AdaMMS/downloaded_models/cogvlm-base-490-hf", #"/home/user/xieqiuhao/AdaMMS/downloaded_models/cogvlm-chat-hf",
+    "cogvlm_grounding": "/home/user/xieqiuhao/AdaMMS/downloaded_models/cogvlm-grounding-generalist-hf",
+    "llava": "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-v1.5-7b",
+    "sharegpt": "/home/user/xieqiuhao/AdaMMS/downloaded_models/ShareGPT4V-7B-llava",
+    "vicuna-v1.5": "/yeesuanAI05/thumt/cc/checkpoints/vicuna-7b-v1.5",
+    "qwen2_vl" : "/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct",
+    "llava-onevision-qwen" : "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si"
 }
-# 请将上面的 "/home/user/xieqiuhao/AdaMMS/..." 替换为您的实际模型路径
+
+INDEX_FILENAME = {
+    "cogvlm_chat": "model.safetensors.index.json",
+    "cogvlm_grounding": "model.safetensors.index.json",
+    "llava": "pytorch_model.bin.index.json",
+    "sharegpt": "pytorch_model.bin.index.json",
+    "vicuna-v1.5": "pytorch_model.bin.index.json",
+    "llava-onevision-qwen": "model.safetensors.index.json",
+    "qwen2_vl" : "model.safetensors.index.json"
+}
 
 # 用于缓存协方差统计数据和投影矩阵的目录
 STATS_DIR = "hparams_cache"
@@ -171,6 +191,40 @@ def need_merge(name:str) -> bool:
         return True
     return False
 
+def create_soft_link(source_path, link_path):
+    # Check if source path exists
+    if not os.path.exists(source_path):
+        print(f"Error: Source path '{source_path}' does not exist.")
+        return
+
+    # Check if link path exists, if not create it
+    if not os.path.exists(link_path):
+        os.makedirs(link_path)
+        print(f"Created directory '{link_path}'")
+
+    # Iterate through all files and directories in the source path
+    for item in os.listdir(source_path):
+        source_item = os.path.join(source_path, item)
+        link_item = os.path.join(link_path, item)
+
+        # Skip files that end with '.bin'
+        if item.endswith('.bin'):
+            print(f"Skipping '{item}' as it ends with '.bin'")
+            continue
+
+        # If it's a file, create a symbolic link
+        if os.path.isfile(source_item):
+            try:
+                os.symlink(source_item, link_item)
+                print(f"Created soft link '{link_item}' -> '{source_item}'")
+            except OSError as e:
+                print(f"Error creating soft link for '{item}': {e}")
+
+        # If it's a directory, ignore it
+        elif os.path.isdir(source_item):
+            continue
+
+
 # --- 主合并逻辑 ---
 def convert(args):
     """
@@ -258,14 +312,42 @@ def convert(args):
 
     # --- 保存合并后的模型 ---
     print("\nSaving merged model...")
-    # 找到基础模型的配置文件并复制
-    config_path = os.path.join(args.base_model_path, "config.json")
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f_in, open(os.path.join(OUTPUT_PATH, "config.json"), 'w') as f_out:
-            f_out.write(f_in.read())
+
+    # save
+    print("Saving...")
+    metadata = {'format': 'pt'}
+    llava_index_path = os.path.join(CKPT_PATH["qwen2_vl"], INDEX_FILENAME["qwen2_vl"])
+    with open(llava_index_path, "r") as f:
+        print(f"Loading LLaVA index from {llava_index_path}...")
+        llava_index = json.load(f)
+        llava_index = llava_index["weight_map"]
     
-    # 保存权重
-    safetensors.torch.save_file(base_weights, os.path.join(OUTPUT_PATH, "model.safetensors"))
+    split_llava = {}
+    for file in qwenvl_file_list:
+        split_llava[file] = {}
+    for key in llava_index:
+        split_llava[llava_index[key]][key] = base_weights[key]
+    for file in qwenvl_file_list:
+        if not os.path.isdir(OUTPUT_PATH):
+            os.makedirs(OUTPUT_PATH)
+        save_path = os.path.join(OUTPUT_PATH, file)
+        safetensors.torch.save_file(split_llava[file], save_path, metadata)
+        
+    create_soft_link(source_path=CKPT_PATH["qwen2_vl"], link_path=OUTPUT_PATH)
+
+    print("Convert Done.")
+    print(save_path)
+
+
+
+    # # 找到基础模型的配置文件并复制
+    # config_path = os.path.join(args.base_model_path, "config.json")
+    # if os.path.exists(config_path):
+    #     with open(config_path, 'r') as f_in, open(os.path.join(OUTPUT_PATH, "config.json"), 'w') as f_out:
+    #         f_out.write(f_in.read())
+    
+    # # 保存权重
+    # safetensors.torch.save_file(base_weights, os.path.join(OUTPUT_PATH, "model.safetensors"))
     
     print("Convert Done.")
     print(f"Merged model saved to: {OUTPUT_PATH}")
