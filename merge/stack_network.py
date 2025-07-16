@@ -45,6 +45,83 @@ def load_and_prepare_dataset(tokenizer_a, tokenizer_b, dataset_name="wikitext", 
     processed_dataset.set_format(type='torch')
     return processed_dataset
 
+def load_and_prepare_qa_dataset(tokenizer_a, tokenizer_b, dataset_name="squad", split="validation", max_samples=16, max_length=128):
+    """
+    加载QA数据集并为两个模型准备输入
+    
+    Args:
+        tokenizer_a, tokenizer_b: 两个模型的分词器
+        dataset_name: 要加载的QA数据集名称
+        split: 数据集分割
+        max_samples: 最大样本数
+        max_length: 序列最大长度
+    
+    Returns:
+        处理后的数据集
+    """
+    print(f"正在加载QA数据集: {dataset_name}...")
+    
+    # 加载数据集
+    if dataset_name == "squad":
+        # SQuAD数据集结构：每个样本包含一个问题和答案
+        dataset = load_dataset("squad", split=split)
+        
+        # 对于SQuAD，直接使用现有结构
+        flattened_data = []
+        for example in dataset:
+            question = example["question"]
+            # SQuAD中答案是一个字典，包含'text'列表和'answer_start'列表
+            answer_text = example["answers"]["text"][0] if example["answers"]["text"] else ""
+            context = example["context"]
+            
+            flattened_data.append({
+                "question": question,
+                "answer": answer_text,
+                "context": context
+            })
+        
+        # 创建新的数据集对象
+        from datasets import Dataset
+        dataset = Dataset.from_dict({
+            "question": [item["question"] for item in flattened_data],
+            "answer": [item["answer"] for item in flattened_data],
+            "context": [item["context"] for item in flattened_data]
+        }).select(range(min(max_samples, len(flattened_data))))
+    else:
+        # 其他QA数据集的通用加载方法
+        dataset = load_dataset(dataset_name, split=split).select(range(max_samples))
+    
+    def tokenize_qa_fn(examples):
+        # 对于QA数据集，我们使用问题作为输入
+        questions = examples["question"]
+        
+        # 确保问题非空
+        valid_questions = [q for q in questions if q and q.strip()]
+        if not valid_questions:
+            return {}
+        
+        # 添加前缀使问题更明确
+        formatted_questions = [f"Question: {q} Answer:" for q in valid_questions]
+        
+        # 使用两个模型的tokenizer处理输入
+        inputs_a = tokenizer_a(formatted_questions, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
+        inputs_b = tokenizer_b(formatted_questions, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
+        
+        return {
+            "input_ids_a": inputs_a.input_ids,
+            "attention_mask_a": inputs_a.attention_mask,
+            "input_ids_b": inputs_b.input_ids,
+            "attention_mask_b": inputs_b.attention_mask,
+            "raw_question": valid_questions,
+            "raw_answer": [examples["answer"][i] for i, q in enumerate(questions) if q and q.strip()]
+        }
+    
+    # 处理数据集
+    processed_dataset = dataset.map(tokenize_qa_fn, batched=True, remove_columns=dataset.column_names)
+    processed_dataset.set_format(type='torch', columns=["input_ids_a", "attention_mask_a", "input_ids_b", "attention_mask_b"])
+    
+    return processed_dataset
+
 def get_module_by_name(model, module_name):
     for part in module_name.split('.'):
         if not hasattr(model, part): return None
@@ -275,6 +352,170 @@ def evaluate_model(model, tokenizer, prompts, max_new_tokens=50, device=None):
     
     return results
 
+# --- LMA层对齐算法 ---
+def align_layers_lma(C):
+    """使用动态规划进行层对齐"""
+    m, n = C.shape  # m是深层模型层数，n是浅层模型层数
+    F = torch.full((n + 1, m + 1), -torch.inf)
+    F[0, :] = 0
+    path = torch.zeros((n + 1, m + 1), dtype=torch.long)
+    
+    for i in range(1, n + 1):
+        for j in range(i, m + 1):
+            max_val, best_k = -torch.inf, -1
+            for k in range(i - 1, j):
+                # 计算从深层模型的k到j-1的层与浅层模型的第i-1层的相似度总和
+                segment_sim = C[k:j, i - 1].sum()
+                current_val = F[i - 1, k] + segment_sim
+                if current_val > max_val:
+                    max_val, best_k = current_val, k
+            F[i, j], path[i, j] = max_val, best_k
+    
+    # 回溯构建对齐方案
+    alignment, i, j = [], n, m
+    while i > 0:
+        k = path[i, j].item()
+        alignment.insert(0, list(range(k, j)))
+        j = k
+        i -= 1
+    
+    return alignment
+
+def create_stack_strategy_threshold(cka_matrix, similarity_threshold=0.8, start_from_middle=True):
+    """
+    基于相似度阈值创建堆叠策略，可以从中间层开始。
+    
+    Args:
+        cka_matrix: 相似度矩阵，形状为 [deep_layers, shallow_layers]
+        similarity_threshold: 相似度阈值，高于此值的层被认为匹配良好
+        start_from_middle: 是否从中间层开始处理
+    
+    Returns:
+        堆叠策略字典 {shallow_layer_idx: num_repeats, ...}
+    """
+    deep_layers, shallow_layers = cka_matrix.shape
+    stack_strategy = {}
+    
+    # 计算每个浅层模型层最相似的深层模型层
+    best_matches = {}
+    for j in range(shallow_layers):
+        similarities = cka_matrix[:, j]
+        best_idx = torch.argmax(similarities).item()
+        best_sim = similarities[best_idx].item()
+        best_matches[j] = (best_idx, best_sim)
+    
+    # 计算匹配矩阵：每个深层与哪些浅层匹配
+    deep_to_shallow = {}
+    for shallow_idx, (deep_idx, sim) in best_matches.items():
+        if deep_idx not in deep_to_shallow:
+            deep_to_shallow[deep_idx] = []
+        deep_to_shallow[deep_idx].append((shallow_idx, sim))
+    
+    # 计算需要堆叠的层
+    layers_to_stack = []
+    for deep_idx in range(deep_layers):
+        # 检查这个深层是否没有匹配的浅层
+        if deep_idx not in deep_to_shallow or len(deep_to_shallow[deep_idx]) == 0:
+            continue
+            
+        # 如果多个浅层都匹配到同一个深层，我们只保留相似度最高的一个
+        if len(deep_to_shallow[deep_idx]) > 1:
+            # 按相似度排序
+            matched_layers = sorted(deep_to_shallow[deep_idx], key=lambda x: x[1], reverse=True)
+            # 第一个是最匹配的，其余的需要堆叠
+            for shallow_idx, sim in matched_layers[1:]:
+                if sim >= similarity_threshold:  # 相似度超过阈值，认为是好的匹配
+                    layers_to_stack.append(shallow_idx)
+    
+    # 从中间层开始处理
+    if start_from_middle:
+        middle_idx = shallow_layers // 2
+        # 按照与中间层的距离排序
+        layers_to_stack.sort(key=lambda x: abs(x - middle_idx))
+    
+    # 确定堆叠次数
+    layers_to_add = deep_layers - shallow_layers
+    for shallow_idx in layers_to_stack:
+        if layers_to_add <= 0:
+            break
+        if shallow_idx not in stack_strategy:
+            stack_strategy[shallow_idx] = 1
+        else:
+            stack_strategy[shallow_idx] += 1
+        layers_to_add -= 1
+    
+    # 如果还需要更多层，从中间开始添加
+    if layers_to_add > 0:
+        middle_start = shallow_layers // 3
+        for i in range(layers_to_add):
+            idx = (middle_start + i) % shallow_layers
+            if idx not in stack_strategy:
+                stack_strategy[idx] = 1
+            else:
+                stack_strategy[idx] += 1
+    
+    return stack_strategy
+
+
+def evaluate_qa_performance(model, tokenizer, dataset, max_new_tokens=50, device=None):
+    """QA任务特定的评估函数"""
+    results = []
+    
+    # 设备选择逻辑与evaluate_model相同
+    if device is None:
+        # ... (保持原有的设备选择逻辑)
+        pass
+    
+    # 确保模型在正确的设备上
+    model_device = next(model.parameters()).device
+    if model_device != device:
+        print(f"将模型从 {model_device} 移动到 {device}...")
+        try:
+            model.to(device)
+        except RuntimeError:
+            print("内存不足，使用CPU评估")
+            device = torch.device("cpu")
+            model.to(device)
+    
+    model.eval()
+    with torch.no_grad():
+        for i in range(len(dataset)):
+            question = dataset[i]["raw_question"]
+            ground_truth = dataset[i]["raw_answer"]
+            
+            print(f"问题: '{question}'")
+            inputs = tokenizer(question, return_tensors="pt").to(device)
+            
+            outputs = model.generate(
+                **inputs, 
+                max_new_tokens=max_new_tokens,
+                do_sample=False,  # 对于QA任务，我们禁用采样以获得确定性回答
+                temperature=0.7,
+                top_k=50,
+                top_p=0.95,
+                pad_token_id=tokenizer.eos_token_id,
+                use_cache=True
+            )
+            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # 提取生成的答案部分
+            answer_part = generated_text[len(question):].strip()
+            
+            results.append({
+                "question": question,
+                "ground_truth": ground_truth,
+                "generated": answer_part
+            })
+            
+            print(f"真实答案: {ground_truth}")
+            print(f"生成答案: {answer_part}\n")
+            
+            # 每次生成后清理缓存
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    return results
+
+
 # --- 5. 主执行流程 ---
 def main():
     # 加载模型
@@ -287,7 +528,11 @@ def main():
     print(f"Llama2层数: {llama_layers}, Qwen2层数: {qwen_layers}")
     
     # 准备数据
-    dataset = load_and_prepare_dataset(tokenizer_llama, tokenizer_qwen, max_samples=8)
+    dataset = load_and_prepare_qa_dataset(
+        tokenizer_llama, tokenizer_qwen, 
+        dataset_name="squad",
+        max_samples=16
+    )
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
     
     # 注册钩子收集激活
@@ -322,7 +567,8 @@ def main():
     plt.savefig('llama2_qwen2_cka_similarity.png')
     plt.close()
     
-    # --- 修改开始：使用LMA算法进行层对齐 ---
+    # --- 保留LMA算法代码，但通过注释禁用 ---
+    '''
     print("\n--- 使用LMA算法进行层对齐 ---")
     # LMA需要浅层模型作为对齐目标，所以如果llama2是深层，qwen2是浅层，直接使用cka_matrix
     # 如果qwen2是深层，llama2是浅层，需要转置cka_matrix
@@ -354,37 +600,62 @@ def main():
         for llama_idx, qwen_indices in enumerate(layer_alignment):
             if len(qwen_indices) > 1:
                 stack_strategy[llama_idx] = len(qwen_indices) - 1
+    '''
     
+    # --- 使用阈值对齐算法 ---
+    print("\n--- 使用阈值方法进行层对齐（从中间层开始）---")
+    if llama_layers > qwen_layers:  # 需要堆叠qwen2
+        deep_model_name, shallow_model_name = "Llama2", "Qwen2"
+        stack_strategy = create_stack_strategy_threshold(cka_matrix, similarity_threshold=0.7)
+    else:  # 需要堆叠llama2
+        deep_model_name, shallow_model_name = "Qwen2", "Llama2"
+        stack_strategy = create_stack_strategy_threshold(cka_matrix.T, similarity_threshold=0.7)
+        
     print(f"\n确定的堆叠策略: {stack_strategy}")
     total_added = sum(stack_strategy.values())
     layers_to_add = abs(llama_layers - qwen_layers)
     print(f"总共添加的层数: {total_added}, 目标添加层数: {layers_to_add}")
     
-    # 如果添加的层数不足，使用原来的策略补充
-    if total_added < layers_to_add:
-        remaining_layers = layers_to_add - total_added
-        print(f"LMA对齐添加的层数不足，还需添加 {remaining_layers} 层")
-        
-        if llama_layers > qwen_layers:  # 需要增加qwen2的层
-            shallow_num_layers = qwen_layers
-        else:  # 需要增加llama2的层
-            shallow_num_layers = llama_layers
-        
-        # 从模型中间开始添加剩余层
-        middle_start = shallow_num_layers // 3
-        for i in range(remaining_layers):
-            idx = (middle_start + i) % shallow_num_layers
-            if idx not in stack_strategy:
-                stack_strategy[idx] = 1
+    # 如果添加的层数不匹配，调整策略
+    if total_added != layers_to_add:
+        print(f"调整堆叠策略以匹配目标层数...")
+        if total_added < layers_to_add:
+            # 需要增加更多层
+            if llama_layers > qwen_layers:
+                shallow_num_layers = qwen_layers
             else:
-                stack_strategy[idx] += 1
+                shallow_num_layers = llama_layers
+                
+            # 从中间开始添加剩余层
+            middle_start = shallow_num_layers // 3
+            for i in range(layers_to_add - total_added):
+                idx = (middle_start + i) % shallow_num_layers
+                if idx not in stack_strategy:
+                    stack_strategy[idx] = 1
+                else:
+                    stack_strategy[idx] += 1
+                
+                print(f"额外堆叠层: {idx}")
+        elif total_added > layers_to_add:
+            # 需要减少层数，从堆叠次数最少的层开始减
+            layers_to_remove = total_added - layers_to_add
+            stack_items = sorted(stack_strategy.items(), key=lambda x: x[1])
             
-            print(f"额外堆叠层: {idx}")
+            for idx, count in stack_items:
+                if layers_to_remove <= 0:
+                    break
+                if count <= layers_to_remove:
+                    layers_to_remove -= count
+                    del stack_strategy[idx]
+                    print(f"移除堆叠层: {idx}")
+                else:
+                    stack_strategy[idx] -= layers_to_remove
+                    layers_to_remove = 0
+                    print(f"减少层 {idx} 的堆叠次数至 {stack_strategy[idx]}")
         
         print(f"最终堆叠策略: {stack_strategy}")
         total_added = sum(stack_strategy.values())
         print(f"最终添加层数: {total_added}, 目标层数: {layers_to_add}")
-    # --- 修改结束 ---
     
     # 创建堆叠模型
     stacked_model, stacked_tokenizer = create_stacked_model(model_qwen, tokenizer_qwen, stack_strategy)
@@ -416,56 +687,194 @@ def main():
     del model_llama
     gc.collect()
     torch.cuda.empty_cache()
-    original_results = evaluate_model(model_qwen, tokenizer_qwen, test_prompts, device=MODEL_DEVICE_B)
+    # 创建评估数据集
+    eval_dataset = load_and_prepare_qa_dataset(
+        tokenizer_llama, tokenizer_qwen,
+        dataset_name="squad", 
+        max_samples=5  # 只使用少量样本进行演示
+    )
+    
+    # 评估原始模型
+    original_results = evaluate_qa_performance(model_qwen, tokenizer_qwen, eval_dataset, device=MODEL_DEVICE_B)
 
     print("\n--- 测试堆叠后的Qwen2模型 ---")
     # 清理更多内存
-    # model_qwen 已经在前面被移动到CPU，这里可以安全删除
     del model_qwen
     gc.collect()
     torch.cuda.empty_cache()
-    # 尝试选择一个空闲的GPU
-    stacked_results = evaluate_model(stacked_model, stacked_tokenizer, test_prompts, device=COMPUTE_DEVICE)
     
+    # 评估堆叠模型
+    stacked_results = evaluate_qa_performance(stacked_model, stacked_tokenizer, eval_dataset, device=COMPUTE_DEVICE)
+    # 比较结果
+    print("\n--- 模型性能比较 ---")
+    for i, (orig, stacked) in enumerate(zip(original_results, stacked_results)):
+        print(f"问题 {i+1}: {orig['question']}")
+        print(f"  真实答案: {orig['ground_truth']}")
+        print(f"  原始模型: {orig['generated']}")
+        print(f"  堆叠模型: {stacked['generated']}")
+        print()
+
     # --- 修复开始 ---
     # 清理资源
     # model_llama 和 model_qwen 已经在前面被删除了，这里只删除 stacked_model
     print("清理最后的模型资源...")
-    del stacked_model
+    # del stacked_model
     gc.collect()
     torch.cuda.empty_cache()
     # --- 修复结束 ---
     
     print("\n任务完成！")
 
-# --- LMA层对齐算法 ---
-def align_layers_lma(C):
-    """使用动态规划进行层对齐"""
-    m, n = C.shape  # m是深层模型层数，n是浅层模型层数
-    F = torch.full((n + 1, m + 1), -torch.inf)
-    F[0, :] = 0
-    path = torch.zeros((n + 1, m + 1), dtype=torch.long)
+    # --- 新增部分：收集和比较激活状态 ---
+    print("\n--- 收集堆叠后模型的激活状态并与Llama2对比 ---")
     
-    for i in range(1, n + 1):
-        for j in range(i, m + 1):
-            max_val, best_k = -torch.inf, -1
-            for k in range(i - 1, j):
-                # 计算从深层模型的k到j-1的层与浅层模型的第i-1层的相似度总和
-                segment_sim = C[k:j, i - 1].sum()
-                current_val = F[i - 1, k] + segment_sim
-                if current_val > max_val:
-                    max_val, best_k = current_val, k
-            F[i, j], path[i, j] = max_val, best_k
+    # 1. 保存原始Llama2的激活状态
+    original_llama_activations = {}
+    for name in names_llama:
+        # 将所有批次的激活拼接成一个张量
+        original_llama_activations[name] = torch.cat(reps_llama[name], dim=0).cpu()
     
-    # 回溯构建对齐方案
-    alignment, i, j = [], n, m
-    while i > 0:
-        k = path[i, j].item()
-        alignment.insert(0, list(range(k, j)))
-        j = k
-        i -= 1
+    # 清理不需要的变量以节省内存
+    del reps_llama, reps_qwen
+    gc.collect()
+    torch.cuda.empty_cache()
     
-    return alignment
+    # 2. 为堆叠模型创建新的钩子
+    stacked_layer_names = [f"model.layers.{i}" for i in range(stacked_model.config.num_hidden_layers)]
+    stacked_reps, stacked_hooks = register_hooks_for_reps(stacked_model, stacked_layer_names)
+    
+    # 3. 在相同的数据上运行堆叠模型
+    print("\n重新加载数据集进行堆叠模型激活收集...")
+    # dataset = load_and_prepare_dataset(tokenizer_llama, stacked_tokenizer, max_samples=8)
+    # dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+    # 准备数据 - 使用QA数据集
+    dataset = load_and_prepare_qa_dataset(
+        tokenizer_llama, tokenizer_qwen, 
+        dataset_name="squad",
+        max_samples=16
+    )
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+    
+    stacked_model.to(COMPUTE_DEVICE)
+    stacked_model.eval()
+    
+    for batch in tqdm(dataloader, desc="收集堆叠模型激活"):
+        with torch.no_grad():
+            stacked_model(
+                input_ids=batch["input_ids_b"].to(COMPUTE_DEVICE),
+                attention_mask=batch["attention_mask_b"].to(COMPUTE_DEVICE)
+            )
+    
+    # 移除钩子
+    for hook in stacked_hooks:
+        hook.remove()
+    
+    # 4. 处理收集到的激活
+    stacked_activations = {}
+    for name in stacked_layer_names:
+        stacked_activations[name] = torch.cat(stacked_reps[name], dim=0).cpu()
+    
+    # 5. 保存激活状态
+    activations_dir = "./model_activations"
+    os.makedirs(activations_dir, exist_ok=True)
+    
+    print(f"\n保存激活状态到 {activations_dir}...")
+    
+    # 保存Llama2激活
+    torch.save(original_llama_activations, os.path.join(activations_dir, "llama2_activations.pt"))
+    
+    # 保存堆叠后Qwen2激活
+    torch.save(stacked_activations, os.path.join(activations_dir, "stacked_qwen2_activations.pt"))
+    
+    # 6. 计算堆叠模型层与Llama2层之间的CKA相似度
+    print("\n计算堆叠模型与Llama2的层间相似度...")
+    stacked_cka_matrix = compute_cka_matrix(
+        {name: [original_llama_activations[name]] for name in names_llama},
+        {name: [stacked_activations[name]] for name in stacked_layer_names},
+        names_llama,
+        stacked_layer_names
+    )
+    
+    # 7. 可视化新的CKA矩阵
+    plt.figure(figsize=(12, 10))
+    plt.imshow(stacked_cka_matrix, cmap='viridis')
+    plt.colorbar(label='CKA Similarity')
+    plt.xlabel('Stacked Qwen2 Layers')
+    plt.ylabel('Llama2 Layers')
+    plt.title('Layer-wise CKA Similarity between Llama2 and Stacked Qwen2')
+    plt.savefig(os.path.join(activations_dir, 'llama2_stacked_qwen2_cka_similarity.png'))
+    plt.close()
+    
+    # 8. 分析层对齐效果
+    print("\n--- 分析层对齐效果 ---")
+    # 寻找堆叠后每一层最相似的Llama2层
+    best_matches = {}
+    for j, stacked_name in enumerate(stacked_layer_names):
+        best_i = torch.argmax(stacked_cka_matrix[:, j]).item()
+        similarity = stacked_cka_matrix[best_i, j].item()
+        best_matches[stacked_name] = (names_llama[best_i], similarity)
+    
+    # 输出对齐结果分析
+    print("\n堆叠Qwen2模型的层与Llama2模型最相似的层:")
+    for stacked_name, (llama_name, sim) in best_matches.items():
+        stacked_idx = int(stacked_name.split('.')[-1])
+        llama_idx = int(llama_name.split('.')[-1])
+        print(f"  堆叠Qwen2层 {stacked_idx} -> Llama2层 {llama_idx} (相似度: {sim:.4f})")
+    
+    # 9. 将分析结果保存到文件
+    with open(os.path.join(activations_dir, "layer_alignment_analysis.txt"), "w") as f:
+        f.write("堆叠Qwen2模型的层与Llama2模型最相似的层:\n")
+        for stacked_name, (llama_name, sim) in best_matches.items():
+            stacked_idx = int(stacked_name.split('.')[-1])
+            llama_idx = int(llama_name.split('.')[-1])
+            f.write(f"堆叠Qwen2层 {stacked_idx} -> Llama2层 {llama_idx} (相似度: {sim:.4f})\n")
+    
+    # 10. 可视化激活状态的PCA (可选，仅对一部分层)
+    try:
+        from sklearn.decomposition import PCA
+        
+        print("\n执行神经元激活的PCA分析...")
+        
+        # 选择一些关键层进行可视化
+        key_indices = [0, stacked_model.config.num_hidden_layers // 4, 
+                       stacked_model.config.num_hidden_layers // 2,
+                       stacked_model.config.num_hidden_layers - 1]
+        
+        for idx in key_indices:
+            llama_layer = names_llama[idx] if idx < len(names_llama) else names_llama[-1]
+            stacked_layer = stacked_layer_names[idx]
+            
+            # 提取激活并降维
+            llama_act = original_llama_activations[llama_layer].flatten(1)
+            stacked_act = stacked_activations[stacked_layer].flatten(1)
+            
+            # 对前1000个token进行PCA
+            max_tokens = min(1000, llama_act.shape[0], stacked_act.shape[0])
+            
+            # 执行PCA
+            pca = PCA(n_components=2)
+            llama_pca = pca.fit_transform(llama_act[:max_tokens].numpy())
+            stacked_pca = pca.fit_transform(stacked_act[:max_tokens].numpy())
+            
+            # 可视化
+            plt.figure(figsize=(10, 8))
+            plt.scatter(llama_pca[:, 0], llama_pca[:, 1], alpha=0.5, label=f'Llama2 {llama_layer}')
+            plt.scatter(stacked_pca[:, 0], stacked_pca[:, 1], alpha=0.5, label=f'Stacked Qwen2 {stacked_layer}')
+            plt.legend()
+            plt.title(f'PCA of Layer Activations - Layer {idx}')
+            plt.savefig(os.path.join(activations_dir, f'pca_layer_{idx}.png'))
+            plt.close()
+        
+        print("PCA分析完成并保存在激活目录中")
+    except ImportError:
+        print("未安装scikit-learn，跳过PCA分析")
+    
+    # 清理资源
+    del original_llama_activations, stacked_activations, stacked_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    print("\n激活状态收集与分析完成！数据已保存到", activations_dir)
 
 if __name__ == "__main__":
     main()
