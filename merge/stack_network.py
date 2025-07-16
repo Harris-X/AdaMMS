@@ -63,14 +63,11 @@ def load_and_prepare_qa_dataset(tokenizer_a, tokenizer_b, dataset_name="squad", 
     
     # 加载数据集
     if dataset_name == "squad":
-        # SQuAD数据集结构：每个样本包含一个问题和答案
         dataset = load_dataset("squad", split=split)
         
-        # 对于SQuAD，直接使用现有结构
         flattened_data = []
         for example in dataset:
             question = example["question"]
-            # SQuAD中答案是一个字典，包含'text'列表和'answer_start'列表
             answer_text = example["answers"]["text"][0] if example["answers"]["text"] else ""
             context = example["context"]
             
@@ -80,7 +77,6 @@ def load_and_prepare_qa_dataset(tokenizer_a, tokenizer_b, dataset_name="squad", 
                 "context": context
             })
         
-        # 创建新的数据集对象
         from datasets import Dataset
         dataset = Dataset.from_dict({
             "question": [item["question"] for item in flattened_data],
@@ -88,17 +84,19 @@ def load_and_prepare_qa_dataset(tokenizer_a, tokenizer_b, dataset_name="squad", 
             "context": [item["context"] for item in flattened_data]
         }).select(range(min(max_samples, len(flattened_data))))
     else:
-        # 其他QA数据集的通用加载方法
         dataset = load_dataset(dataset_name, split=split).select(range(max_samples))
     
     def tokenize_qa_fn(examples):
-        # 对于QA数据集，我们使用问题作为输入
         questions = examples["question"]
+        answers = examples["answer"]
         
         # 确保问题非空
-        valid_questions = [q for q in questions if q and q.strip()]
-        if not valid_questions:
+        valid_indices = [i for i, q in enumerate(questions) if q and q.strip()]
+        if not valid_indices:
             return {}
+        
+        valid_questions = [questions[i] for i in valid_indices]
+        valid_answers = [answers[i] for i in valid_indices]
         
         # 添加前缀使问题更明确
         formatted_questions = [f"Question: {q} Answer:" for q in valid_questions]
@@ -113,12 +111,18 @@ def load_and_prepare_qa_dataset(tokenizer_a, tokenizer_b, dataset_name="squad", 
             "input_ids_b": inputs_b.input_ids,
             "attention_mask_b": inputs_b.attention_mask,
             "raw_question": valid_questions,
-            "raw_answer": [examples["answer"][i] for i, q in enumerate(questions) if q and q.strip()]
+            "raw_answer": valid_answers
         }
     
     # 处理数据集
     processed_dataset = dataset.map(tokenize_qa_fn, batched=True, remove_columns=dataset.column_names)
-    processed_dataset.set_format(type='torch', columns=["input_ids_a", "attention_mask_a", "input_ids_b", "attention_mask_b"])
+    
+    # --- 修复：包含所有字段在 set_format 中 ---
+    processed_dataset.set_format(
+        type='torch', 
+        columns=["input_ids_a", "attention_mask_a", "input_ids_b", "attention_mask_b"],
+        output_all_columns=True  # 确保所有列都可以访问
+    )
     
     return processed_dataset
 
@@ -463,13 +467,32 @@ def evaluate_qa_performance(model, tokenizer, dataset, max_new_tokens=50, device
     
     # 设备选择逻辑与evaluate_model相同
     if device is None:
-        # ... (保持原有的设备选择逻辑)
-        pass
+        # 尝试找到有足够内存的GPU
+        if torch.cuda.is_available():
+            # 检查可用GPU内存
+            device_id = -1
+            max_free_mem = 0
+            for i in range(torch.cuda.device_count()):
+                free_mem = torch.cuda.get_device_properties(i).total_memory - torch.cuda.memory_allocated(i)
+                if free_mem > max_free_mem and free_mem > 2 * 1024 * 1024 * 1024:  # 至少需要2GB空闲
+                    max_free_mem = free_mem
+                    device_id = i
+            
+            if device_id >= 0:
+                device = torch.device(f"cuda:{device_id}")
+                print(f"使用GPU {device_id} 进行评估")
+            else:
+                device = torch.device("cpu")
+                print("所有GPU内存不足，使用CPU进行评估")
+        else:
+            device = torch.device("cpu")
+            print("无可用GPU，使用CPU进行评估")
     
     # 确保模型在正确的设备上
     model_device = next(model.parameters()).device
     if model_device != device:
         print(f"将模型从 {model_device} 移动到 {device}...")
+        # 如果是大模型，可能需要逐层加载到GPU
         try:
             model.to(device)
         except RuntimeError:
@@ -674,40 +697,107 @@ def main():
     stacked_tokenizer.save_pretrained(output_dir)
     print("模型保存完成。")
     
-    # 测试评估模型
+    # === 新增：测试提示评估 ===
     test_prompts = [
         "The capital of France is",
         "Artificial intelligence can be defined as",
-        "The main difference between deep learning and machine learning is",
+        "小梅数她家的鸡与兔,数头有16个,数脚有44只.问小梅家的鸡与兔各有多少只？",
         "In the context of climate change, renewable energy sources"
     ]
     
-    print("\n--- 测试原始Qwen2模型 ---")
-    # 清理内存以释放空间
-    del model_llama
+    print("\n=== 开始对原始模型进行测试提示评估 ===")
+    
+    # 测试原始的两个模型
+    original_test_results = test_models_with_prompts(
+        model_llama, tokenizer_llama, 
+        model_qwen, tokenizer_qwen, 
+        test_prompts
+    )
+    
+    print("\n=== 测试堆叠后的模型 ===")
+    
+    # 清理内存为堆叠模型测试做准备
+    del model_llama  # 已经测试完成，可以删除
     gc.collect()
     torch.cuda.empty_cache()
+    
+    # 测试堆叠模型
+    print("\n--- 测试堆叠后的Qwen2模型 ---")
+    try:
+        stacked_test_results = evaluate_model(
+            stacked_model, 
+            stacked_tokenizer, 
+            test_prompts, 
+            max_new_tokens=100,
+            device=COMPUTE_DEVICE
+        )
+        
+        print("堆叠模型测试结果:")
+        for i, result in enumerate(stacked_test_results):
+            print(f"  提示 {i+1}: {result['prompt']}")
+            print(f"  生成: {result['generated']}")
+            print()
+            
+    except Exception as e:
+        print(f"堆叠模型测试失败: {e}")
+        stacked_test_results = []
+    
+    # 保存测试结果
+    save_test_results(original_test_results, stacked_test_results)
+    
+    # 显示对比结果
+    print("\n=== 模型性能对比总结 ===")
+    for i, prompt in enumerate(test_prompts):
+        print(f"\n测试提示 {i+1}: '{prompt}'")
+        print("-" * 60)
+        
+        # Llama2 结果
+        if i < len(original_test_results.get("llama2", [])):
+            llama_response = original_test_results["llama2"][i]["generated"]
+            print(f"Llama2: {llama_response[:100]}{'...' if len(llama_response) > 100 else ''}")
+        else:
+            print("Llama2: [测试失败]")
+        
+        # Qwen2 结果
+        if i < len(original_test_results.get("qwen2", [])):
+            qwen_response = original_test_results["qwen2"][i]["generated"]
+            print(f"Qwen2: {qwen_response[:100]}{'...' if len(qwen_response) > 100 else ''}")
+        else:
+            print("Qwen2: [测试失败]")
+        
+        # 堆叠模型结果
+        if i < len(stacked_test_results):
+            stacked_response = stacked_test_results[i]["generated"]
+            print(f"堆叠Qwen2: {stacked_response[:100]}{'...' if len(stacked_response) > 100 else ''}")
+        else:
+            print("堆叠Qwen2: [测试失败]")
+    
+    # === 继续原有的QA数据集测试 ===
+    print("\n=== 开始QA数据集测试 ===")
+    
     # 创建评估数据集
     eval_dataset = load_and_prepare_qa_dataset(
         tokenizer_llama, tokenizer_qwen,
         dataset_name="squad", 
-        max_samples=5  # 只使用少量样本进行演示
+        max_samples=5
     )
     
-    # 评估原始模型
-    original_results = evaluate_qa_performance(model_qwen, tokenizer_qwen, eval_dataset, device=MODEL_DEVICE_B)
+    # 评估原始Qwen2模型
+    print("\n--- QA测试：原始Qwen2模型 ---")
+    original_qa_results = evaluate_qa_performance(model_qwen, tokenizer_qwen, eval_dataset, device=MODEL_DEVICE_B)
 
-    print("\n--- 测试堆叠后的Qwen2模型 ---")
     # 清理更多内存
     del model_qwen
     gc.collect()
     torch.cuda.empty_cache()
     
     # 评估堆叠模型
-    stacked_results = evaluate_qa_performance(stacked_model, stacked_tokenizer, eval_dataset, device=COMPUTE_DEVICE)
-    # 比较结果
-    print("\n--- 模型性能比较 ---")
-    for i, (orig, stacked) in enumerate(zip(original_results, stacked_results)):
+    print("\n--- QA测试：堆叠后的Qwen2模型 ---")
+    stacked_qa_results = evaluate_qa_performance(stacked_model, stacked_tokenizer, eval_dataset, device=COMPUTE_DEVICE)
+    
+    # QA测试结果对比
+    print("\n--- QA模型性能比较 ---")
+    for i, (orig, stacked) in enumerate(zip(original_qa_results, stacked_qa_results)):
         print(f"问题 {i+1}: {orig['question']}")
         print(f"  真实答案: {orig['ground_truth']}")
         print(f"  原始模型: {orig['generated']}")
@@ -731,8 +821,8 @@ def main():
     # 1. 保存原始Llama2的激活状态
     original_llama_activations = {}
     for name in names_llama:
-        # 将所有批次的激活拼接成一个张量
-        original_llama_activations[name] = torch.cat(reps_llama[name], dim=0).cpu()
+        # 将所有批次的激活拼接成一个张量，并确保是 float32 类型
+        original_llama_activations[name] = torch.cat(reps_llama[name], dim=0).float().cpu()
     
     # 清理不需要的变量以节省内存
     del reps_llama, reps_qwen
@@ -772,7 +862,8 @@ def main():
     # 4. 处理收集到的激活
     stacked_activations = {}
     for name in stacked_layer_names:
-        stacked_activations[name] = torch.cat(stacked_reps[name], dim=0).cpu()
+        # 确保激活数据是 float32 类型以避免后续问题
+        stacked_activations[name] = torch.cat(stacked_reps[name], dim=0).float().cpu()
     
     # 5. 保存激活状态
     activations_dir = "./model_activations"
@@ -851,30 +942,298 @@ def main():
             # 对前1000个token进行PCA
             max_tokens = min(1000, llama_act.shape[0], stacked_act.shape[0])
             
-            # 执行PCA
-            pca = PCA(n_components=2)
-            llama_pca = pca.fit_transform(llama_act[:max_tokens].numpy())
-            stacked_pca = pca.fit_transform(stacked_act[:max_tokens].numpy())
+            # --- 修复开始：分别处理不同维度的数据 ---
+            # 将 BFloat16 转换为 float32，然后转换为 numpy
+            llama_act_subset = llama_act[:max_tokens].float().numpy()
+            stacked_act_subset = stacked_act[:max_tokens].float().numpy()
             
-            # 可视化
-            plt.figure(figsize=(10, 8))
-            plt.scatter(llama_pca[:, 0], llama_pca[:, 1], alpha=0.5, label=f'Llama2 {llama_layer}')
-            plt.scatter(stacked_pca[:, 0], stacked_pca[:, 1], alpha=0.5, label=f'Stacked Qwen2 {stacked_layer}')
-            plt.legend()
-            plt.title(f'PCA of Layer Activations - Layer {idx}')
-            plt.savefig(os.path.join(activations_dir, f'pca_layer_{idx}.png'))
-            plt.close()
+            print(f"层 {idx}: Llama2 特征维度: {llama_act_subset.shape[1]}, 堆叠Qwen2 特征维度: {stacked_act_subset.shape[1]}")
+            
+            # 检查数据有效性
+            if np.any(np.isnan(llama_act_subset)) or np.any(np.isnan(stacked_act_subset)):
+                print(f"警告: 层 {idx} 的激活数据包含 NaN，跳过此层的 PCA 分析")
+                continue
+                
+            if np.any(np.isinf(llama_act_subset)) or np.any(np.isinf(stacked_act_subset)):
+                print(f"警告: 层 {idx} 的激活数据包含无穷大值，跳过此层的 PCA 分析")
+                continue
+            
+            # 执行PCA - 分别为每个模型创建 PCA
+            try:
+                # 为 Llama2 数据创建并拟合 PCA
+                pca_llama = PCA(n_components=2)
+                llama_pca = pca_llama.fit_transform(llama_act_subset)
+                
+                # 为堆叠 Qwen2 数据创建并拟合独立的 PCA
+                pca_stacked = PCA(n_components=2)
+                stacked_pca = pca_stacked.fit_transform(stacked_act_subset)
+                
+                # 可视化 - 分别显示两个模型的 PCA 结果
+                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+                
+                # 子图1: Llama2 PCA
+                ax1.scatter(llama_pca[:, 0], llama_pca[:, 1], alpha=0.6, color='blue', s=20)
+                ax1.set_title(f'Llama2 {llama_layer} PCA')
+                ax1.set_xlabel('First Principal Component')
+                ax1.set_ylabel('Second Principal Component')
+                ax1.grid(True, alpha=0.3)
+                
+                # 子图2: 堆叠 Qwen2 PCA
+                ax2.scatter(stacked_pca[:, 0], stacked_pca[:, 1], alpha=0.6, color='red', s=20)
+                ax2.set_title(f'Stacked Qwen2 {stacked_layer} PCA')
+                ax2.set_xlabel('First Principal Component')
+                ax2.set_ylabel('Second Principal Component')
+                ax2.grid(True, alpha=0.3)
+                
+                # 子图3: 重叠比较（标准化后）
+                # 标准化 PCA 结果以便比较
+                llama_pca_norm = (llama_pca - llama_pca.mean(axis=0)) / llama_pca.std(axis=0)
+                stacked_pca_norm = (stacked_pca - stacked_pca.mean(axis=0)) / stacked_pca.std(axis=0)
+                
+                ax3.scatter(llama_pca_norm[:, 0], llama_pca_norm[:, 1], 
+                           alpha=0.5, color='blue', s=20, label=f'Llama2 {llama_layer}')
+                ax3.scatter(stacked_pca_norm[:, 0], stacked_pca_norm[:, 1], 
+                           alpha=0.5, color='red', s=20, label=f'Stacked Qwen2 {stacked_layer}')
+                ax3.set_title(f'Normalized PCA Comparison - Layer {idx}')
+                ax3.set_xlabel('Normalized PC1')
+                ax3.set_ylabel('Normalized PC2')
+                ax3.legend()
+                ax3.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(activations_dir, f'pca_layer_{idx}_comparison.png'), 
+                           dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                # 计算并保存解释方差比
+                with open(os.path.join(activations_dir, f'pca_layer_{idx}_variance.txt'), 'w') as f:
+                    f.write(f"层 {idx} PCA 分析结果:\n")
+                    f.write(f"Llama2 {llama_layer}:\n")
+                    f.write(f"  特征维度: {llama_act_subset.shape[1]}\n")
+                    f.write(f"  PC1 解释方差比: {pca_llama.explained_variance_ratio_[0]:.4f}\n")
+                    f.write(f"  PC2 解释方差比: {pca_llama.explained_variance_ratio_[1]:.4f}\n")
+                    f.write(f"  总解释方差比: {pca_llama.explained_variance_ratio_.sum():.4f}\n\n")
+                    
+                    f.write(f"堆叠Qwen2 {stacked_layer}:\n")
+                    f.write(f"  特征维度: {stacked_act_subset.shape[1]}\n")
+                    f.write(f"  PC1 解释方差比: {pca_stacked.explained_variance_ratio_[0]:.4f}\n")
+                    f.write(f"  PC2 解释方差比: {pca_stacked.explained_variance_ratio_[1]:.4f}\n")
+                    f.write(f"  总解释方差比: {pca_stacked.explained_variance_ratio_.sum():.4f}\n")
+                
+                print(f"层 {idx} 的 PCA 分析完成")
+                
+            except Exception as e:
+                print(f"层 {idx} 的 PCA 分析失败: {e}")
+                continue
+            # --- 修复结束 ---
         
         print("PCA分析完成并保存在激活目录中")
     except ImportError:
         print("未安装scikit-learn，跳过PCA分析")
+    except Exception as e:
+        print(f"PCA分析过程中出现错误: {e}")
     
     # 清理资源
-    del original_llama_activations, stacked_activations, stacked_model
+    # del stacked_activations, stacked_model # original_llama_activations
     gc.collect()
     torch.cuda.empty_cache()
     
     print("\n激活状态收集与分析完成！数据已保存到", activations_dir)
+
+    # 在 PCA 分析之后添加这个可选的高级对比方法
+
+    # 11. 可选：通过 CCA (Canonical Correlation Analysis) 对比不同维度的激活
+    try:
+        from sklearn.cross_decomposition import CCA
+        
+        print("\n执行 CCA 分析以直接比较不同维度的激活...")
+        
+        for idx in key_indices:
+            llama_layer = names_llama[idx] if idx < len(names_llama) else names_llama[-1]
+            stacked_layer = stacked_layer_names[idx]
+            
+            llama_act = original_llama_activations[llama_layer].flatten(1)
+            stacked_act = stacked_activations[stacked_layer].flatten(1)
+            
+            max_tokens = min(500, llama_act.shape[0], stacked_act.shape[0])  # 使用更少的样本以加速CCA
+            
+            llama_act_subset = llama_act[:max_tokens].float().numpy()
+            stacked_act_subset = stacked_act[:max_tokens].float().numpy()
+            
+            # 确定 CCA 的组件数量（不能超过最小的特征维度）
+            n_components = min(2, llama_act_subset.shape[1], stacked_act_subset.shape[1])
+            
+            if n_components < 2:
+                print(f"跳过层 {idx} 的 CCA 分析，特征维度太小")
+                continue
+            
+            try:
+                # 执行 CCA
+                cca = CCA(n_components=n_components)
+                llama_cca, stacked_cca = cca.fit_transform(llama_act_subset, stacked_act_subset)
+                
+                # 可视化 CCA 结果
+                plt.figure(figsize=(10, 8))
+                plt.scatter(llama_cca[:, 0], llama_cca[:, 1], alpha=0.5, 
+                           color='blue', s=20, label=f'Llama2 {llama_layer}')
+                plt.scatter(stacked_cca[:, 0], stacked_cca[:, 1], alpha=0.5, 
+                           color='red', s=20, label=f'Stacked Qwen2 {stacked_layer}')
+                plt.xlabel('First Canonical Component')
+                plt.ylabel('Second Canonical Component')
+                plt.title(f'CCA Analysis - Layer {idx}')
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.savefig(os.path.join(activations_dir, f'cca_layer_{idx}.png'), 
+                           dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                # 计算典型相关系数
+                correlations = []
+                for i in range(n_components):
+                    corr = np.corrcoef(llama_cca[:, i], stacked_cca[:, i])[0, 1]
+                    correlations.append(corr)
+                
+                print(f"层 {idx} CCA 典型相关系数: {correlations}")
+                
+                # 保存CCA结果
+                with open(os.path.join(activations_dir, f'cca_layer_{idx}_results.txt'), 'w') as f:
+                    f.write(f"层 {idx} CCA 分析结果:\n")
+                    f.write(f"典型相关系数: {correlations}\n")
+                    f.write(f"平均相关系数: {np.mean(correlations):.4f}\n")
+                
+            except Exception as e:
+                print(f"层 {idx} 的 CCA 分析失败: {e}")
+                continue
+        
+        print("CCA分析完成")
+        
+    except ImportError:
+        print("未安装scikit-learn的CCA模块，跳过CCA分析")
+    except Exception as e:
+        print(f"CCA分析过程中出现错误: {e}")
+
+def test_models_with_prompts(model_llama, tokenizer_llama, model_qwen, tokenizer_qwen, test_prompts):
+    """
+    使用测试提示对两个模型进行评估和比较
+    
+    Args:
+        model_llama: Llama2模型
+        tokenizer_llama: Llama2分词器
+        model_qwen: Qwen2模型
+        tokenizer_qwen: Qwen2分词器
+        test_prompts: 测试提示列表
+    
+    Returns:
+        包含两个模型测试结果的字典
+    """
+    print("\n=== 开始对两个模型进行测试提示评估 ===")
+    
+    results = {
+        "llama2": [],
+        "qwen2": []
+    }
+    
+    # 测试 Llama2 模型
+    print("\n--- 测试 Llama2 模型 ---")
+    try:
+        llama_results = evaluate_model(
+            model_llama, 
+            tokenizer_llama, 
+            test_prompts, 
+            max_new_tokens=100,  # 增加生成长度以获得更完整的回答
+            device=MODEL_DEVICE_A
+        )
+        results["llama2"] = llama_results
+        
+        print("Llama2 模型测试结果:")
+        for i, result in enumerate(llama_results):
+            print(f"  提示 {i+1}: {result['prompt']}")
+            print(f"  生成: {result['generated']}")
+            print()
+            
+    except Exception as e:
+        print(f"Llama2 模型测试失败: {e}")
+        results["llama2"] = []
+    
+    # 测试 Qwen2 模型
+    print("\n--- 测试 Qwen2 模型 ---")
+    try:
+        qwen_results = evaluate_model(
+            model_qwen, 
+            tokenizer_qwen, 
+            test_prompts, 
+            max_new_tokens=100,
+            device=MODEL_DEVICE_B
+        )
+        results["qwen2"] = qwen_results
+        
+        print("Qwen2 模型测试结果:")
+        for i, result in enumerate(qwen_results):
+            print(f"  提示 {i+1}: {result['prompt']}")
+            print(f"  生成: {result['generated']}")
+            print()
+            
+    except Exception as e:
+        print(f"Qwen2 模型测试失败: {e}")
+        results["qwen2"] = []
+    
+    return results
+
+def save_test_results(test_results, stacked_results, output_dir="./test_results"):
+    """
+    保存测试结果到文件
+    
+    Args:
+        test_results: 原始模型测试结果
+        stacked_results: 堆叠模型测试结果
+        output_dir: 输出目录
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 保存详细的测试结果
+    import json
+    
+    # 创建完整的测试报告
+    full_report = {
+        "original_models": test_results,
+        "stacked_model": stacked_results,
+        "test_prompts": test_prompts,
+        "timestamp": str(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+    }
+    
+    # 保存 JSON 格式的结果
+    with open(os.path.join(output_dir, "test_results.json"), "w", encoding="utf-8") as f:
+        json.dump(full_report, f, ensure_ascii=False, indent=2)
+    
+    # 保存人类可读的文本格式
+    with open(os.path.join(output_dir, "test_results.txt"), "w", encoding="utf-8") as f:
+        f.write("=== 模型测试结果对比报告 ===\n\n")
+        
+        for i, prompt in enumerate(test_prompts):
+            f.write(f"测试提示 {i+1}: {prompt}\n")
+            f.write("=" * 50 + "\n")
+            
+            # Llama2 结果
+            if i < len(test_results.get("llama2", [])):
+                f.write(f"Llama2 生成:\n{test_results['llama2'][i]['generated']}\n\n")
+            else:
+                f.write("Llama2 生成: [测试失败]\n\n")
+            
+            # Qwen2 结果
+            if i < len(test_results.get("qwen2", [])):
+                f.write(f"Qwen2 生成:\n{test_results['qwen2'][i]['generated']}\n\n")
+            else:
+                f.write("Qwen2 生成: [测试失败]\n\n")
+            
+            # 堆叠模型结果
+            if i < len(stacked_results):
+                f.write(f"堆叠Qwen2 生成:\n{stacked_results[i]['generated']}\n\n")
+            else:
+                f.write("堆叠Qwen2 生成: [测试失败]\n\n")
+            
+            f.write("-" * 80 + "\n\n")
+    
+    print(f"测试结果已保存到 {output_dir}")
 
 if __name__ == "__main__":
     main()

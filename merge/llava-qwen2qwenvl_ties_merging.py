@@ -16,14 +16,14 @@ except:
 OUTPUT_PATH = "converted-minicpm2qwen"
 
 CKPT_PATH = {
-    "cogvlm_chat": "/yeesuanAI05/thumt/dyy/model/cogvlm-base-490-hf", #"/yeesuanAI05/thumt/dyy/model/cogvlm-chat-hf",
-    "cogvlm_grounding": "/yeesuanAI05/thumt/dyy/model/cogvlm-grounding-generalist-hf",
-    "llava": "/yeesuanAI05/thumt/dyy/model/llava-v1.5-7b",
-    "sharegpt": "/yeesuanAI05/thumt/dyy/model/ShareGPT4V-7B-llava",
+    "cogvlm_chat": "/home/user/xieqiuhao/AdaMMS/downloaded_models/cogvlm-base-490-hf", #"/home/user/xieqiuhao/AdaMMS/downloaded_models/cogvlm-chat-hf",
+    "cogvlm_grounding": "/home/user/xieqiuhao/AdaMMS/downloaded_models/cogvlm-grounding-generalist-hf",
+    "llava": "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-v1.5-7b",
+    "sharegpt": "/home/user/xieqiuhao/AdaMMS/downloaded_models/ShareGPT4V-7B-llava",
     "vicuna-v1.5": "/yeesuanAI05/thumt/cc/checkpoints/vicuna-7b-v1.5",
-    "qwen2-7B": "/yeesuanAI05/thumt/dyy/model/qwen2-7b-instruct/Qwen2-7B-Instruct",
-    "qwen2_vl":"/yeesuanAI05/thumt/dyy/model/Qwen2-VL-7B-Instruct",
-    "llava-onevision-qwen" : "/yeesuanAI05/thumt/dyy/model/llava-onevision-qwen2-7b-si"
+    "qwen2-7B": "/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct",
+    "qwen2_vl":"/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct",
+    "llava-onevision-qwen" : "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si"
 }
 
 INDEX_FILENAME = {
@@ -222,7 +222,7 @@ def convert(args):
 if __name__ == "__main__":
    
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output', type=str, default='/yeesuanAI05/thumt/dyy/model/checkpoints/debug/debug-0.5-llava2qwen/qwen2_vl', help="Output checkpoint path")
+    parser.add_argument('--output', type=str, default='/home/user/xieqiuhao/AdaMMS/downloaded_models/checkpoints/debug/debug-0.5-llava2qwen/qwen2_vl', help="Output checkpoint path")
     parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--interpolation',default=False, action='store_true')
     parser.add_argument('--noLN', default=False, action='store_true')    
@@ -234,11 +234,11 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    args.output=f"/yeesuanAI05/thumt/dyy/model/checkpoints/debug/{args.strategy}-K-{str(args.K)}-llava2qwen"
+    args.output=f"/home/user/xieqiuhao/AdaMMS/downloaded_models/checkpoints/debug/{args.strategy}-K-{str(args.K)}-llava2qwen"
     print(args)
     # if args.reverse:
-    #     CKPT_PATH['llava'] ="/yeesuanAI05/thumt/dyy/model/ShareGPT4V-7B-llava"
-    #     CKPT_PATH['sharegpt'] = "/yeesuanAI05/thumt/dyy/model/llava-v1.5-7b"
+    #     CKPT_PATH['llava'] ="/home/user/xieqiuhao/AdaMMS/downloaded_models/ShareGPT4V-7B-llava"
+    #     CKPT_PATH['sharegpt'] = "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-v1.5-7b"
     
 
     convert(args)
