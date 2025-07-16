@@ -14,9 +14,9 @@ CKPT_PATH = {
     "llama2": "./downloaded_models/Llama-2-7b-hf",
     "qwen2": "./downloaded_models/Qwen2-7B-Instruct",
 }
-MODEL_DEVICE_A = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+MODEL_DEVICE_A = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 MODEL_DEVICE_B = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
-COMPUTE_DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+COMPUTE_DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print(f"模型A设备: {MODEL_DEVICE_A}, 模型B设备: {MODEL_DEVICE_B}, 计算设备: {COMPUTE_DEVICE}")
 
 # --- 2. 辅助函数 ---
@@ -148,7 +148,9 @@ def create_stacked_model(model_qwen, tokenizer_qwen, stack_strategy):
     # 创建层映射关系
     layer_mapping = []
     for old_idx in range(original_num_layers):
+        # 根据堆叠策略，确定每个原始层需要重复的次数
         repeat_times = 1 + stack_strategy.get(old_idx, 0)
+        # 将该层索引重复相应次数添加到映射中
         for _ in range(repeat_times):
             layer_mapping.append(old_idx)
     
@@ -320,51 +322,69 @@ def main():
     plt.savefig('llama2_qwen2_cka_similarity.png')
     plt.close()
     
-    # 确定堆叠策略
-    # 方法1: 使用CKA矩阵中最相似的层
+    # --- 修改开始：使用LMA算法进行层对齐 ---
+    print("\n--- 使用LMA算法进行层对齐 ---")
+    # LMA需要浅层模型作为对齐目标，所以如果llama2是深层，qwen2是浅层，直接使用cka_matrix
+    # 如果qwen2是深层，llama2是浅层，需要转置cka_matrix
+    if llama_layers > qwen_layers:  # llama2是深层模型
+        layer_alignment = align_layers_lma(cka_matrix)
+        deep_model_name, shallow_model_name = "Llama2", "Qwen2"
+        deep_layers, shallow_layers = names_llama, names_qwen
+    else:  # qwen2是深层模型
+        layer_alignment = align_layers_lma(cka_matrix.T)
+        deep_model_name, shallow_model_name = "Qwen2", "Llama2"
+        deep_layers, shallow_layers = names_qwen, names_llama
+    
+    print("\n层对齐结果 (Shallow -> Deep Segments):")
+    for i, segment in enumerate(layer_alignment):
+        print(f"  {shallow_model_name} Layer {i} -> {deep_model_name} Layers {segment}")
+    
+    # 创建堆叠策略（针对qwen2）
     stack_strategy = {}
     
-    # 计算需要额外堆叠的层数
-    layers_to_add = llama_layers - qwen_layers  # 应该是4
+    if llama_layers > qwen_layers:  # 需要堆叠qwen2
+        # 对于每个qwen2层，检查它对应几个llama2层
+        for qwen_idx, llama_indices in enumerate(layer_alignment):
+            # 如果一个qwen2层对应多个llama2层，则需要堆叠
+            if len(llama_indices) > 1:
+                # 需要堆叠的次数 = 对应的llama2层数 - 1
+                stack_strategy[qwen_idx] = len(llama_indices) - 1
+    else:  # 需要堆叠llama2（这种情况应该不会发生，但为完整性保留）
+        # 对于每个llama2层，检查它对应几个qwen2层
+        for llama_idx, qwen_indices in enumerate(layer_alignment):
+            if len(qwen_indices) > 1:
+                stack_strategy[llama_idx] = len(qwen_indices) - 1
     
-    # 找出哪些Qwen层与多个Llama层高度相似
-    layer_match_counts = {}
-    threshold = 0.8 * torch.max(cka_matrix)  # 设置相似度阈值
+    print(f"\n确定的堆叠策略: {stack_strategy}")
+    total_added = sum(stack_strategy.values())
+    layers_to_add = abs(llama_layers - qwen_layers)
+    print(f"总共添加的层数: {total_added}, 目标添加层数: {layers_to_add}")
     
-    for llama_idx in range(llama_layers):
-        max_sim_qwen_idx = torch.argmax(cka_matrix[llama_idx]).item()
-        if cka_matrix[llama_idx, max_sim_qwen_idx] > threshold:
-            if max_sim_qwen_idx not in layer_match_counts:
-                layer_match_counts[max_sim_qwen_idx] = 0
-            layer_match_counts[max_sim_qwen_idx] += 1
-    
-    # 根据匹配次数排序
-    sorted_matches = sorted(layer_match_counts.items(), key=lambda x: x[1], reverse=True)
-    
-    # 分配堆叠次数
-    remaining_layers = layers_to_add
-    for qwen_idx, match_count in sorted_matches:
-        if remaining_layers <= 0:
-            break
-        # 每个高频匹配层最多堆叠1次
-        stack_times = min(1, remaining_layers)
-        stack_strategy[qwen_idx] = stack_times
-        remaining_layers -= stack_times
-    
-    # 如果还有剩余需要堆叠的层，从模型中间开始堆叠
-    if remaining_layers > 0:
-        middle_start = qwen_layers // 3
+    # 如果添加的层数不足，使用原来的策略补充
+    if total_added < layers_to_add:
+        remaining_layers = layers_to_add - total_added
+        print(f"LMA对齐添加的层数不足，还需添加 {remaining_layers} 层")
+        
+        if llama_layers > qwen_layers:  # 需要增加qwen2的层
+            shallow_num_layers = qwen_layers
+        else:  # 需要增加llama2的层
+            shallow_num_layers = llama_layers
+        
+        # 从模型中间开始添加剩余层
+        middle_start = shallow_num_layers // 3
         for i in range(remaining_layers):
-            idx = (middle_start + i) % qwen_layers
+            idx = (middle_start + i) % shallow_num_layers
             if idx not in stack_strategy:
                 stack_strategy[idx] = 1
-                remaining_layers -= 1
-            if remaining_layers <= 0:
-                break
-    
-    print(f"确定的堆叠策略: {stack_strategy}")
-    total_added = sum(stack_strategy.values())
-    print(f"总共添加的层数: {total_added}, 目标添加层数: {layers_to_add}")
+            else:
+                stack_strategy[idx] += 1
+            
+            print(f"额外堆叠层: {idx}")
+        
+        print(f"最终堆叠策略: {stack_strategy}")
+        total_added = sum(stack_strategy.values())
+        print(f"最终添加层数: {total_added}, 目标层数: {layers_to_add}")
+    # --- 修改结束 ---
     
     # 创建堆叠模型
     stacked_model, stacked_tokenizer = create_stacked_model(model_qwen, tokenizer_qwen, stack_strategy)
@@ -417,6 +437,35 @@ def main():
     # --- 修复结束 ---
     
     print("\n任务完成！")
+
+# --- LMA层对齐算法 ---
+def align_layers_lma(C):
+    """使用动态规划进行层对齐"""
+    m, n = C.shape  # m是深层模型层数，n是浅层模型层数
+    F = torch.full((n + 1, m + 1), -torch.inf)
+    F[0, :] = 0
+    path = torch.zeros((n + 1, m + 1), dtype=torch.long)
+    
+    for i in range(1, n + 1):
+        for j in range(i, m + 1):
+            max_val, best_k = -torch.inf, -1
+            for k in range(i - 1, j):
+                # 计算从深层模型的k到j-1的层与浅层模型的第i-1层的相似度总和
+                segment_sim = C[k:j, i - 1].sum()
+                current_val = F[i - 1, k] + segment_sim
+                if current_val > max_val:
+                    max_val, best_k = current_val, k
+            F[i, j], path[i, j] = max_val, best_k
+    
+    # 回溯构建对齐方案
+    alignment, i, j = [], n, m
+    while i > 0:
+        k = path[i, j].item()
+        alignment.insert(0, list(range(k, j)))
+        j = k
+        i -= 1
+    
+    return alignment
 
 if __name__ == "__main__":
     main()
