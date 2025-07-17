@@ -63,6 +63,25 @@ os.makedirs(STATS_DIR, exist_ok=True)
 # --- AlphaEdit 核心逻辑实现 ---
 PROJECTOR_CACHE = {}
 
+def fix_layer_name_for_qwen2vl(name):
+    """修正 Qwen2-VL 模型的层名称路径"""
+    # 对于语言模型层
+    if name.startswith("model.layers."):
+        return name.replace("model.layers.", "model.language_model.layers.")
+    
+    # 对于模型最终的norm层
+    if name.startswith("model.norm"):
+        return name.replace("model.norm", "model.language_model.norm")
+    
+    # 对于embed_tokens层
+    if name.startswith("model.embed_tokens"):
+        return name.replace("model.embed_tokens", "model.language_model.embed_tokens")
+    
+    return name
+
+
+
+
 def compute_covariance_and_projector(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
@@ -111,6 +130,9 @@ def compute_covariance_and_projector(
         print(f"临时将模型从BFloat16转换为Float32以计算协方差...")
         model = model.float()
 
+    # 使用更小的样本数量
+    reduced_samples = min(hparams.mom2_n_samples, 2000)  # 10000 减少到2000个样本
+
     stat = layer_stats(
         model,
         tok,
@@ -118,7 +140,7 @@ def compute_covariance_and_projector(
         STATS_DIR,
         hparams.mom2_dataset,
         to_collect=["mom2"],
-        sample_size=hparams.mom2_n_samples,
+        sample_size=reduced_samples,
         precision="float32", #"float32", hparams.mom2_dtype
         force_recompute=force_recompute,
         device=COMPUTE_DEVICE,  # 使用统一的计算设备
@@ -149,14 +171,7 @@ def compute_covariance_and_projector(
     
     return projector
 
-# # --- 原始脚本中的模型加载和辅助函数 ---
-# def load_qwenvl_weights(ckpt_path):
-#     # (此函数内容保持不变)
-#     return safetensors.torch.load_file(os.path.join(ckpt_path, "model.safetensors"))
 
-# def load_minicpm_weights(ckpt_path):
-#     # (此函数内容保持不变)
-#     return safetensors.torch.load_file(os.path.join(ckpt_path, "model.safetensors"))
 def compute_all_projectors(
     model: AutoModelForVision2Seq,
     tokenizer: AutoTokenizer,
@@ -268,6 +283,163 @@ def compute_all_projectors(
     return projectors
 
 
+def compute_all_projectors_batched(
+    model: AutoModelForVision2Seq,
+    tokenizer: AutoTokenizer,
+    layer_names: list,
+    hparams: argparse.Namespace,
+    batch_size: int = 5,  # 每批处理的层数
+    force_recompute: bool = False,
+) -> dict:
+    """
+    分批高效计算所有层的投影矩阵，降低显存需求。
+    在每个批次内，通过一次前向传播计算该批次所有层的统计数据。
+    
+    Args:
+        model: 用于计算协方差的基础模型
+        tokenizer: 分词器
+        layer_names: 需要计算的层名称列表
+        hparams: 超参数
+        batch_size: 每批处理的层数
+        force_recompute: 是否强制重新计算
+        
+    Returns:
+        dict: 层名称到投影矩阵的映射
+    """
+    # 这两个 import 是必须的
+    from util.nethook import TraceDict
+    from rome.layer_stats import layer_stats_for_multiple_layers
+
+    # 检查缓存
+    model_name_safe = hparams.base_model_path.replace("/", "_").replace("-", "_")
+    projectors = {}
+    uncached_layers = []
+    
+    # 首先检查哪些层需要计算
+    for layer_name in layer_names:
+        # 统一缓存路径格式
+        cache_path = os.path.join(
+            STATS_DIR, 
+            f"projector__{model_name_safe}__{layer_name.replace('.', '_')}__{hparams.null_space_threshold}.pt"
+        )
+        if os.path.exists(cache_path) and not force_recompute:
+            print(f"Loading cached projector for {layer_name}")
+            projectors[layer_name] = torch.load(cache_path).to(COMPUTE_DEVICE)
+        else:
+            uncached_layers.append(layer_name)
+    
+    # 如果所有层都已缓存，直接返回
+    if not uncached_layers:
+        print("All projectors found in cache!")
+        return projectors
+    
+    total_batches = (len(uncached_layers) + batch_size - 1) // batch_size
+    print(f"需要计算 {len(uncached_layers)} 层的投影矩阵，将分 {total_batches} 批处理 (每批最多 {batch_size} 层)")
+    
+    # 确保模型的权重是float32类型
+    original_dtype = None
+    for param in model.parameters():
+        if hasattr(param, 'dtype'):
+            original_dtype = param.dtype
+            break
+            
+    # 临时将模型转换为float32进行计算
+    if original_dtype == torch.bfloat16:
+        print(f"临时将模型从BFloat16转换为Float32以计算协方差...")
+        model = model.float()
+    
+    # 分批处理层
+    for batch_idx in range(0, len(uncached_layers), batch_size):
+        batch_layers = uncached_layers[batch_idx:batch_idx + batch_size]
+        batch_num = batch_idx // batch_size + 1
+        
+        print(f"\n=== 批次 {batch_num}/{total_batches}: 高效处理 {len(batch_layers)} 层 ===")
+        for layer in batch_layers:
+            print(f"  - {layer}")
+        
+        # 检查当前GPU内存状态
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(COMPUTE_DEVICE) / 1024**3
+            cached = torch.cuda.memory_reserved(COMPUTE_DEVICE) / 1024**3
+            print(f"开始批次计算前 - GPU内存: 已分配 {allocated:.2f}GB, 已缓存 {cached:.2f}GB")
+
+        # --- 核心修改 ---
+        # 在一个批次内，一次性计算所有层的统计数据
+        try:
+            print(f"批次 {batch_num}: 正在通过一次前向传播计算 {len(batch_layers)} 个层的统计数据...")
+            layer_stats_dict = layer_stats_for_multiple_layers(
+                model=model,
+                tokenizer=tokenizer,
+                layer_names=batch_layers, # 传入当前批次的层
+                stats_dir=STATS_DIR,
+                ds_name=hparams.mom2_dataset,
+                to_collect=["mom2"],
+                sample_size=hparams.mom2_n_samples,
+                precision="float32",
+                force_recompute=force_recompute,
+                device=COMPUTE_DEVICE
+            )
+            
+            # 遍历批次内的层，计算SVD和投影矩阵
+            print(f"批次 {batch_num}: 正在计算 SVD 和投影矩阵...")
+            for layer_name in tqdm(batch_layers, desc=f"Batch {batch_num} SVD"):
+                if layer_name not in layer_stats_dict:
+                    print(f"警告: 在批次统计结果中未找到层 {layer_name}，跳过。")
+                    continue
+                
+                stat = layer_stats_dict[layer_name]
+                cov = stat.mom2.moment().float().to(COMPUTE_DEVICE)
+                
+                # 对协方差矩阵进行SVD分解
+                U, S, _ = torch.linalg.svd(cov)
+                
+                # 根据阈值确定零空间
+                threshold = hparams.null_space_threshold
+                null_space_vectors = U[:, S < threshold]
+                
+                # 计算投影矩阵 P = Û * Ûᵀ
+                projector = null_space_vectors @ null_space_vectors.T
+                
+                print(f"  {layer_name}: 原始维度: {cov.shape[0]}, 零空间维度: {null_space_vectors.shape[1]}")
+                
+                # 缓存结果到文件
+                cache_path = os.path.join(
+                    STATS_DIR, 
+                    f"projector__{model_name_safe}__{layer_name.replace('.', '_')}__{hparams.null_space_threshold}.pt"
+                )
+                torch.save(projector.cpu(), cache_path)
+                
+                projectors[layer_name] = projector
+
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"批次 {batch_num} 计算时发生GPU内存不足错误: {e}")
+            print("可以尝试减小 `batch_size` 或 `--mom2_n_samples`。")
+            # 即使出错，也清理内存
+            gc.collect()
+            torch.cuda.empty_cache()
+            # 跳过当前批次
+            print("跳过当前批次。")
+            continue
+        
+        # 每批处理完后进行大清理
+        print(f"批次 {batch_num} 完成，清理内存...")
+        del layer_stats_dict
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # 显示当前进度
+        processed = min(batch_idx + batch_size, len(uncached_layers))
+        print(f"已处理 {processed}/{len(uncached_layers)} 层")
+    
+    # 将模型恢复到原始数据类型
+    if original_dtype == torch.bfloat16:
+        model = model.to(original_dtype)
+    
+    print(f"\n投影矩阵计算完成！成功计算了 {len(projectors)} 个投影矩阵")
+    return projectors
+
+
+
 def load_pytorch_weights(base_path, file_list):
     weights = {}
     for file in file_list:
@@ -321,19 +493,6 @@ def need_merge(name:str) -> bool:
             return False
         return True
     return False
-
-
-def fix_layer_name_for_qwen2vl(name):
-    """修正 Qwen2-VL 模型的层名称路径"""
-    # 对于语言模型层
-    if name.startswith("model.layers."):
-        return name.replace("model.layers.", "model.language_model.layers.")
-    
-    # 对于模型最终的norm层
-    if name == "model.norm.weight":
-        return "model.language_model.norm.weight"
-    
-    return name
 
 
 def create_soft_link(source_path, link_path):
@@ -434,13 +593,25 @@ def convert(args):
         # 去重
         layers_to_process = list(set(layers_to_process))
         print(f"需要计算投影矩阵的层数: {len(layers_to_process)}")
-        # 一次性计算所有投影矩阵
-        projectors = compute_all_projectors(
+
+        # # 一次性计算所有投影矩阵
+        # projectors = compute_all_projectors(
+        #     base_model_for_cov,
+        #     base_tok,
+        #     layers_to_process,
+        #     args
+        # )
+
+        # 使用分批计算方法，可以调整batch_size
+        batch_size = 3  # 可以根据GPU内存调整
+        projectors = compute_all_projectors_batched(
             base_model_for_cov,
             base_tok,
             layers_to_process,
-            args
+            args,
+            batch_size=batch_size
         )
+
 
         # 应用计算好的投影矩阵进行合并
         for key in tqdm(base_weights.keys(), desc="Applying Null-Space Grafting"):
