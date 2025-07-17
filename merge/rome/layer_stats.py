@@ -87,11 +87,21 @@ def layer_stats(
     download=True,
     progress=tqdm,
     force_recompute=False,
-    hparams=None
+    hparams=None,
+    device=None  # 新增设备参数
 ):
     """
     Function to load or compute cached stats.
     """
+    
+    # 获取模型所在的设备
+    if device is None:
+        # 自动检测模型所在的设备
+        model_device = next(model.parameters()).device
+    else:
+        model_device = device
+    
+    print(f"Using device: {model_device} for layer_stats computation")
 
     def get_ds():
         # Load_From_File
@@ -100,7 +110,7 @@ def layer_stats(
         # raw_ds = {'train': raw_ds}
         raw_ds = load_dataset(
             ds_name,
-            dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name]
+            dict(wikitext="wikitext-103-raw-v1", wikipedia="20220301.en")[ds_name]
         )
         if hasattr(model.config, 'n_positions'):
             maxlen = model.config.n_positions
@@ -184,13 +194,13 @@ def layer_stats(
     with torch.no_grad():
         for batch_group in progress(loader, total=batch_count):
             for batch in batch_group:
-                batch = dict_to_(batch, "cuda")
+                # 修改：将数据移动到模型所在的设备
+                batch = dict_to_(batch, model_device)  # 改为使用模型设备而不是硬编码 "cuda"
                 with Trace(
                     model, layer_name, retain_input=True, retain_output=False, stop=True
                 ) as tr:
                     model(**batch)
                 feats = flatten_masked_batch(tr.input, batch["attention_mask"])
-                # feats = flatten_masked_batch(tr.output, batch["attention_mask"])
                 feats = feats.to(dtype=dtype)
                 stat.add(feats)
     return stat

@@ -7,7 +7,7 @@ import torch
 import safetensors.torch
 import argparse
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForVision2Seq, AutoTokenizer, AutoModelForCausalLM
 import gc
 
 # 假设 rome/layer_stats.py 存在于 Python 路径中
@@ -49,6 +49,15 @@ INDEX_FILENAME = {
     "llava-onevision-qwen": "model.safetensors.index.json",
     "qwen2_vl" : "model.safetensors.index.json"
 }
+
+
+# 定义计算设备。如果显存不足，可将一个模型加载到CPU
+MODEL_DEVICE_A = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+MODEL_DEVICE_B = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+COMPUTE_DEVICE = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+print(f"模型A设备: {MODEL_DEVICE_A}, 模型B设备: {MODEL_DEVICE_B}, 计算设备: {COMPUTE_DEVICE}")
+
+
 
 # 用于缓存协方差统计数据和投影矩阵的目录
 STATS_DIR = "hparams_cache"
@@ -92,6 +101,19 @@ def compute_covariance_and_projector(
     print(f"Computing covariance for {model_name_safe} @ {layer_name}.")
     # 使用 layer_stats (类似AlphaEdit中的 get_cov) 来获取二阶矩 (协方差)
     # mom2_dataset 指定了用于统计的数据集，例如'c4'或'wikipedia'
+
+    # 修复: 确保模型的权重是float32类型以避免BFloat16不兼容问题
+    original_dtype = None
+    for param in model.parameters():
+        if hasattr(param, 'dtype'):
+            original_dtype = param.dtype
+            break
+            
+    # 临时将模型转换为float32进行计算
+    if original_dtype == torch.bfloat16:
+        print(f"临时将模型从BFloat16转换为Float32以计算协方差...")
+        model = model.float()
+
     stat = layer_stats(
         model,
         tok,
@@ -100,11 +122,12 @@ def compute_covariance_and_projector(
         hparams.mom2_dataset,
         to_collect=["mom2"],
         sample_size=hparams.mom2_n_samples,
-        precision=hparams.mom2_dtype,
+        precision="float32", #"float32", hparams.mom2_dtype
         force_recompute=force_recompute,
+        device=COMPUTE_DEVICE,  # 使用统一的计算设备
     )
     
-    cov = stat.mom2.moment().float().cuda()
+    cov = stat.mom2.moment().float().to(COMPUTE_DEVICE)
 
     print(f"Computing SVD and projector for {layer_name}.")
     # 对协方差矩阵进行SVD分解
@@ -123,6 +146,9 @@ def compute_covariance_and_projector(
     
     # 缓存结果到文件
     torch.save(projector.cpu(), cache_path)
+    # 将模型恢复到原始数据类型
+    if original_dtype == torch.bfloat16:
+        model = model.to(original_dtype)
     
     return projector
 
@@ -191,6 +217,20 @@ def need_merge(name:str) -> bool:
         return True
     return False
 
+
+def fix_layer_name_for_qwen2vl(name):
+    """修正 Qwen2-VL 模型的层名称路径"""
+    # 对于语言模型层
+    if name.startswith("model.layers."):
+        return name.replace("model.layers.", "model.language_model.layers.")
+    
+    # 对于模型最终的norm层
+    if name == "model.norm.weight":
+        return "model.language_model.norm.weight"
+    
+    return name
+
+
 def create_soft_link(source_path, link_path):
     # Check if source path exists
     if not os.path.exists(source_path):
@@ -223,6 +263,8 @@ def create_soft_link(source_path, link_path):
         # If it's a directory, ignore it
         elif os.path.isdir(source_item):
             continue
+
+
 
 
 # --- 主合并逻辑 ---
@@ -259,8 +301,9 @@ def convert(args):
         
         # 加载用于计算协方差的基础模型和分词器
         print(f"Loading base model '{args.base_model_path}' for covariance computation...")
-        # 以bfloat16加载以节省内存，计算时会转为float32
-        base_model_for_cov = AutoModelForCausalLM.from_pretrained(args.base_model_path, torch_dtype=torch.bfloat16).cuda()
+        # torch.bfloat16 以bfloat16加载以节省内存，计算时会转为float32 # AutoModelForCausalLM, AutoModelForVision2Seq
+        base_model_for_cov = AutoModelForVision2Seq.from_pretrained(args.base_model_path, torch_dtype=torch.bfloat16).to(COMPUTE_DEVICE)
+        print(base_model_for_cov)
         base_tok = AutoTokenizer.from_pretrained(args.base_model_path)
 
         for key in tqdm(base_weights.keys(), desc="Applying Null-Space Grafting"):
@@ -268,16 +311,19 @@ def convert(args):
                 print(f"\nProcessing layer: {key}")
                 # 1. 计算投影矩阵 P
                 module_path = key.rsplit('.', 1)[0]
+                module_path = fix_layer_name_for_qwen2vl(module_path)
+
+                print(f"Computing projector for layer '{module_path}'...")
                 projector = compute_covariance_and_projector(
                     base_model_for_cov,
                     base_tok,
                     module_path,
                     args,
-                ).cuda()
+                ).to(COMPUTE_DEVICE)
 
                 # 2. 计算权重差异 Δ
-                w_a = base_weights[key].float().cuda()
-                w_b = donor_weights[key].float().cuda()
+                w_a = base_weights[key].float().to(COMPUTE_DEVICE)
+                w_b = donor_weights[key].float().to(COMPUTE_DEVICE)
                 delta = w_b - w_a
                 
                 # 3. 投影扰动 Δ' = Δ @ P
@@ -357,7 +403,7 @@ if __name__ == "__main__":
     
     # 通用参数
     parser.add_argument('--output', type=str, default=None, help="Output checkpoint path (including model name)")
-    parser.add_argument('--strategy', type=str, default=None, 
+    parser.add_argument('--strategy', type=str, default="null_space", 
                         help="Merging strategy: 'ties', 'dare_ties', or the new 'null_space'. Default is linear interpolation.") 
     
     # 线性插值和TIES/DARE的参数
