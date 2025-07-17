@@ -60,7 +60,7 @@ print(f"模型A设备: {MODEL_DEVICE_A}, 模型B设备: {MODEL_DEVICE_B}, 计算
 
 
 # 用于缓存协方差统计数据和投影矩阵的目录
-STATS_DIR = "hparams_cache"
+STATS_DIR = "/home/user/xieqiuhao/AdaMMS/hparams_cache"
 os.makedirs(STATS_DIR, exist_ok=True)
 
 # --- AlphaEdit 核心逻辑实现 ---

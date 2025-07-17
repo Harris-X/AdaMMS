@@ -51,13 +51,13 @@ INDEX_FILENAME = {
 }
 
 
-COMPUTE_DEVICE = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+COMPUTE_DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"计算设备: {COMPUTE_DEVICE}")
 
 
 
 # 用于缓存协方差统计数据和投影矩阵的目录
-STATS_DIR = "hparams_cache"
+STATS_DIR = "/home/user/xieqiuhao/AdaMMS/hparams_cache"
 os.makedirs(STATS_DIR, exist_ok=True)
 
 # --- AlphaEdit 核心逻辑实现 ---
@@ -367,6 +367,8 @@ def compute_all_projectors_batched(
         # 在一个批次内，一次性计算所有层的统计数据
         try:
             print(f"批次 {batch_num}: 正在通过一次前向传播计算 {len(batch_layers)} 个层的统计数据...")
+            # 使用更小的样本数量
+            reduced_samples = min(hparams.mom2_n_samples, 200)  # 10000 减少到200个样本
             layer_stats_dict = layer_stats_for_multiple_layers(
                 model=model,
                 tokenizer=tokenizer,
@@ -374,7 +376,7 @@ def compute_all_projectors_batched(
                 stats_dir=STATS_DIR,
                 ds_name=hparams.mom2_dataset,
                 to_collect=["mom2"],
-                sample_size=hparams.mom2_n_samples,
+                sample_size=reduced_samples,
                 precision="float32",
                 force_recompute=force_recompute,
                 device=COMPUTE_DEVICE
@@ -491,6 +493,10 @@ def need_merge(name:str) -> bool:
     if name.startswith("model.layers."):
         if name.endswith(".self_attn.rotary_emb.inv_freq"):
             return False
+        if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight") or name.endswith(".self_attn.o_proj.weight"):
+            return False
+        if name.endswith(".self_attn.q_proj.bias") or name.endswith(".self_attn.k_proj.bias") or name.endswith(".self_attn.v_proj.bias") or name.endswith(".self_attn.o_proj.bias"):
+            return False
         return True
     return False
 
@@ -603,7 +609,7 @@ def convert(args):
         # )
 
         # 使用分批计算方法，可以调整batch_size
-        batch_size = 3  # 可以根据GPU内存调整
+        batch_size = 20  # 可以根据GPU内存调整
         projectors = compute_all_projectors_batched(
             base_model_for_cov,
             base_tok,
