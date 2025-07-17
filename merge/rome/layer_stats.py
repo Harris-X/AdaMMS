@@ -205,5 +205,153 @@ def layer_stats(
                 stat.add(feats)
     return stat
 
+
+# 在 rome/layer_stats.py 中添加
+def layer_stats_for_multiple_layers(
+    model,
+    tokenizer,
+    layer_names,
+    stats_dir,
+    ds_name,
+    to_collect,
+    model_name=None,
+    sample_size=None,
+    precision=None,
+    batch_tokens=None,
+    download=True,
+    progress=tqdm,
+    force_recompute=False,
+    device=None
+):
+    """
+    一次性计算多个层的统计数据
+    """
+    from util.nethook import TraceDict
+    
+    # 获取模型所在的设备
+    if device is None:
+        model_device = next(model.parameters()).device
+    else:
+        model_device = device
+    
+    print(f"Using device: {model_device} for computing statistics of {len(layer_names)} layers")
+    
+    # 使用与原函数相同的数据集加载逻辑
+    def get_ds():
+        raw_ds = load_dataset(
+            ds_name,
+            dict(wikitext="wikitext-103-raw-v1", wikipedia="20220301.en")[ds_name]
+        )
+        # ... 保持原来的最大长度计算逻辑 ...
+        if hasattr(model.config, 'n_positions'):
+            maxlen = model.config.n_positions
+        elif hasattr(model.config, 'max_sequence_length'):
+            maxlen = model.config.max_sequence_length
+        elif hasattr(model.config, 'max_position_embeddings'):
+            maxlen = model.config.max_position_embeddings
+        elif hasattr(model.config,'seq_length'):
+            maxlen = model.config.seq_length
+        else:
+            raise NotImplementedError
+                
+        if hasattr(model.config, 'model_type') and 'mistral' in model.config.model_type:
+            if hasattr(model.config, 'sliding_window') and model.config.sliding_window:
+                maxlen = model.config.sliding_window or 4096
+            else:
+                maxlen = 4096
+        if hasattr(model.config, 'model_type') and 'qwen2' in model.config.model_type:
+            maxlen = 4096
+
+        if batch_tokens is not None and batch_tokens < maxlen:
+            maxlen = batch_tokens
+        return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
+    
+    # Continue with computation of statistics
+    batch_size = 1  # Examine this many dataset texts at once
+    if hasattr(model.config, 'n_positions'):
+        npos = model.config.n_positions
+    elif hasattr(model.config, 'max_sequence_length'):
+        npos = model.config.max_sequence_length
+    elif hasattr(model.config, 'max_position_embeddings'):
+        npos = model.config.max_position_embeddings
+    elif hasattr(model.config,'seq_length'):
+        npos = model.config.seq_length
+    else:
+        raise NotImplementedError
+        
+    if hasattr(model.config, 'model_type') and 'mistral' in model.config.model_type:
+        if hasattr(model.config, 'sliding_window') and model.config.sliding_window:
+            npos = model.config.sliding_window or 4096
+        else:
+            npos = 4096
+    if hasattr(model.config, 'model_type') and 'qwen2' in model.config.model_type:
+            npos = 4096
+    
+    # 设置批处理大小和精度
+     # 关键修复：确保 batch_tokens 不为 None
+    if batch_tokens is None:
+        batch_tokens = npos * 3  # Sort and divide into batches with this many tokens
+    if precision is None:
+        precision = "float64"
+    dtype = getattr(torch, precision)
+    
+    size_suffix = "" if sample_size is None else f"_{sample_size}"
+    if batch_tokens < npos:
+        size_suffix = "_t{batch_tokens}" + size_suffix
+    if model_name is None:
+        # model_name = model.config._name_or_path.replace("/", "_")
+        model_name = model.config._name_or_path.rsplit("/")[-1]
+
+
+    # 加载数据集
+    ds = get_ds()
+    
+    # 为每一层创建统计对象
+    stats_dict = {
+        layer_name: CombinedStat(**{k: STAT_TYPES[k]() for k in to_collect})
+        for layer_name in layer_names
+    }
+    
+    # 设置数据加载器
+    loader = torch.utils.data.DataLoader(
+        ds, 
+        batch_size=batch_size,
+        collate_fn=length_collation(batch_tokens),
+        pin_memory=True,
+        shuffle=True
+    )
+    
+    # 限制样本数量
+    if sample_size is not None:
+        batch_count = -(-(sample_size) // batch_size)
+    else:
+        batch_count = len(loader)
+    
+    # 使用 TraceDict 同时跟踪多个层
+    with torch.no_grad():
+        for batch_idx, batch_group in enumerate(progress(loader, total=batch_count)):
+            if sample_size is not None and batch_idx >= batch_count:
+                break
+                
+            for batch in batch_group:
+                batch = dict_to_(batch, model_device)
+                
+                # 使用 TraceDict 同时跟踪多个层
+                with TraceDict(
+                    model, layer_names, retain_input=True, retain_output=False, stop=False
+                ) as tr:
+                    model(**batch)
+                
+                # 处理每一层的数据
+                for layer_name in layer_names:
+                    if layer_name not in tr:
+                        continue
+                    feats = flatten_masked_batch(tr[layer_name].input, batch["attention_mask"])
+                    feats = feats.to(dtype=dtype)
+                    stats_dict[layer_name].add(feats)
+    
+    return stats_dict
+
+
 if __name__ == "__main__":
     main()
