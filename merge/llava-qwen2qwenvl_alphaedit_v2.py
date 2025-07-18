@@ -290,10 +290,9 @@ def compute_all_projectors_batched(
     hparams: argparse.Namespace,
     batch_size: int = 5,  # 每批处理的层数
     force_recompute: bool = False,
-) -> dict:
+) -> None: # 修改点: 不再返回字典
     """
-    分批高效计算所有层的投影矩阵，降低显存需求。
-    在每个批次内，通过一次前向传播计算该批次所有层的统计数据。
+    分批高效计算所有层的投影矩阵，并将其保存到磁盘，而不是保留在内存中。
     
     Args:
         model: 用于计算协方差的基础模型
@@ -304,46 +303,37 @@ def compute_all_projectors_batched(
         force_recompute: 是否强制重新计算
         
     Returns:
-        dict: 层名称到投影矩阵的映射
+        None: 此函数仅确保投影矩阵被计算并缓存到磁盘。
     """
     # 这两个 import 是必须的
-    from util.nethook import TraceDict
     from rome.layer_stats import layer_stats_for_multiple_layers
 
-    # 检查缓存
     model_name_safe = hparams.base_model_path.replace("/", "_").replace("-", "_")
-    projectors = {}
     uncached_layers = []
     
     # 首先检查哪些层需要计算
     for layer_name in layer_names:
-        # 统一缓存路径格式
+        # 注意：这里使用修正后的层名来检查和构建列表
+        fixed_layer_name = fix_layer_name_for_qwen2vl(layer_name)
         cache_path = os.path.join(
             STATS_DIR, 
-            f"projector__{model_name_safe}__{layer_name.replace('.', '_')}__{hparams.null_space_threshold}.pt"
+            f"projector__{model_name_safe}__{fixed_layer_name.replace('.', '_')}__{hparams.null_space_threshold}.pt"
         )
-        if os.path.exists(cache_path) and not force_recompute:
-            print(f"Loading cached projector for {layer_name}")
-            projectors[layer_name] = torch.load(cache_path).to(COMPUTE_DEVICE)
-        else:
-            uncached_layers.append(layer_name)
+        if not os.path.exists(cache_path) or force_recompute:
+            uncached_layers.append(fixed_layer_name)
     
-    # 如果所有层都已缓存，直接返回
     if not uncached_layers:
-        print("All projectors found in cache!")
-        return projectors
-    
+        print("所有投影矩阵均已在缓存中找到，无需计算。")
+        return # 修改点: 直接返回
+
     total_batches = (len(uncached_layers) + batch_size - 1) // batch_size
-    print(f"需要计算 {len(uncached_layers)} 层的投影矩阵，将分 {total_batches} 批处理 (每批最多 {batch_size} 层)")
+    print(f"需要计算 {len(uncached_layers)} 个新的投影矩阵，将分 {total_batches} 批处理。")
     
-    # 确保模型的权重是float32类型
     original_dtype = None
     for param in model.parameters():
         if hasattr(param, 'dtype'):
             original_dtype = param.dtype
             break
-            
-    # 临时将模型转换为float32进行计算
     if original_dtype == torch.bfloat16:
         print(f"临时将模型从BFloat16转换为Float32以计算协方差...")
         model = model.float()
@@ -354,25 +344,14 @@ def compute_all_projectors_batched(
         batch_num = batch_idx // batch_size + 1
         
         print(f"\n=== 批次 {batch_num}/{total_batches}: 高效处理 {len(batch_layers)} 层 ===")
-        for layer in batch_layers:
-            print(f"  - {layer}")
         
-        # 检查当前GPU内存状态
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated(COMPUTE_DEVICE) / 1024**3
-            cached = torch.cuda.memory_reserved(COMPUTE_DEVICE) / 1024**3
-            print(f"开始批次计算前 - GPU内存: 已分配 {allocated:.2f}GB, 已缓存 {cached:.2f}GB")
-
-        # --- 核心修改 ---
-        # 在一个批次内，一次性计算所有层的统计数据
         try:
-            print(f"批次 {batch_num}: 正在通过一次前向传播计算 {len(batch_layers)} 个层的统计数据...")
-            # 使用更小的样本数量
-            reduced_samples = min(hparams.mom2_n_samples, 200)  # 10000 减少到200个样本
+            print(f"批次 {batch_num}: 正在通过一次前向传播计算统计数据...")
+            reduced_samples = min(hparams.mom2_n_samples, 200)
             layer_stats_dict = layer_stats_for_multiple_layers(
                 model=model,
                 tokenizer=tokenizer,
-                layer_names=batch_layers, # 传入当前批次的层
+                layer_names=batch_layers,
                 stats_dir=STATS_DIR,
                 ds_name=hparams.mom2_dataset,
                 to_collect=["mom2"],
@@ -382,9 +361,8 @@ def compute_all_projectors_batched(
                 device=COMPUTE_DEVICE
             )
             
-            # 遍历批次内的层，计算SVD和投影矩阵
-            print(f"批次 {batch_num}: 正在计算 SVD 和投影矩阵...")
-            for layer_name in tqdm(batch_layers, desc=f"Batch {batch_num} SVD"):
+            print(f"批次 {batch_num}: 正在计算 SVD、投影矩阵并保存到磁盘...")
+            for layer_name in tqdm(batch_layers, desc=f"Batch {batch_num} SVD & Save"):
                 if layer_name not in layer_stats_dict:
                     print(f"警告: 在批次统计结果中未找到层 {layer_name}，跳过。")
                     continue
@@ -392,53 +370,34 @@ def compute_all_projectors_batched(
                 stat = layer_stats_dict[layer_name]
                 cov = stat.mom2.moment().float().to(COMPUTE_DEVICE)
                 
-                # 对协方差矩阵进行SVD分解
                 U, S, _ = torch.linalg.svd(cov)
-                
-                # 根据阈值确定零空间
                 threshold = hparams.null_space_threshold
                 null_space_vectors = U[:, S < threshold]
-                
-                # 计算投影矩阵 P = Û * Ûᵀ
                 projector = null_space_vectors @ null_space_vectors.T
                 
-                print(f"  {layer_name}: 原始维度: {cov.shape[0]}, 零空间维度: {null_space_vectors.shape[1]}")
-                
-                # 缓存结果到文件
                 cache_path = os.path.join(
                     STATS_DIR, 
                     f"projector__{model_name_safe}__{layer_name.replace('.', '_')}__{hparams.null_space_threshold}.pt"
                 )
+                # 修改点: 只保存到CPU，不收集到内存字典中
                 torch.save(projector.cpu(), cache_path)
                 
-                projectors[layer_name] = projector
-
         except torch.cuda.OutOfMemoryError as e:
             print(f"批次 {batch_num} 计算时发生GPU内存不足错误: {e}")
-            print("可以尝试减小 `batch_size` 或 `--mom2_n_samples`。")
-            # 即使出错，也清理内存
+            print("可以尝试减小 `batch_size` 或 `--mom2_n_samples`。跳过当前批次。")
+            continue
+        finally:
+            # 关键: 每批结束后都强制清理内存
+            if 'layer_stats_dict' in locals():
+                del layer_stats_dict
             gc.collect()
             torch.cuda.empty_cache()
-            # 跳过当前批次
-            print("跳过当前批次。")
-            continue
-        
-        # 每批处理完后进行大清理
-        print(f"批次 {batch_num} 完成，清理内存...")
-        del layer_stats_dict
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        # 显示当前进度
-        processed = min(batch_idx + batch_size, len(uncached_layers))
-        print(f"已处理 {processed}/{len(uncached_layers)} 层")
     
-    # 将模型恢复到原始数据类型
     if original_dtype == torch.bfloat16:
         model = model.to(original_dtype)
     
-    print(f"\n投影矩阵计算完成！成功计算了 {len(projectors)} 个投影矩阵")
-    return projectors
+    print("\n所有必需的投影矩阵均已计算并保存到磁盘。")
+    return
 
 
 
@@ -497,7 +456,10 @@ def need_merge(name:str) -> bool:
             return False
         if name.endswith(".self_attn.q_proj.bias") or name.endswith(".self_attn.k_proj.bias") or name.endswith(".self_attn.v_proj.bias") or name.endswith(".self_attn.o_proj.bias"):
             return False
-        return True
+        if name.endswith(".mlp.down_proj.weight"): # or name.endswith(".mlp.gate_proj.weight") or name.endswith(".mlp.up_proj.weight"):
+            return True
+        return False #return True
+    
     return False
 
 
@@ -566,51 +528,32 @@ def convert(args):
     # 选择合并策略
     if args.strategy == "null_space":
         print("="*80)
-        print("Applying 'null_space' grafting strategy.")
+        print("Applying 'null_space' grafting strategy with on-demand loading.")
         print("="*80)
         
-        # 加载用于计算协方差的基础模型和分词器
+        # --- 阶段 1: 计算并缓存所有投影矩阵 ---
+        print("[阶段 1/2] 准备计算并缓存所有投影矩阵...")
+        
         print(f"Loading base model '{args.base_model_path}' for covariance computation...")
-        # torch.bfloat16 以bfloat16加载以节省内存，计算时会转为float32 # AutoModelForCausalLM, AutoModelForVision2Seq
-        base_model_for_cov = AutoModelForVision2Seq.from_pretrained(args.base_model_path, torch_dtype=torch.bfloat16).to(COMPUTE_DEVICE)
-        print(base_model_for_cov)
+        base_model_for_cov = AutoModelForVision2Seq.from_pretrained(
+            args.base_model_path, 
+            torch_dtype=torch.bfloat16,
+            device_map={"": COMPUTE_DEVICE}
+        )
         base_tok = AutoTokenizer.from_pretrained(args.base_model_path)
 
-
-        # 获取需要计算的所有层
+        # 收集所有需要处理的层
         layers_to_process = []
-        for key in tqdm(base_weights.keys(), desc="Applying Null-Space Grafting"):
-            if need_merge(key) and key in donor_weights:
-                print(f"\nProcessing layer: {key}")
-                # 1. 计算投影矩阵 P
-                module_path = key.rsplit('.', 1)[0]
-                module_path = fix_layer_name_for_qwen2vl(module_path)
-
-                # print(f"Computing projector for layer '{module_path}'...")
-                # projector = compute_covariance_and_projector(
-                #     base_model_for_cov,
-                #     base_tok,
-                #     module_path,
-                #     args,
-                # ).to(COMPUTE_DEVICE)
-                layers_to_process.append(module_path)
+        for key in base_weights.keys():
+            if need_merge(key):
+                layers_to_process.append(key.rsplit('.', 1)[0])
         
+        layers_to_process = sorted(list(set(layers_to_process)))
+        print(f"总共需要 {len(layers_to_process)} 个投影矩阵。")
 
-        # 去重
-        layers_to_process = list(set(layers_to_process))
-        print(f"需要计算投影矩阵的层数: {len(layers_to_process)}")
-
-        # # 一次性计算所有投影矩阵
-        # projectors = compute_all_projectors(
-        #     base_model_for_cov,
-        #     base_tok,
-        #     layers_to_process,
-        #     args
-        # )
-
-        # 使用分批计算方法，可以调整batch_size
-        batch_size = 20  # 可以根据GPU内存调整
-        projectors = compute_all_projectors_batched(
+        # 调用函数以确保所有投影矩阵都已在磁盘上
+        batch_size = 4  # 可根据GPU内存调整
+        compute_all_projectors_batched(
             base_model_for_cov,
             base_tok,
             layers_to_process,
@@ -618,36 +561,47 @@ def convert(args):
             batch_size=batch_size
         )
 
+        # --- 关键的内存释放步骤 ---
+        print("投影矩阵计算/缓存完成。从显存中卸载基础模型...")
+        del base_model_for_cov, base_tok
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("基础模型已卸载，显存已释放。")
 
-        # 应用计算好的投影矩阵进行合并
-        for key in tqdm(base_weights.keys(), desc="Applying Null-Space Grafting"):
+        # --- 阶段 2: 应用合并，按需从磁盘加载投影矩阵 ---
+        print("\n[阶段 2/2] 应用合并策略，按需加载投影矩阵...")
+        model_name_safe = args.base_model_path.replace("/", "_").replace("-", "_")
+
+        for key in tqdm(base_weights.keys(), desc="Merging with On-Demand Loading"):
             if need_merge(key) and key in donor_weights:
                 module_path = key.rsplit('.', 1)[0]
-                module_path = fix_layer_name_for_qwen2vl(module_path)
+                fixed_module_path = fix_layer_name_for_qwen2vl(module_path)
                 
-                if module_path not in projectors:
-                    print(f"Warning: No projector found for {module_path}, using linear interpolation")
+                # 构建当前层投影矩阵的缓存路径
+                cache_path = os.path.join(
+                    STATS_DIR, 
+                    f"projector__{model_name_safe}__{fixed_module_path.replace('.', '_')}__{args.null_space_threshold}.pt"
+                )
+
+                if not os.path.exists(cache_path):
+                    print(f"警告: 未找到 {fixed_module_path} 的投影矩阵缓存，使用线性插值替代。")
                     base_weights[key] = (1 - args.alpha) * base_weights[key] + args.alpha * donor_weights[key]
                     continue
                 
-                # 1. 使用预先计算好的投影矩阵
-                projector = projectors[module_path]
-                # 2. 计算权重差异 Δ
+                # --- 按需加载 ---
+                projector = torch.load(cache_path).to(COMPUTE_DEVICE)
+                
                 w_a = base_weights[key].float().to(COMPUTE_DEVICE)
                 w_b = donor_weights[key].float().to(COMPUTE_DEVICE)
                 delta = w_b - w_a
                 
-                # 3. 投影扰动 Δ' = Δ @ P
-                # 权重矩阵 W 的形状通常是 (d_out, d_in)。投影作用于输入特征空间，因此是右乘。
                 projected_delta = delta @ projector
                 
-                # 4. 应用嫁接 W* = W_A + Δ'
                 base_weights[key] = (w_a + projected_delta).to(base_weights[key].dtype).cpu()
                 
-
-        del base_model_for_cov, base_tok, projectors
-        gc.collect()
-        torch.cuda.empty_cache()
+                # --- 使用后立即释放 ---
+                del projector, w_a, w_b, delta, projected_delta
+                torch.cuda.empty_cache()
 
     # --- 其他合并策略的逻辑 (保持不变) ---
     elif args.strategy in ['ties', 'dare_ties', 'dare_linear']:
