@@ -79,13 +79,15 @@ def load_original_weights(base_path, file_list=qwen2_7b_file_list):
 # --- Helper Functions ---
 def need_merge(name:str) -> bool:
     if name in ['model.norm.weight']:
-        return True
+        return False
     if name in ['lm_head.weight', 'model.embed_tokens.weight']:
         return False
     if name.startswith("model.layers."):
         if name.endswith(".self_attn.rotary_emb.inv_freq"):
             return False
-        return True
+        if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight") or name.endswith(".self_attn.o_proj.weight"):
+            return False # 修改了此处
+        return True 
     return False
 
 def create_soft_link(source_path, link_path):
@@ -247,9 +249,9 @@ if __name__ == "__main__":
                         help="Path to the original pre-trained model (M_C). Required for 'task_vector_grafting'.")
 
     # Strategy-specific parameters
-    parser.add_argument('--alpha', type=float, default=0.5, help="Coefficient for 'interpolation' strategy.")
+    parser.add_argument('--alpha', type=float, default=0.3, help="Coefficient for 'interpolation' strategy.")
     parser.add_argument('--lambda_s', type=float, default=1.0, help="Synergy coefficient for 'task_vector_grafting'.")
-    parser.add_argument('--lambda_c', type=float, default=0.5, help="Conflict mitigation coefficient for 'task_vector_grafting'.")
+    parser.add_argument('--lambda_c', type=float, default=0.0, help="Conflict mitigation coefficient for 'task_vector_grafting'.")
 
     parser.add_argument('--output', type=str, default=None, help="Output directory and name for the merged model.")
     

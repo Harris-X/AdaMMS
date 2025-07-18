@@ -10,15 +10,6 @@ import argparse
 from tqdm import tqdm
 import gc
 
-# --- CUDA设备设置 ---
-CUDA_DEVICE = 4  # 设置为4号GPU
-if torch.cuda.is_available() and CUDA_DEVICE < torch.cuda.device_count():
-    torch.cuda.set_device(CUDA_DEVICE)
-    DEVICE = f'cuda:{CUDA_DEVICE}'
-    print(f"Using CUDA device: {DEVICE}")
-else:
-    DEVICE = 'cpu'
-    print(f"CUDA device {CUDA_DEVICE} not available, using CPU")
 
 # --- 模型与路径配置 (请根据您的环境更新路径) ---
 CKPT_PATH = {
@@ -253,7 +244,7 @@ if __name__ == "__main__":
     parser.add_argument('--output', type=str, default=None, help="Output directory and name for the merged model (e.g., /path/to/my_sosm_model).")
     
     # 添加CUDA设备选择参数
-    parser.add_argument('--cuda_device', type=int, default=4, help="CUDA device to use (default: 4).")
+    parser.add_argument('--cuda_device', type=int, default=0, help="CUDA device to use (default: 4).")
     
     args = parser.parse_args()
     
