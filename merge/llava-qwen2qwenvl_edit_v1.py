@@ -8,6 +8,7 @@ import safetensors.torch
 import argparse
 from tqdm import tqdm
 import gc
+import shutil
 
 # --- Model & Path Configuration (Please update with your paths) ---
 CKPT_PATH = {
@@ -22,49 +23,104 @@ INDEX_FILENAME = {
     "llava-onevision-qwen": "model.safetensors.index.json"
 }
 
-# --- Weight Loading Functions (from your template) ---
-def load_weights(base_path, index_filename):
+# --- Weight Loading Functions (from llava-qwen2qwenvl.py) ---
+def load_safetensors_weights(base_path, file_list):
     weights = {}
-    index_path = os.path.join(base_path, index_filename)
-    if not os.path.exists(index_path):
-        single_file_path = os.path.join(base_path, "model.safetensors")
-        if os.path.exists(single_file_path):
-            print(f"Loading single weight file from {single_file_path}")
-            return safetensors.torch.load_file(single_file_path)
-        else:
-            raise FileNotFoundError(f"Neither {index_filename} nor model.safetensors found in {base_path}")
-            
-    with open(index_path, 'r') as f:
-        index = json.load(f)
-    file_list = sorted(list(set(index["weight_map"].values())))
-    
     for file in tqdm(file_list, desc=f"Loading weights from {os.path.basename(base_path)}"):
         path = os.path.join(base_path, file)
         weights.update(safetensors.torch.load_file(path))
     return weights
 
-# --- Helper Functions (from your template) ---
-def need_merge(name: str) -> bool:
-    # We merge all parameters except the embeddings and final head for stability
+def load_pytorch_weights(base_path, file_list):
+    weights = {}
+    for file in file_list:
+        path = os.path.join(base_path, file)
+        x = torch.load(path)
+        weights.update(x)
+    return weights
+
+# # Define hardcoded file lists
+# qwenvl_file_list = [f'model-0000{i}-of-00005.safetensors' for i in range(1, 6)]
+# llava_onevision_qwen_file_list = [f'model-0000{i}-of-00004.safetensors' for i in range(1, 5)]
+
+
+
+
+vicuna_file_list = ['pytorch_model-00001-of-00002.bin', 'pytorch_model-00002-of-00002.bin']
+llama_file_list = ['pytorch_model-00001-of-00003.bin', 'pytorch_model-00002-of-00003.bin', 'pytorch_model-00003-of-00003.bin']
+def load_llama_weights(base_path, file_list=llama_file_list):
+    return load_pytorch_weights(base_path, file_list)
+
+llava_file_list = ['pytorch_model-00001-of-00002.bin', 'pytorch_model-00002-of-00002.bin']
+def load_llava_weights(base_path, file_list=llava_file_list):
+    return load_pytorch_weights(base_path, file_list)
+
+mplug_owl_file_list_template = "pytorch_model-{}-of-33.bin"
+mplug_owl_file_list = [mplug_owl_file_list_template.format(str(i+1)) for i in range(33)]
+def load_mplug_owl_weights(base_path, file_list=mplug_owl_file_list):
+    return load_pytorch_weights(base_path, file_list)
+
+cogvlm_file_list = ['model-00001-of-00008.safetensors', 'model-00002-of-00008.safetensors', 'model-00003-of-00008.safetensors', 'model-00004-of-00008.safetensors', 'model-00005-of-00008.safetensors', 'model-00006-of-00008.safetensors', 'model-00007-of-00008.safetensors', 'model-00008-of-00008.safetensors']
+def load_cogvlm_weights(base_path, file_list=cogvlm_file_list):
+    return load_safetensors_weights(base_path, file_list)
+
+qwenvl_file_list = ['model-00001-of-00005.safetensors', 'model-00002-of-00005.safetensors', 'model-00003-of-00005.safetensors', 'model-00004-of-00005.safetensors', 'model-00005-of-00005.safetensors']
+def load_qwenvl_weights(base_path, file_list=qwenvl_file_list):
+    return load_safetensors_weights(base_path, file_list)
+
+llava_onevision_qwen_file_list = ['model-00001-of-00004.safetensors', 'model-00002-of-00004.safetensors', 'model-00003-of-00004.safetensors', 'model-00004-of-00004.safetensors']
+def load_llava_onevision_weights(base_path, file_list=llava_onevision_qwen_file_list):
+    return load_safetensors_weights(base_path, file_list)
+
+qwen2_7b_file_list = [f'model-0000{i}-of-00004.safetensors' for i in range(1, 4)]
+def load_original_weights(base_path, file_list=qwen2_7b_file_list):
+    return load_safetensors_weights(base_path, file_list)
+
+# --- Helper Functions ---
+def need_merge(name:str) -> bool:
+    if name in ['model.norm.weight']:
+        return True
     if name in ['lm_head.weight', 'model.embed_tokens.weight']:
         return False
-    if "rotary_emb.inv_freq" in name:
-        return False
-    return True
+    if name.startswith("model.layers."):
+        if name.endswith(".self_attn.rotary_emb.inv_freq"):
+            return False
+        return True
+    return False
 
 def create_soft_link(source_path, link_path):
-    print(f"Creating symbolic links from {source_path} to {link_path} for non-weight files...")
+    # Check if source path exists
+    if not os.path.exists(source_path):
+        print(f"Error: Source path '{source_path}' does not exist.")
+        return
+
+    # Check if link path exists, if not create it
+    if not os.path.exists(link_path):
+        os.makedirs(link_path)
+        print(f"Created directory '{link_path}'")
+
+    # Iterate through all files and directories in the source path
     for item in os.listdir(source_path):
         source_item = os.path.join(source_path, item)
         link_item = os.path.join(link_path, item)
-        if item.endswith(('.safetensors', '.bin', '.py', '.md')):
-             continue
-        if os.path.exists(link_item):
+
+        # Skip files that end with '.bin'
+        if item.endswith('.bin'):
+            print(f"Skipping '{item}' as it ends with '.bin'")
             continue
-        try:
-            os.symlink(source_item, link_item)
-        except OSError as e:
-            print(f"Error creating soft link for '{item}': {e}", file=sys.stderr)
+
+        # If it's a file, create a symbolic link
+        if os.path.isfile(source_item):
+            try:
+                os.symlink(source_item, link_item)
+                print(f"Created soft link '{link_item}' -> '{source_item}'")
+            except OSError as e:
+                print(f"Error creating soft link for '{item}': {e}")
+
+        # If it's a directory, ignore it
+        elif os.path.isdir(source_item):
+            continue
+
 
 # --- Main Conversion and Merging Logic ---
 def convert(args):
@@ -86,10 +142,10 @@ def convert(args):
 
     # --- Model Loading ---
     print("Loading Base Model (M_A)...")
-    base_weights = load_weights(args.base_model_path, INDEX_FILENAME["qwen2_vl"])
+    base_weights = load_qwenvl_weights(args.base_model_path)
     
     print("Loading Donor Model (M_B)...")
-    donor_weights = load_weights(args.donor_model_path, INDEX_FILENAME["llava-onevision-qwen"])
+    donor_weights = load_llava_onevision_weights(args.donor_model_path)
     
     merged_weights = {}
 
@@ -101,61 +157,41 @@ def convert(args):
         print("="*80)
 
         print("Loading Original Pretrained Model (M_C)...")
-        original_weights = load_weights(args.original_model_path, INDEX_FILENAME["original_model"])
+        original_weights = load_original_weights(args.original_model_path)
 
-        for key in tqdm(original_weights.keys(), desc="Applying Task Vector Grafting"):
-            if key not in base_weights or key not in donor_weights:
-                merged_weights[key] = original_weights[key]
-                continue
-
-            if need_merge(key) and base_weights[key].shape == donor_weights[key].shape:
+        # Use base_weights keys as the reference for iteration
+        for key in tqdm(base_weights.keys(), desc="Applying Task Vector Grafting"):
+            if key in original_weights and key in donor_weights and need_merge(key) and base_weights[key].shape == donor_weights[key].shape:
                 w_c = original_weights[key].float().cuda()
                 w_a = base_weights[key].float().cuda()
                 w_b = donor_weights[key].float().cuda()
 
-                # 1. Calculate Task Vectors
                 tau_a = w_a - w_c
                 tau_b = w_b - w_c
 
-                # 2. Decompose tau_b into synergistic, conflicting, and orthogonal components
-                # Frobenius inner product and norm squared
                 tau_a_norm_sq = torch.sum(tau_a * tau_a)
                 inner_product = torch.sum(tau_a * tau_b)
 
-                if tau_a_norm_sq > 1e-9: # Avoid division by zero
-                    # Calculate the scalar projection coefficient
+                if tau_a_norm_sq > 1e-9:
                     proj_scalar = inner_product / tau_a_norm_sq
-                    
-                    # Decompose the parallel component
                     tau_b_synergy = torch.clamp(proj_scalar, min=0) * tau_a
                     tau_b_conflict = torch.clamp(-proj_scalar, min=0) * tau_a
-                    
-                    # Calculate the orthogonal component
                     tau_b_ortho = tau_b - (tau_b_synergy - tau_b_conflict)
-                else: # If tau_a is a zero vector, all of tau_b is orthogonal
+                else:
                     tau_b_synergy = torch.zeros_like(tau_b)
                     tau_b_conflict = torch.zeros_like(tau_b)
                     tau_b_ortho = tau_b
 
-                # 3. Apply the controlled merging formula
-                # W* = W_A + (λ_s-1)*τ_B_syn + (1-λ_c)*(-τ_B_conf) + τ_B_ortho
-                # Note: W_A already contains τ_A. We start with W_A and add modifications.
-                
-                # We start with the base model's weights
                 w_star = w_a.clone()
-                # Add scaled synergistic component
                 w_star += (args.lambda_s - 1.0) * tau_b_synergy
-                # Add scaled (and direction-corrected) conflicting component
                 w_star += (1.0 - args.lambda_c) * (-tau_b_conflict)
-                # Add the orthogonal component
                 w_star += tau_b_ortho
                 
-                merged_weights[key] = w_star.to(original_weights[key].dtype).cpu()
+                merged_weights[key] = w_star.to(base_weights[key].dtype).cpu()
             else:
-                # For layers not being merged, we keep the base model's weights
+                # For layers not being merged or not present in all models, keep the base model's weights
                 merged_weights[key] = base_weights[key]
             
-            # Clean up GPU memory
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -169,33 +205,31 @@ def convert(args):
             else:
                  merged_weights[key] = base_weights[key]
 
-    # --- Saving the Merged Model ---
+    # --- Saving the Merged Model (as per llava-qwen2qwenvl.py) ---
     print("\nSaving merged model...")
-    index_path = os.path.join(args.base_model_path, INDEX_FILENAME["qwen2_vl"])
-    with open(index_path, "r") as f:
-        index_map = json.load(f)["weight_map"]
+
+    metadata = {'format': 'pt'}
+    llava_index_path = os.path.join(CKPT_PATH["qwen2_vl"], INDEX_FILENAME["qwen2_vl"])
+    with open(llava_index_path, "r") as f:
+        llava_index = json.load(f)
+        llava_index = llava_index["weight_map"]
     
-    sharded_weights = {}
-    for filename in set(index_map.values()):
-        sharded_weights[filename] = {}
-    
-    for key, value in merged_weights.items():
-        if key in index_map:
-            sharded_weights[index_map[key]][key] = value
-        else:
-            print(f"Warning: key '{key}' not in weight map, will not be saved.", file=sys.stderr)
-            
-    for filename, weights_dict in sharded_weights.items():
-        save_path = os.path.join(OUTPUT_PATH, filename)
-        safetensors.torch.save_file(weights_dict, save_path)
-    
-    create_soft_link(source_path=args.base_model_path, link_path=OUTPUT_PATH)
-    with open(index_path, "r") as f_in, \
-         open(os.path.join(OUTPUT_PATH, os.path.basename(index_path)), "w") as f_out:
-        f_out.write(f_in.read())
+    split_llava = {}
+    for file in qwenvl_file_list:
+        split_llava[file] = {}
+    for key in llava_index:
+        split_llava[llava_index[key]][key] = base_weights[key]
+    for file in qwenvl_file_list:
+        if not os.path.isdir(OUTPUT_PATH):
+            os.makedirs(OUTPUT_PATH)
+        save_path = os.path.join(OUTPUT_PATH, file)
+        safetensors.torch.save_file(split_llava[file], save_path, metadata)
+        
+    create_soft_link(source_path=CKPT_PATH["qwen2_vl"], link_path=OUTPUT_PATH)
 
     print("Convert Done.")
-    print(f"Merged model and associated files saved to: {OUTPUT_PATH}")
+    print(save_path)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Merge two models using advanced task vector projection.")
