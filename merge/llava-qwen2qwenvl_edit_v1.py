@@ -218,7 +218,7 @@ def convert(args):
     for file in qwenvl_file_list:
         split_llava[file] = {}
     for key in llava_index:
-        split_llava[llava_index[key]][key] = base_weights[key]
+        split_llava[llava_index[key]][key] = merged_weights[key]
     for file in qwenvl_file_list:
         if not os.path.isdir(OUTPUT_PATH):
             os.makedirs(OUTPUT_PATH)
@@ -249,7 +249,7 @@ if __name__ == "__main__":
     # Strategy-specific parameters
     parser.add_argument('--alpha', type=float, default=0.5, help="Coefficient for 'interpolation' strategy.")
     parser.add_argument('--lambda_s', type=float, default=1.0, help="Synergy coefficient for 'task_vector_grafting'.")
-    parser.add_argument('--lambda_c', type=float, default=1.0, help="Conflict mitigation coefficient for 'task_vector_grafting'.")
+    parser.add_argument('--lambda_c', type=float, default=0.5, help="Conflict mitigation coefficient for 'task_vector_grafting'.")
 
     parser.add_argument('--output', type=str, default=None, help="Output directory and name for the merged model.")
     
