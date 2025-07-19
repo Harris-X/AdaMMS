@@ -35,17 +35,25 @@ def load_weights_from_index(base_path: str) -> dict:
         weights.update(safetensors.torch.load_file(os.path.join(base_path, file)))
     return weights
 
-def normalize_keys(weights: dict, prefix_to_remove: str) -> dict:
-    """移除权重字典中每个 key 的指定前缀。"""
-    if not prefix_to_remove:
+def normalize_keys(weights: dict, prefix_to_remove: str, prefix_to_add: str = "") -> dict:
+    """
+    标准化权重字典中的 key。
+    - 移除 'prefix_to_remove'。
+    - （可选）在开头添加 'prefix_to_add'。
+    """
+    if not prefix_to_remove and not prefix_to_add:
         return weights
     
     normalized_weights = {}
     for key, value in weights.items():
-        if key.startswith(prefix_to_remove):
-            normalized_weights[key[len(prefix_to_remove):]] = value
-        else:
-            normalized_weights[key] = value
+        new_key = key
+        if prefix_to_remove and new_key.startswith(prefix_to_remove):
+            new_key = new_key[len(prefix_to_remove):]
+        
+        if prefix_to_add:
+            new_key = prefix_to_add + new_key
+            
+        normalized_weights[new_key] = value
     return normalized_weights
 
 # --- 辅助函数 ---
@@ -105,7 +113,7 @@ def create_soft_link(source_path, link_path):
             continue
 
 # --- 主转换与合并逻辑 ---
-def convert(args):
+def convert(args, device):
     # --- 输出路径设置 ---
     output_dir = "merged_models"
     if args.output:
@@ -128,7 +136,7 @@ def convert(args):
     
     print("加载增量模型 (M_B: llava-onevision-qwen)...")
     donor_weights_raw = load_weights_from_index(args.donor_model_path)
-    # 标准化 Key：移除 'language_model.' 前缀
+    # 标准化 Key：移除 'language_model.' 前缀，并添加 'model.' 前缀
     donor_weights = normalize_keys(donor_weights_raw, "language_model.")
     print("增量模型 Key 标准化完成。")
     
@@ -144,16 +152,16 @@ def convert(args):
         print("加载原始预训练模型 (M_C: Qwen2-Instruct)...")
         original_weights_raw = load_weights_from_index(args.original_model_path)
         # 标准化 Key：移除 'model.' 前缀
-        original_weights = normalize_keys(original_weights_raw, "model.")
+        # original_weights = normalize_keys(original_weights_raw, "model.")
         print("原始模型 Key 标准化完成。")
 
         # 迭代基础模型的 key，因为它是我们最终要保存的结构
         for key in tqdm(base_weights.keys(), desc="应用任务向量嫁接"):
             # 检查标准化后的 key 是否存在于所有模型中
-            if key in original_weights and key in donor_weights and need_merge(key) and base_weights[key].shape == donor_weights[key].shape:
-                w_c = original_weights[key].float().cuda()
-                w_a = base_weights[key].float().cuda()
-                w_b = donor_weights[key].float().cuda()
+            if key in original_weights_raw and key in donor_weights and need_merge(key) and base_weights[key].shape == donor_weights[key].shape:
+                w_c = original_weights_raw[key].float().to(device)
+                w_a = base_weights[key].float().to(device)
+                w_b = donor_weights[key].float().to(device)
 
                 tau_a = w_a - w_c
                 tau_b = w_b - w_c
@@ -220,6 +228,9 @@ if __name__ == "__main__":
                         choices=['interpolation', 'task_vector_grafting'], 
                         help="使用的合并策略。")
     
+    # 修复点：添加 cuda_device 参数
+    parser.add_argument('--cuda_device', type=int, default=0, help="要使用的 CUDA 设备号 (例如, 0, 1, 2)。")
+
     # 模型路径
     parser.add_argument('--base_model_path', type=str, default=CKPT_PATH["qwen2_vl"], 
                         help="基础模型 (M_A) 的路径。")
@@ -236,6 +247,14 @@ if __name__ == "__main__":
     parser.add_argument('--output', type=str, default=None, help="合并后模型的输出目录和名称。")
     
     args = parser.parse_args()
+
+    # 修复点：根据参数设置设备
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.cuda_device}")
+        print(f"正在使用 CUDA 设备: {device}")
+    else:
+        device = torch.device("cpu")
+        print("警告: CUDA 不可用，将使用 CPU。计算会非常慢。")
     
     # 从参数更新路径
     CKPT_PATH['qwen2_vl'] = args.base_model_path
@@ -254,4 +273,4 @@ if __name__ == "__main__":
         print(f"插值 Alpha: {args.alpha}")
     print("--------------------")
 
-    convert(args)
+    convert(args, device)
