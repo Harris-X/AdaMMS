@@ -211,17 +211,21 @@ def convert(args, device):
     model_a = AutoModelForVision2Seq.from_pretrained(args.base_model_path, torch_dtype=torch.bfloat16).to(device)
     tokenizer_a = AutoTokenizer.from_pretrained(args.base_model_path)
 
-    # # 3. 计算模型A的激活
-    target_layers = [k for k, v in model_a.named_modules() if isinstance(v, torch.nn.Module) and k.startswith("model.layers.")]
+    # 3. 计算模型A的激活
+    # model_a 的目标层
+    target_layers_a = [k for k, v in model_a.named_modules() if isinstance(v, torch.nn.Module) and k.startswith("model.language_model.layers.")]
+    if not target_layers_a:
+        print("错误: 在基础模型中未找到任何以 'model.language_model.layers.' 开头的层。", file=sys.stderr); sys.exit(1)
+    print(f"Found {len(target_layers_a)} target layers in Base Model.")
+
     probe_inputs_a = tokenizer_a(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
     probe_dataset_a = TensorDataset(probe_inputs_a['input_ids'], probe_inputs_a['attention_mask'])
     probe_dataloader_a = DataLoader(probe_dataset_a, batch_size=args.probe_batch_size)
-    activations_a = get_activations(model_a, tokenizer_a, target_layers, probe_dataloader_a, "Base Model", device)
+    activations_a = get_activations(model_a, tokenizer_a, target_layers_a, probe_dataloader_a, "Base Model", model_a.device)
     del model_a, tokenizer_a, probe_inputs_a, probe_dataset_a, probe_dataloader_a; gc.collect(); torch.cuda.empty_cache()
 
     # 4. 加载模型B用于激活探测
     print("\nLoading Donor Model (B) to GPU for activation probing...")
-    # 修复点：显式加载 donor 模型的配置，并传递给 from_pretrained，确保结构正确
     from transformers import AutoConfig
     tokenizer_b = AutoTokenizer.from_pretrained(args.donor_model_path)
     model_b = AutoModelForVision2Seq.from_pretrained(
@@ -230,19 +234,46 @@ def convert(args, device):
     ).to(device)
 
     # 5. 计算模型B的激活
+    # 修复点：为 model_b 创建其自己的目标层列表
+    target_layers_b = [k for k, v in model_b.named_modules() if isinstance(v, torch.nn.Module) and k.startswith("language_model.layers.")]
+    if not target_layers_b:
+        print("错误: 在增量模型中未找到任何以 'language_model.model.layers.' 开头的层。", file=sys.stderr); sys.exit(1)
+    print(f"Found {len(target_layers_b)} target layers in Donor Model.")
+
     probe_inputs_b = tokenizer_b(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
     probe_dataset_b = TensorDataset(probe_inputs_b['input_ids'], probe_inputs_b['attention_mask'])
     probe_dataloader_b = DataLoader(probe_dataset_b, batch_size=args.probe_batch_size)
-    activations_b = get_activations(model_b, tokenizer_b, target_layers, probe_dataloader_b, "Donor Model", device)
+    # 使用 target_layers_b 获取激活
+    activations_b = get_activations(model_b, tokenizer_b, target_layers_b, probe_dataloader_b, "Donor Model", model_b.device)
     del model_b, tokenizer_b, probe_inputs_b, probe_dataset_b, probe_dataloader_b; gc.collect(); torch.cuda.empty_cache()
 
     # 6. 计算散度并合并
     divergence_scores = {}
-    for layer_name in tqdm(target_layers, desc="Calculating CKA Divergence"):
-        act_a = activations_a[layer_name].view(activations_a[layer_name].shape[0], -1)
-        act_b = activations_b[layer_name].view(activations_b[layer_name].shape[0], -1)
-        divergence_scores[layer_name] = 1 - cka(act_a, act_b)
+    # 修复点：创建一个从 model_a 层名到 model_b 层名的映射
+    map_a_to_b = {a_name: b_name for a_name, b_name in zip(target_layers_a, target_layers_b)}
+
+    for layer_name_a in tqdm(target_layers_a, desc="Calculating CKA Divergence"):
+        layer_name_b = map_a_to_b[layer_name_a] # 获取对应的 model_b 层名
+        
+        # 检查两个模型的激活是否都已成功获取
+        if layer_name_a not in activations_a or not activations_a[layer_name_a].numel():
+            print(f"警告: 模型A中层 {layer_name_a} 的激活为空，跳过。")
+            continue
+        if layer_name_b not in activations_b or not activations_b[layer_name_b].numel():
+            print(f"警告: 模型B中层 {layer_name_b} 的激活为空，跳过。")
+            continue
+
+        act_a = activations_a[layer_name_a].view(activations_a[layer_name_a].shape[0], -1)
+        act_b = activations_b[layer_name_b].view(activations_b[layer_name_b].shape[0], -1)
+        
+        # 将散度分数存储在以 model_a 的层名为 key 的字典中，方便后续合并使用
+        divergence_scores[layer_name_a] = 1 - cka(act_a, act_b)
+
     del activations_a, activations_b; gc.collect(); torch.cuda.empty_cache()
+
+    if not divergence_scores:
+        print("错误：未能计算任何层的散度分数，无法继续合并。请检查层名匹配逻辑。", file=sys.stderr)
+        sys.exit(1)
 
     all_divergences = np.array(list(divergence_scores.values()))
     t_low = np.percentile(all_divergences, args.low_div_percentile)

@@ -63,6 +63,8 @@ def need_merge(name: str) -> bool:
         # 排除旋转位置编码的频率缓存
         if name.endswith(".self_attn.rotary_emb.inv_freq"):
             return False
+        if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight") or name.endswith(".self_attn.o_proj.weight"):
+            return False # 修改了此处
         return True
     # 合并最终的 LayerNorm
     if name == 'model.norm.weight':
@@ -227,7 +229,7 @@ if __name__ == "__main__":
                         help="原始预训练模型 (M_C) 的路径。'task_vector_grafting' 策略需要。")
 
     # 策略特定参数
-    parser.add_argument('--alpha', type=float, default=1.0, help="'interpolation' 策略的系数。")
+    parser.add_argument('--alpha', type=float, default=0.3, help="'interpolation' 策略的系数。")
     parser.add_argument('--lambda_s', type=float, default=1.2, help="'task_vector_grafting' 的协同系数。")
     parser.add_argument('--lambda_c', type=float, default=0.0, help="'task_vector_grafting' 的冲突系数。")
 
