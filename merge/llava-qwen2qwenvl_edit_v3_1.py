@@ -89,8 +89,8 @@ def need_merge(name:str) -> bool:
     if name.startswith("model.layers."):
         if name.endswith(".self_attn.rotary_emb.inv_freq"):
             return False
-        if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight") or name.endswith(".self_attn.o_proj.weight"):
-            return False # 修改了此处
+        # if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight") or name.endswith(".self_attn.o_proj.weight"):
+        #     return False # 修改了此处
         return True 
     return False
 
@@ -390,7 +390,16 @@ def convert(args, device):
                     tau_b_ortho = tau_b - (tau_b_synergy - tau_b_conflict)
                 else:
                     tau_b_synergy, tau_b_conflict, tau_b_ortho = torch.zeros_like(tau_b), torch.zeros_like(tau_b), tau_b
-                w_star = w_a + (lambda_s * tau_b_synergy) - (lambda_c * tau_b_conflict) + (lambda_o * tau_b_ortho)
+                # w_star = w_a + (lambda_s * tau_b_synergy) - (lambda_c * tau_b_conflict) + (lambda_o * tau_b_ortho)
+                # 修改成为如下
+                w_star = w_a.clone()
+                w_star += (lambda_s - 1.0) * tau_b_synergy
+                w_star += (1.0 - lambda_c) * (-tau_b_conflict)
+                w_star += lambda_o * tau_b_ortho
+                
+                merged_weights[key] = w_star.to(base_weights[key].dtype).cpu()
+
+
         
             merged_weights[key] = w_star.to(base_weights[key].dtype).cpu()
             gc.collect(); torch.cuda.empty_cache()
@@ -440,9 +449,9 @@ if __name__ == "__main__":
     parser.add_argument('--high_div_percentile', type=float, default=66, help="Percentile to define high divergence threshold.")
     
     # λ coefficients for each divergence zone
-    parser.add_argument('--lambda_s_low', type=float, default=1.2, help="Synergy coeff for low divergence.")
+    parser.add_argument('--lambda_s_low', type=float, default=1.5, help="Synergy coeff for low divergence.")
     parser.add_argument('--lambda_c_low', type=float, default=1.0, help="Conflict coeff for low divergence.")
-    parser.add_argument('--lambda_s_mid', type=float, default=1.0, help="Synergy coeff for medium divergence.")
+    parser.add_argument('--lambda_s_mid', type=float, default=1.2, help="Synergy coeff for medium divergence.")
     parser.add_argument('--lambda_c_mid', type=float, default=0.5, help="Conflict coeff for medium divergence.")
     parser.add_argument('--lambda_o', type=float, default=1.0, help="Orthogonal knowledge coefficient (usually 1.0).")
     
