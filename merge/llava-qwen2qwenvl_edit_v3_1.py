@@ -227,6 +227,7 @@ def convert(args, device):
     # for k, v in model_a.named_modules():
     #     if isinstance(v, torch.nn.Module):
     #         print(k, v)
+    print("Base Model (A) layers:", model_a)
 
 
     # if not target_layers_a:
@@ -275,7 +276,7 @@ def convert(args, device):
     # for k, v in model_b.named_modules():
     #     if isinstance(v, torch.nn.Module):
     #         print(k, v)
-
+    print("Donor Model (B) layers:", model_b)
 
     # if not target_layers_b:
     #     print(f"错误: 在增量模型中未找到任何以language_model.layers.开头的层。", file=sys.stderr); sys.exit(1)
