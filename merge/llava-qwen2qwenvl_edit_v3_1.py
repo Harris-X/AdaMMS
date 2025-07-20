@@ -234,20 +234,20 @@ def convert(args, device):
     # print(f"Found {len(target_layers_a)} target layers in Base Model.")
 
 
-        # --- 核心修改点 1: 定义粗粒度的目标层 ---
+    # --- 核心修改点 1: 定义粗粒度的目标层 ---
     print("Defining coarse-grained target layers (self_attn and mlp)...")
     target_layers_a = []
     target_layers_b = []
     num_layers = model_a.config.num_hidden_layers
     for i in range(num_layers):
         # 基础模型A (Qwen2-VL) 的层名
-        attn_layer_a = f"model.language_model.model.layers.{i}.self_attn"
-        mlp_layer_a = f"model.language_model.model.layers.{i}.mlp"
+        attn_layer_a = f"model.language_model.layers.{i}.self_attn"
+        mlp_layer_a = f"model.language_model.layers.{i}.mlp"
         target_layers_a.extend([attn_layer_a, mlp_layer_a])
         
         # 增量模型B (LLaVA-OneVision) 的层名
-        attn_layer_b = f"language_model.model.layers.{i}.self_attn"
-        mlp_layer_b = f"language_model.model.layers.{i}.mlp"
+        attn_layer_b = f"model.language_model.layers.{i}.self_attn"
+        mlp_layer_b = f"model.language_model.layers.{i}.mlp"
         target_layers_b.extend([attn_layer_b, mlp_layer_b])
     
     print(f"Defined {len(target_layers_a)} target modules for divergence calculation.")
