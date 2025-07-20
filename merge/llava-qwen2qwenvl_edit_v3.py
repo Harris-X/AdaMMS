@@ -80,11 +80,19 @@ def normalize_donor_keys(weights: dict) -> dict:
             normalized_weights[key] = value
     return normalized_weights
 
-def need_merge(name: str) -> bool:
-    if any(k in name for k in ['lm_head', 'embed_tokens', 'rotary_emb.inv_freq', 'vision_tower']):
+# --- Helper Functions ---
+def need_merge(name:str) -> bool:
+    if name in ['model.norm.weight']:
         return False
-    # 我们主要合并语言模型的 Transformer 层
-    return name.startswith("model.layers.") or name == 'model.norm.weight'
+    if name in ['lm_head.weight', 'model.embed_tokens.weight']:
+        return False
+    if name.startswith("model.layers."):
+        if name.endswith(".self_attn.rotary_emb.inv_freq"):
+            return False
+        if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight") or name.endswith(".self_attn.o_proj.weight"):
+            return False # 修改了此处
+        return True 
+    return False
 
 def create_soft_link(source_path, link_path):
     print(f"Creating symbolic links from {source_path} to {link_path} for non-weight files...")
@@ -264,18 +272,24 @@ def convert(args, device):
     map_a_to_b = {a_name: b_name for a_name, b_name in zip(target_layers_a, target_layers_b)}
 
     for layer_name_a in tqdm(target_layers_a, desc="Calculating CKA Divergence"):
-        layer_name_b = map_a_to_b[layer_name_a] # 获取对应的 model_b 层名
-        
-        # 检查两个模型的激活是否都已成功获取
-        if layer_name_a not in activations_a or not activations_a[layer_name_a].numel():
-            print(f"警告: 模型A中层 {layer_name_a} 的激活为空，跳过。")
+        layer_name_b = map_a_to_b.get(layer_name_a) # 使用 .get() 更安全
+        if not layer_name_b:
+            continue # 如果没有映射关系，则跳过
+
+        # 修复点：更稳健地检查激活是否存在且不为空
+        act_a_val = activations_a.get(layer_name_a)
+        act_b_val = activations_b.get(layer_name_b)
+
+        # 检查激活是否为 None、空列表或空张量
+        if not isinstance(act_a_val, torch.Tensor) or not act_a_val.numel():
+            print(f"警告: 模型A中层 {layer_name_a} 的激活为空或无效，跳过。")
             continue
-        if layer_name_b not in activations_b or not activations_b[layer_name_b].numel():
-            print(f"警告: 模型B中层 {layer_name_b} 的激活为空，跳过。")
+        if not isinstance(act_b_val, torch.Tensor) or not act_b_val.numel():
+            print(f"警告: 模型B中层 {layer_name_b} 的激活为空或无效，跳过。")
             continue
 
-        act_a = activations_a[layer_name_a].view(activations_a[layer_name_a].shape[0], -1)
-        act_b = activations_b[layer_name_b].view(activations_b[layer_name_b].shape[0], -1)
+        act_a = act_a_val.view(act_a_val.shape[0], -1)
+        act_b = act_b_val.view(act_b_val.shape[0], -1)
         
         # 将散度分数存储在以 model_a 的层名为 key 的字典中，方便后续合并使用
         divergence_scores[layer_name_a] = 1 - cka(act_a, act_b)
