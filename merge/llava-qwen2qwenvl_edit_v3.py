@@ -214,8 +214,13 @@ def convert(args, device):
     # 3. 计算模型A的激活
     # model_a 的目标层
     target_layers_a = [k for k, v in model_a.named_modules() if isinstance(v, torch.nn.Module) and k.startswith("model.language_model.layers.")]
+    for k, v in model_a.named_modules():
+        if isinstance(v, torch.nn.Module):
+            print(k, v)
+
+
     if not target_layers_a:
-        print("错误: 在基础模型中未找到任何以 'model.language_model.layers.' 开头的层。", file=sys.stderr); sys.exit(1)
+        print("错误: 在基础模型中未找到任何以 'model.layers.' 开头的层。", file=sys.stderr); sys.exit(1)
     print(f"Found {len(target_layers_a)} target layers in Base Model.")
 
     probe_inputs_a = tokenizer_a(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
@@ -235,9 +240,15 @@ def convert(args, device):
 
     # 5. 计算模型B的激活
     # 修复点：为 model_b 创建其自己的目标层列表
-    target_layers_b = [k for k, v in model_b.named_modules() if isinstance(v, torch.nn.Module) and k.startswith("language_model.layers.")]
+
+    target_layers_b = [k for k, v in model_b.named_modules() if isinstance(v, torch.nn.Module) and k.startswith("model.language_model.layers.")]
+    for k, v in model_b.named_modules():
+        if isinstance(v, torch.nn.Module):
+            print(k, v)
+
+
     if not target_layers_b:
-        print("错误: 在增量模型中未找到任何以 'language_model.model.layers.' 开头的层。", file=sys.stderr); sys.exit(1)
+        print(f"错误: 在增量模型中未找到任何以language_model.layers.开头的层。", file=sys.stderr); sys.exit(1)
     print(f"Found {len(target_layers_b)} target layers in Donor Model.")
 
     probe_inputs_b = tokenizer_b(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
@@ -347,7 +358,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Adaptively merge models based on activation divergence.")
     
     # 修复点：添加 cuda_device 参数
-    parser.add_argument('--cuda_device', type=int, default=1, help="CUDA device to use (e.g., 0, 1, 2).")
+    parser.add_argument('--cuda_device', type=int, default=7, help="CUDA device to use (e.g., 0, 1, 2).")
     # ... (参数定义与上一版本相同) ...
     # Model Paths
     parser.add_argument('--base_model_path', type=str, default=CKPT_PATH["qwen2_vl"])
