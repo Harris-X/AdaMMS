@@ -95,13 +95,38 @@ def need_merge(name:str) -> bool:
     return False
 
 def create_soft_link(source_path, link_path):
-    print(f"Creating symbolic links from {source_path} to {link_path} for non-weight files...")
+    # Check if source path exists
+    if not os.path.exists(source_path):
+        print(f"Error: Source path '{source_path}' does not exist.")
+        return
+
+    # Check if link path exists, if not create it
+    if not os.path.exists(link_path):
+        os.makedirs(link_path)
+        print(f"Created directory '{link_path}'")
+
+    # Iterate through all files and directories in the source path
     for item in os.listdir(source_path):
-        if not item.endswith(('.safetensors', '.bin', '.py', '.md')):
-            source_item, link_item = os.path.join(source_path, item), os.path.join(link_path, item)
-            if not os.path.exists(link_item):
-                try: os.symlink(source_item, link_item)
-                except OSError as e: print(f"Error linking {item}: {e}", file=sys.stderr)
+        source_item = os.path.join(source_path, item)
+        link_item = os.path.join(link_path, item)
+
+        # Skip files that end with '.bin'
+        if item.endswith('.bin'):
+            print(f"Skipping '{item}' as it ends with '.bin'")
+            continue
+
+        # If it's a file, create a symbolic link
+        if os.path.isfile(source_item):
+            try:
+                os.symlink(source_item, link_item)
+                print(f"Created soft link '{link_item}' -> '{source_item}'")
+            except OSError as e:
+                print(f"Error creating soft link for '{item}': {e}")
+
+        # If it's a directory, ignore it
+        elif os.path.isdir(source_item):
+            continue
+
 
 # --- 激活散度与合并逻辑 ---
 def gram_linear(x):
@@ -388,7 +413,7 @@ def convert(args, device):
         safetensors.torch.save_file(weights_dict, os.path.join(OUTPUT_PATH, filename))
     
     create_soft_link(source_path=args.base_model_path, link_path=OUTPUT_PATH)
-    shutil.copy(index_path, os.path.join(OUTPUT_PATH, os.path.basename(index_path)))
+    # shutil.copy(index_path, os.path.join(OUTPUT_PATH, os.path.basename(index_path)))
     print(f"Merged model saved to: {OUTPUT_PATH}")
 
 if __name__ == "__main__":
