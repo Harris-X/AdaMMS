@@ -88,12 +88,21 @@ def need_merge(name:str) -> bool:
     if name in ['lm_head.weight', 'model.embed_tokens.weight']:
         return False
     if name.startswith("model.layers."):
+        # 不合并旋转位置编码
         if name.endswith(".self_attn.rotary_emb.inv_freq"):
             return False
-        if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.o_proj.weight"): # or name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight") 
-            return False # 修改了此处
+        
+        # 精确控制 Attention 块的合并范围
+        # 不合并 Q, K, O 的权重和偏置
+        if name.endswith((".self_attn.q_proj.weight", ".self_attn.q_proj.bias",
+                           ".self_attn.k_proj.weight", ".self_attn.k_proj.bias",
+                           ".self_attn.o_proj.weight", ".self_attn.o_proj.bias")):
+            return False
+            
+        # 其他层（包括 MLP, v_proj.weight, v_proj.bias, layernorms）都进行合并
         return True 
     return False
+
 
 def create_soft_link(source_path, link_path):
     # Check if source path exists
@@ -397,7 +406,7 @@ def convert(args, device):
                 w_star += (lambda_s - 1.0) * tau_b_synergy
                 w_star += (1.0 - lambda_c) * (-tau_b_conflict)
                 w_star += lambda_o * tau_b_ortho
-                
+                    
                 merged_weights[key] = w_star.to(base_weights[key].dtype).cpu()
 
 
