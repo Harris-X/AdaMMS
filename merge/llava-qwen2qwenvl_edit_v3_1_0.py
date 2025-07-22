@@ -93,11 +93,13 @@ def need_merge(name:str) -> bool:
             return False
         
         # 精确控制 Attention 块的合并范围
-        # 只排除 O 投影，允许合并 Q, K, V
-        if name.endswith((".self_attn.o_proj.weight", ".self_attn.o_proj.bias")):
+        # 不合并 Q, K, O 的权重和偏置
+        if name.endswith((".self_attn.q_proj.weight", ".self_attn.q_proj.bias",
+                                                      )): # ".self_attn.k_proj.weight", ".self_attn.k_proj.bias",
+            # ".self_attn.o_proj.weight", ".self_attn.o_proj.bias" 
             return False
             
-        # 其他层（包括 MLP, Q/K/V 投影, layernorms）都进行合并
+        # 其他层（包括 MLP, v_proj.weight, v_proj.bias, layernorms）都进行合并
         return True 
     return False
 
@@ -368,32 +370,25 @@ def convert(args, device):
         # 使用标准化后的 donor_weights 进行检查
         if key in donor_weights and key in original_weights and need_merge(key) and base_weights[key].shape == donor_weights[key].shape:
             module_path = key.rsplit('.', 1)[0]
-            # 如果参数属于某个模块（例如 self_attn 或 mlp），则获取其散度
-            # 对于 layernorm 等直接在层下的参数，我们使用一个中等散度值
             divergence = divergence_scores.get(module_path, (t_low + t_high) / 2)
             
             w_c = original_weights[key].float().to(device)
             w_a = base_weights[key].float().to(device)
             w_b = donor_weights[key].float().to(device)
 
-            # 核心修改：高散度策略仅用于 MLP 层
-            if 'mlp' in key and divergence > t_high and layer_stats:
-                print(f"Layer {key}: High divergence ({divergence:.4f}) on MLP. Using activation-space null-space grafting.")
-                # 确保模型被加载以计算协方差
+            if divergence > t_high and layer_stats:
+                print(f"Layer {key}: High divergence ({divergence:.4f}). Using activation-space null-space grafting.")
                 model_a_for_cov = AutoModelForVision2Seq.from_pretrained(args.base_model_path, torch_dtype=torch.bfloat16).to(device)
                 projector = compute_covariance_and_projector(model_a_for_cov, tokenizer_for_cov, module_path, args).to(device)
                 delta = w_b - w_a
                 projected_delta = delta @ projector
                 w_star = w_a + projected_delta
-                del model_a_for_cov, projector; gc.collect(); torch.cuda.empty_cache()
+                del model_a_for_cov; gc.collect(); torch.cuda.empty_cache()
             else:
-                # 对所有其他层（包括 self_attn 的 Q,K,V）使用此方法
                 if divergence < t_low:
                     lambda_s, lambda_c = args.lambda_s_low, args.lambda_c_low
-                    # print(f"Layer {key}: Low divergence ({divergence:.4f}). Using synergy/conflict decomposition.")
-                else: # mid divergence
+                else:
                     lambda_s, lambda_c = args.lambda_s_mid, args.lambda_c_mid
-                    # print(f"Layer {key}: Mid divergence ({divergence:.4f}). Using synergy/conflict decomposition.")
                 lambda_o = args.lambda_o
 
                 tau_a, tau_b = w_a - w_c, w_b - w_c

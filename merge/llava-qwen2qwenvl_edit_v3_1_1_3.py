@@ -367,27 +367,43 @@ def convert(args, device):
     for key in tqdm(base_weights.keys(), desc="Applying Adaptive Merging"):
         # 使用标准化后的 donor_weights 进行检查
         if key in donor_weights and key in original_weights and need_merge(key) and base_weights[key].shape == donor_weights[key].shape:
+            # 修复点：正确地将参数key映射到其所属的模块（self_attn 或 mlp）
+            parts = key.split('.')
+            module_path = ""
+            if 'self_attn' in parts:
+                # 例如: model.layers.0.self_attn.q_proj.weight -> model.layers.0.self_attn
+                module_path = ".".join(parts[:parts.index('self_attn')+1])
+            elif 'mlp' in parts:
+                # 例如: model.layers.0.mlp.gate_proj.weight -> model.layers.0.mlp
+                module_path = ".".join(parts[:parts.index('mlp')+1])
+
             module_path = key.rsplit('.', 1)[0]
-            # 如果参数属于某个模块（例如 self_attn 或 mlp），则获取其散度
-            # 对于 layernorm 等直接在层下的参数，我们使用一个中等散度值
             divergence = divergence_scores.get(module_path, (t_low + t_high) / 2)
             
             w_c = original_weights[key].float().to(device)
             w_a = base_weights[key].float().to(device)
             w_b = donor_weights[key].float().to(device)
 
-            # 核心修改：高散度策略仅用于 MLP 层
-            if 'mlp' in key and divergence > t_high and layer_stats:
-                print(f"Layer {key}: High divergence ({divergence:.4f}) on MLP. Using activation-space null-space grafting.")
+            # 核心修改：高散度策略应用于 MLP, Q-proj, 和 K-proj
+            is_high_div_candidate = 'mlp' in key or 'self_attn.q_proj' in key or 'self_attn.k_proj' in key
+            if is_high_div_candidate and divergence > t_high and layer_stats:
+                print(f"Layer {key}: High divergence ({divergence:.4f}). Using activation-space null-space grafting.")
                 # 确保模型被加载以计算协方差
                 model_a_for_cov = AutoModelForVision2Seq.from_pretrained(args.base_model_path, torch_dtype=torch.bfloat16).to(device)
-                projector = compute_covariance_and_projector(model_a_for_cov, tokenizer_for_cov, module_path, args).to(device)
+                # 使用正确的散度key（即模块路径）来计算投影
+                projector = compute_covariance_and_projector(model_a_for_cov, tokenizer_for_cov, divergence_key, args).to(device)
                 delta = w_b - w_a
-                projected_delta = delta @ projector
+                
+                # 确保投影矩阵和权重张量可以进行矩阵乘法
+                if delta.dim() > 1:
+                    projected_delta = delta @ projector
+                else: # 对于偏置项 (bias)
+                    projected_delta = delta
+                    
                 w_star = w_a + projected_delta
                 del model_a_for_cov, projector; gc.collect(); torch.cuda.empty_cache()
             else:
-                # 对所有其他层（包括 self_attn 的 Q,K,V）使用此方法
+                # 对所有其他层（包括 self_attn 的 V-proj）使用此方法
                 if divergence < t_low:
                     lambda_s, lambda_c = args.lambda_s_low, args.lambda_c_low
                     # print(f"Layer {key}: Low divergence ({divergence:.4f}). Using synergy/conflict decomposition.")
