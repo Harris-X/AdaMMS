@@ -117,19 +117,14 @@ class LowMemoryGradientMerger:
         print(f"输出将保存至: {self.output_dir}")
 
     def _get_target_modules(self, model):
-        """获取模型中所有需要被hook的目标模块的名称。"""
+        """
+        获取模型中所有需要被hook的目标模块的名称。
+        修正：移除 model_prefix，直接使用 state_dict 中的绝对键名。
+        """
         target_module_names = set()
         
-        # 检查模型的结构
-        if not hasattr(model, "state_dict"):
-            print(f"警告: 模型没有 state_dict 方法，尝试其他方式获取模块")
-            # 尝试直接遍历所有模块
-            for name, _ in model.named_modules():
-                if "mlp" in name or "self_attn" in name:
-                    if "layers" in name and not name.endswith(("rotary_emb", "norm")):
-                        target_module_names.add(name)
-            return list(target_module_names)
-        
+        # 遍历 state_dict 来确定需要合并的参数
+        # state_dict 中的键名已经是我们需要的绝对路径
         for name in model.state_dict().keys():
             if need_merge(name):
                 # 从参数名找到对应的模块名
@@ -165,23 +160,29 @@ class LowMemoryGradientMerger:
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         
         
-        # 根据模型类型获取目标模块名
+        # 根据模型类型获取目标模块名和需要操作的模型部分
         if hasattr(model, "language_model"):
-            target_module_names = self._get_target_modules(model.language_model)
-            model_prefix = "language_model."
+            model_to_hook = model.language_model
         else:
-            target_module_names = self._get_target_modules(model)
-            model_prefix = ""
+            model_to_hook = model
+        
+        # 修正：调用 _get_target_modules 时不再传递错误的 model_prefix
+        target_module_names = self._get_target_modules(model_to_hook)
         
         if not target_module_names:
             print(f"警告: 在 {model_path} 中没有找到符合 `need_merge` 条件的模块。")
-            # 修复 need_merge 函数的问题
+            # 备用逻辑：直接扫描所有模块
             print("尝试扫描所有模块以找到可能的目标...")
             target_module_names = []
-            for name, _ in model.named_modules():
-                if "mlp" in name or "self_attn" in name:
-                    if "layers" in name and not name.endswith(("rotary_emb", "norm")):
-                        target_module_names.append(name)
+            for name, module in model_to_hook.named_modules():
+                # 检查模块的 forward 方法是否有位置参数
+                import inspect
+                sig = inspect.signature(module.forward)
+                # 过滤掉没有位置参数或只有 self/cls 的模块
+                if any(p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD for p in sig.parameters.values()):
+                     if "mlp" in name or "self_attn" in name:
+                        if "layers" in name and not name.endswith(("rotary_emb", "norm")):
+                            target_module_names.append(name)
             print(f"找到 {len(target_module_names)} 个可能的目标模块")
         
         if not target_module_names:
@@ -197,22 +198,31 @@ class LowMemoryGradientMerger:
             def hook_fn(module, input, output):
                 # 处理不同类型的输出
                 if isinstance(output, tuple):
-                    output_tensor = output[0].detach().cpu()
+                    # 确保元组不为空
+                    if not output: return
+                    output_tensor = output[0]
                 else:
-                    output_tensor = output.detach().cpu()
-                captured_activations[name]["outputs"].append(output_tensor)
+                    output_tensor = output
+                
+                # 确保 output_tensor 是一个张量
+                if not isinstance(output_tensor, torch.Tensor): return
+                captured_activations[name]["outputs"].append(output_tensor.detach().cpu())
                 
                 if capture_inputs:
+                    # 健壮性检查：确保 input 不为空
+                    if not input: return
                     # 处理不同类型的输入
                     if isinstance(input, tuple):
-                        input_tensor = input[0].detach().cpu()
+                        input_tensor = input[0]
                     else:
-                        input_tensor = input.detach().cpu()
-                    captured_activations[name]["inputs"].append(input_tensor)
+                        input_tensor = input
+                    
+                    if not isinstance(input_tensor, torch.Tensor): return
+                    captured_activations[name]["inputs"].append(input_tensor.detach().cpu())
             return hook_fn
 
         # 注册钩子
-        for name, module in model.named_modules():
+        for name, module in model_to_hook.named_modules():
             if name in target_module_names:
                 hooks.append(module.register_forward_hook(get_hook(name)))
 
@@ -304,6 +314,7 @@ class LowMemoryGradientMerger:
             if os.path.exists(grad_path) and not self.args.force_recompute:
                 continue
 
+            # 修正：现在所有激活的键都是绝对路径，直接使用即可
             module_name = ".".join(key.split('.')[:-1])
             if module_name not in activations_A or module_name not in activations_C:
                 print(f"警告: 模块 {module_name} 的激活未找到，跳过参数 {key}。")
@@ -420,11 +431,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="使用局部梯度近似进行低显存模型合并。")
     
     # 基本配置
-    parser.add_argument('--base_model_path', type=str, default="/root/autodl-tmp/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
-    parser.add_argument('--donor_model_path', type=str, default="/root/autodl-tmp/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
-    parser.add_argument('--original_model_path', type=str, default="/root/autodl-tmp/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
+    parser.add_argument('--base_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
+    parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
+    parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="default", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=4, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_dataset', type=str, default="wikitext", help="用于探测激活的数据集 ('wikipedia' 或 'c4')。")
