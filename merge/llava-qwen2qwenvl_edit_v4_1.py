@@ -150,131 +150,123 @@ class LowMemoryGradientMerger:
         # 根据模型路径判断应该使用哪种加载方式
         is_vision_model = "VL" in model_path or "llava" in model_path.lower()
         
-        try:
-            if is_vision_model:
-                model = AutoModelForVision2Seq.from_pretrained(
-                    model_path, torch_dtype=torch.bfloat16
-                ).to(self.device)
-            else:
-                # 对于纯文本模型使用 AutoModelForCausalLM
-                from transformers import AutoModelForCausalLM
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path, torch_dtype=torch.bfloat16
-                ).to(self.device)
         
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
-        except Exception as e:
-            print(f"加载模型时出错: {e}")
-            print(f"尝试使用其他方式加载...")
-            # 尝试加载通用模型
-            from transformers import AutoModel
-            model = AutoModel.from_pretrained(
+        if is_vision_model:
+            model = AutoModelForVision2Seq.from_pretrained(
                 model_path, torch_dtype=torch.bfloat16
             ).to(self.device)
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
+        else:
+            # 对于纯文本模型使用 AutoModelForCausalLM
+            from transformers import AutoModelForCausalLM
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path, torch_dtype=torch.bfloat16
+            ).to(self.device)
     
-    # 根据模型类型获取目标模块名
-    if hasattr(model, "language_model"):
-        target_module_names = self._get_target_modules(model.language_model)
-        model_prefix = "language_model."
-    else:
-        target_module_names = self._get_target_modules(model)
-        model_prefix = ""
-    
-    if not target_module_names:
-        print(f"警告: 在 {model_path} 中没有找到符合 `need_merge` 条件的模块。")
-        # 修复 need_merge 函数的问题
-        print("尝试扫描所有模块以找到可能的目标...")
-        target_module_names = []
-        for name, _ in model.named_modules():
-            if "mlp" in name or "self_attn" in name:
-                if "layers" in name and not name.endswith(("rotary_emb", "norm")):
-                    target_module_names.append(name)
-        print(f"找到 {len(target_module_names)} 个可能的目标模块")
-    
-    if not target_module_names:
-        print("仍然找不到目标模块，跳过此模型")
-        return
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
         
-    print(f"在 {os.path.basename(model_path)} 中找到 {len(target_module_names)} 个目标模块。")
-
-    hooks = []
-    captured_activations = defaultdict(lambda: {"inputs": [], "outputs": []})
-
-    def get_hook(name):
-        def hook_fn(module, input, output):
-            # 处理不同类型的输出
-            if isinstance(output, tuple):
-                output_tensor = output[0].detach().cpu()
-            else:
-                output_tensor = output.detach().cpu()
-            captured_activations[name]["outputs"].append(output_tensor)
+        
+        # 根据模型类型获取目标模块名
+        if hasattr(model, "language_model"):
+            target_module_names = self._get_target_modules(model.language_model)
+            model_prefix = "language_model."
+        else:
+            target_module_names = self._get_target_modules(model)
+            model_prefix = ""
+        
+        if not target_module_names:
+            print(f"警告: 在 {model_path} 中没有找到符合 `need_merge` 条件的模块。")
+            # 修复 need_merge 函数的问题
+            print("尝试扫描所有模块以找到可能的目标...")
+            target_module_names = []
+            for name, _ in model.named_modules():
+                if "mlp" in name or "self_attn" in name:
+                    if "layers" in name and not name.endswith(("rotary_emb", "norm")):
+                        target_module_names.append(name)
+            print(f"找到 {len(target_module_names)} 个可能的目标模块")
+        
+        if not target_module_names:
+            print("仍然找不到目标模块，跳过此模型")
+            return
             
-            if capture_inputs:
-                # 处理不同类型的输入
-                if isinstance(input, tuple):
-                    input_tensor = input[0].detach().cpu()
+        print(f"在 {os.path.basename(model_path)} 中找到 {len(target_module_names)} 个目标模块。")
+
+        hooks = []
+        captured_activations = defaultdict(lambda: {"inputs": [], "outputs": []})
+
+        def get_hook(name):
+            def hook_fn(module, input, output):
+                # 处理不同类型的输出
+                if isinstance(output, tuple):
+                    output_tensor = output[0].detach().cpu()
                 else:
-                    input_tensor = input.detach().cpu()
-                captured_activations[name]["inputs"].append(input_tensor)
-        return hook_fn
-
-    # 注册钩子
-    for name, module in model.named_modules():
-        if name in target_module_names:
-            hooks.append(module.register_forward_hook(get_hook(name)))
-
-    # 准备探针数据集 - 使用更可靠的 wikitext
-    try:
-        # 避免使用 wikipedia 以防止冲突
-        probe_dataset_raw = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True).take(self.args.probe_samples)
-        probe_texts = [item['text'] for item in probe_dataset_raw if item['text']]
-    except Exception as e:
-        print(f"加载 wikitext 数据集失败: {e}")
-        # 备用文本
-        probe_texts = [
-            "The quick brown fox jumps over the lazy dog.",
-            "Machine learning models are trained on large datasets.",
-            "Neural networks process information in a hierarchical manner."
-        ] * (self.args.probe_samples // 3 + 1)
-        probe_texts = probe_texts[:self.args.probe_samples]
-    
-    probe_inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-    probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
-    probe_dataloader = DataLoader(probe_dataset, batch_size=self.args.probe_batch_size)
-
-    model.eval()
-    with torch.no_grad():
-        for batch in tqdm(probe_dataloader, desc=f"前向传播 {os.path.basename(model_path)}"):
-            input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
-            model(input_ids=input_ids, attention_mask=attention_mask)
-
-    for h in hooks: h.remove()
-    
-    # 求平均并保存
-    averaged_activations = {}
-    for name, data in captured_activations.items():
-        averaged_activations[name] = {}
-        if data["outputs"] and len(data["outputs"]) > 0:
-            try:
-                averaged_activations[name]["output"] = torch.mean(torch.cat(data["outputs"], dim=0).float(), dim=0)
-            except Exception as e:
-                print(f"处理 {name} 的输出激活时出错: {e}")
-                continue
+                    output_tensor = output.detach().cpu()
+                captured_activations[name]["outputs"].append(output_tensor)
                 
-        if data["inputs"] and len(data["inputs"]) > 0:
-            try:
-                averaged_activations[name]["input"] = torch.mean(torch.cat(data["inputs"], dim=0).float(), dim=0)
-            except Exception as e:
-                print(f"处理 {name} 的输入激活时出错: {e}")
-                continue
+                if capture_inputs:
+                    # 处理不同类型的输入
+                    if isinstance(input, tuple):
+                        input_tensor = input[0].detach().cpu()
+                    else:
+                        input_tensor = input.detach().cpu()
+                    captured_activations[name]["inputs"].append(input_tensor)
+            return hook_fn
 
-    torch.save(averaged_activations, cache_path)
-    print(f"激活已缓存至: {cache_path}")
+        # 注册钩子
+        for name, module in model.named_modules():
+            if name in target_module_names:
+                hooks.append(module.register_forward_hook(get_hook(name)))
+
+        # 准备探针数据集 - 使用更可靠的 wikitext
+        try:
+            # 避免使用 wikipedia 以防止冲突
+            probe_dataset_raw = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True).take(self.args.probe_samples)
+            probe_texts = [item['text'] for item in probe_dataset_raw if item['text']]
+        except Exception as e:
+            print(f"加载 wikitext 数据集失败: {e}")
+            # 备用文本
+            probe_texts = [
+                "The quick brown fox jumps over the lazy dog.",
+                "Machine learning models are trained on large datasets.",
+                "Neural networks process information in a hierarchical manner."
+            ] * (self.args.probe_samples // 3 + 1)
+            probe_texts = probe_texts[:self.args.probe_samples]
     
-    del model, tokenizer, captured_activations, averaged_activations, probe_dataloader
-    gc.collect()
-    torch.cuda.empty_cache()
+        probe_inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
+        probe_dataloader = DataLoader(probe_dataset, batch_size=self.args.probe_batch_size)
+
+        model.eval()
+        with torch.no_grad():
+            for batch in tqdm(probe_dataloader, desc=f"前向传播 {os.path.basename(model_path)}"):
+                input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
+                model(input_ids=input_ids, attention_mask=attention_mask)
+
+        for h in hooks: h.remove()
+        
+        # 求平均并保存
+        averaged_activations = {}
+        for name, data in captured_activations.items():
+            averaged_activations[name] = {}
+            if data["outputs"] and len(data["outputs"]) > 0:
+                try:
+                    averaged_activations[name]["output"] = torch.mean(torch.cat(data["outputs"], dim=0).float(), dim=0)
+                except Exception as e:
+                    print(f"处理 {name} 的输出激活时出错: {e}")
+                    continue
+                    
+            if data["inputs"] and len(data["inputs"]) > 0:
+                try:
+                    averaged_activations[name]["input"] = torch.mean(torch.cat(data["inputs"], dim=0).float(), dim=0)
+                except Exception as e:
+                    print(f"处理 {name} 的输入激活时出错: {e}")
+                    continue
+
+        torch.save(averaged_activations, cache_path)
+        print(f"激活已缓存至: {cache_path}")
+        
+        del model, tokenizer, captured_activations, averaged_activations, probe_dataloader
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def stage1_cache_activations(self):
         """执行阶段一：缓存模型A和模型C的激活。"""
