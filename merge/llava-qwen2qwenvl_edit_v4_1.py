@@ -81,7 +81,7 @@ def need_merge(name: str) -> bool:
     if suffix.endswith((".self_attn.q_proj.weight", ".self_attn.q_proj.bias",
                       ".self_attn.k_proj.weight", ".self_attn.k_proj.bias",
                       ".self_attn.v_proj.weight", ".self_attn.v_proj.bias",
-                      ".self_attn.o_proj.weight", ".self_attn.o_proj.bias")):
+                      ".self_attn.o_proj.weight", ".self_attn.o_proj.bias")): #
         return False
         
     # 只要是 layers 内部的其他参数，都进行合并
@@ -453,16 +453,16 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="default", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=3, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_dataset', type=str, default="wikitext", help="用于探测激活的数据集 ('wikipedia' 或 'c4')。")
-    parser.add_argument('--probe_samples', type=int, default=128, help="用于探测的样本数量。")
-    parser.add_argument('--probe_batch_size', type=int, default=2, help="探测时的批处理大小，如果显存不足请减小。")
+    parser.add_argument('--probe_samples', type=int, default=1000, help="用于探测的样本数量。")
+    parser.add_argument('--probe_batch_size', type=int, default=1, help="探测时的批处理大小，如果显存不足请减小。")
 
     # 合并超参数
-    parser.add_argument('--lambda_s', type=float, default=1.0, help="协同分量的系数。")
-    parser.add_argument('--lambda_c', type=float, default=1.0, help="冲突分量的系数。")
+    parser.add_argument('--lambda_s', type=float, default=1.2, help="协同分量的系数。")
+    parser.add_argument('--lambda_c', type=float, default=0.8, help="冲突分量的系数。")
     parser.add_argument('--lambda_o', type=float, default=1.0, help="正交分量的系数。")
     
     # 功能性参数
