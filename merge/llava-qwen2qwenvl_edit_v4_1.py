@@ -73,6 +73,10 @@ def need_merge(name: str) -> bool:
     if suffix.endswith(".self_attn.rotary_emb.inv_freq"):
         return False
     
+    # 排除归一化层
+    if "layernorm" in suffix:
+        return False
+    
     # 注意：您的原始 need_merge 函数排除了 QKV O 投影，这里遵循该设定。
     if suffix.endswith((".self_attn.q_proj.weight", ".self_attn.q_proj.bias",
                       ".self_attn.k_proj.weight", ".self_attn.k_proj.bias",
