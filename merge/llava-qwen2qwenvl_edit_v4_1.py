@@ -84,28 +84,37 @@ def need_merge(name: str) -> bool:
     return True
 
 def create_soft_link(source_path, link_path):
-    """创建从源目录到目标目录的符号链接（软链接）。"""
+    # Check if source path exists
     if not os.path.exists(source_path):
-        print(f"错误: 源路径 '{source_path}' 不存在。")
+        print(f"Error: Source path '{source_path}' does not exist.")
         return
 
+    # Check if link path exists, if not create it
     if not os.path.exists(link_path):
         os.makedirs(link_path)
-        print(f"已创建目录 '{link_path}'")
+        print(f"Created directory '{link_path}'")
 
+    # Iterate through all files and directories in the source path
     for item in os.listdir(source_path):
         source_item = os.path.join(source_path, item)
         link_item = os.path.join(link_path, item)
-        
-        # 跳过 safetensors 文件，因为它们将被新生成的权重替换
-        if item.endswith('.safetensors') or item.endswith('.json'):
+
+        # Skip files that end with '.bin'
+        if item.endswith('.bin'):
+            print(f"Skipping '{item}' as it ends with '.bin'")
             continue
-            
-        if not os.path.exists(link_item):
-             try:
+
+        # If it's a file, create a symbolic link
+        if os.path.isfile(source_item):
+            try:
                 os.symlink(source_item, link_item)
-             except OSError as e:
-                print(f"为 '{item}' 创建软链接时出错: {e}")
+                print(f"Created soft link '{link_item}' -> '{source_item}'")
+            except OSError as e:
+                print(f"Error creating soft link for '{item}': {e}")
+
+        # If it's a directory, ignore it
+        elif os.path.isdir(source_item):
+            continue
 
 # --- 核心实现类 ---
 
@@ -357,7 +366,7 @@ class LowMemoryGradientMerger:
         original_weights = load_weights(self.args.original_model_path, "model.safetensors.index.json") #
 
         print("正在标准化 Donor 模型的层名...")
-        donor_weights = normalize_donor_keys(donor_weights_raw) #
+        donor_weights = normalize_donor_keys(donor_weights_raw) # language_model.model.layers.0.mlp.down_proj.weight
         del donor_weights_raw
         gc.collect()
 
