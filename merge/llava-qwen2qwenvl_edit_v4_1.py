@@ -53,28 +53,35 @@ def normalize_donor_keys(weights: dict) -> dict:
         if key.startswith(prefix_to_remove):
             normalized_weights[key[len(prefix_to_remove):]] = value
         else:
+            # 对于非语言模型部分（如 vision_tower），保留原样
             normalized_weights[key] = value
     return normalized_weights
 
 def need_merge(name: str) -> bool:
     """
     根据层名判断是否需要合并。
-    (此函数逻辑完全遵循您的定义)
+    修正：使其能处理带任意前缀的层名。
     """
-    #
-    if name in ['model.norm.weight']:
-        return False #
-    if name in ['lm_head.weight', 'model.embed_tokens.weight']:
-        return False #
-    if name.startswith("model.layers."):
-        if name.endswith(".self_attn.rotary_emb.inv_freq"):
-            return False #
-        # 注意：您的原始 need_merge 函数排除了 QKV O 投影，这里遵循该设定。
-        # 如果需要合并这些层，请从下面移除它们。
-        if name.endswith((".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight", ".self_attn.o_proj.weight")):
-            return False #
-        return True #
-    return False #
+    # 找到 "layers" 在名字中的位置
+    layers_idx = name.rfind("layers.")
+    if layers_idx == -1:
+        return False
+
+    # 从 "layers." 开始截取，以进行统一判断
+    suffix = name[layers_idx:]
+    
+    if suffix.endswith(".self_attn.rotary_emb.inv_freq"):
+        return False
+    
+    # 注意：您的原始 need_merge 函数排除了 QKV O 投影，这里遵循该设定。
+    if suffix.endswith((".self_attn.q_proj.weight", ".self_attn.q_proj.bias",
+                      ".self_attn.k_proj.weight", ".self_attn.k_proj.bias",
+                      ".self_attn.v_proj.weight", ".self_attn.v_proj.bias",
+                      ".self_attn.o_proj.weight", ".self_attn.o_proj.bias")):
+        return False
+        
+    # 只要是 layers 内部的其他参数，都进行合并
+    return True
 
 def create_soft_link(source_path, link_path):
     """创建从源目录到目标目录的符号链接（软链接）。"""
@@ -116,22 +123,20 @@ class LowMemoryGradientMerger:
         print(f"使用设备: {self.device}")
         print(f"输出将保存至: {self.output_dir}")
 
-    def _get_target_modules(self, model):
+    def _get_target_modules(self, model_to_hook):
         """
         获取模型中所有需要被hook的目标模块的名称。
-        修正：移除 model_prefix，直接使用 state_dict 中的绝对键名。
+        返回的名称是相对于 model_to_hook 的。
         """
         target_module_names = set()
-        
         # 遍历 state_dict 来确定需要合并的参数
-        # state_dict 中的键名已经是我们需要的绝对路径
-        for name in model.state_dict().keys():
+        for name in model_to_hook.state_dict().keys():
+            # 使用完整的、相对于顶层模型的键名来判断
             if need_merge(name):
                 # 从参数名找到对应的模块名
-                # e.g., "model.layers.0.mlp.gate_proj.weight" -> "model.layers.0.mlp.gate_proj"
+                # e.g., "layers.0.mlp.gate_proj.weight" -> "layers.0.mlp.gate_proj"
                 module_name = ".".join(name.split('.')[:-1])
                 target_module_names.add(module_name)
-    
         return list(target_module_names)
 
     def _cache_activations_for_model(self, model_path, cache_path, capture_inputs=False):
@@ -160,34 +165,28 @@ class LowMemoryGradientMerger:
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         
         
-        # 根据模型类型获取目标模块名和需要操作的模型部分
-        if hasattr(model, "language_model"):
+        # 修正：智能地定位到包含 "layers" 的语言模型部分
+        model_to_hook = None
+        if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
+             # 适用于 Qwen2-VL-7B-Instruct 结构
+            model_to_hook = model.language_model.model
+        elif hasattr(model, "language_model"):
+            # 适用于 llava-onevision-qwen2-7b-si-hf 结构
             model_to_hook = model.language_model
+        elif hasattr(model, "model"):
+            # 适用于 Qwen2-7B-Instruct 结构
+            model_to_hook = model.model
         else:
+            # 备用方案
             model_to_hook = model
+
+        print(f"将对模块 '{type(model_to_hook).__name__}' 注册钩子。")
         
-        # 修正：调用 _get_target_modules 时不再传递错误的 model_prefix
         target_module_names = self._get_target_modules(model_to_hook)
         
         if not target_module_names:
-            print(f"警告: 在 {model_path} 中没有找到符合 `need_merge` 条件的模块。")
-            # 备用逻辑：直接扫描所有模块
-            print("尝试扫描所有模块以找到可能的目标...")
-            target_module_names = []
-            for name, module in model_to_hook.named_modules():
-                # 检查模块的 forward 方法是否有位置参数
-                import inspect
-                sig = inspect.signature(module.forward)
-                # 过滤掉没有位置参数或只有 self/cls 的模块
-                if any(p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD for p in sig.parameters.values()):
-                     if "mlp" in name or "self_attn" in name:
-                        if "layers" in name and not name.endswith(("rotary_emb", "norm")):
-                            target_module_names.append(name)
-            print(f"找到 {len(target_module_names)} 个可能的目标模块")
-        
-        if not target_module_names:
-            print("仍然找不到目标模块，跳过此模型")
-            return
+            print(f"警告: 在 {os.path.basename(model_path)} 中没有找到符合 `need_merge` 条件的模块。")
+            return # 如果找不到目标，直接返回
             
         print(f"在 {os.path.basename(model_path)} 中找到 {len(target_module_names)} 个目标模块。")
 
@@ -307,17 +306,22 @@ class LowMemoryGradientMerger:
         base_weights = load_weights(self.args.base_model_path, "model.safetensors.index.json")
 
         for key in tqdm(base_weights.keys(), desc="计算近似梯度"):
+            
             if not need_merge(key):
                 continue
                 
-            grad_path = os.path.join(self.grad_dir, f"{key}.pt")
+            grad_path = os.path.join(self.grad_dir, f"{key.replace('/', '_')}.pt") # 替换/防止路径问题
             if os.path.exists(grad_path) and not self.args.force_recompute:
                 continue
 
-            # 修正：现在所有激活的键都是绝对路径，直接使用即可
-            module_name = ".".join(key.split('.')[:-1])
+            # 修正：从绝对路径key中提取出相对于语言模型部分的模块名
+            layers_idx = key.rfind("layers.")
+            if layers_idx == -1: continue
+            relative_key = key[layers_idx:]
+            module_name = ".".join(relative_key.split('.')[:-1])
+
             if module_name not in activations_A or module_name not in activations_C:
-                print(f"警告: 模块 {module_name} 的激活未找到，跳过参数 {key}。")
+                print(f"警告: 模块 {module_name} (来自键 {key}) 的激活未找到，跳过。")
                 continue
 
             # 加载激活到设备
@@ -363,9 +367,10 @@ class LowMemoryGradientMerger:
             # 默认直接使用基础模型的权重
             merged_weights[key] = base_weights[key] 
 
-            # 检查是否满足合并条件
+            # 检查是否满足合并条件,额外需要注意此处的检查代码
+            # 使用原始的、未经标准化的 donor_weights_raw 进行检查，以匹配前缀
             if need_merge(key) and key in donor_weights and key in original_weights and base_weights[key].shape == donor_weights[key].shape:
-                grad_path = os.path.join(self.grad_dir, f"{key}.pt")
+                grad_path = os.path.join(self.grad_dir, f"{key.replace('/', '_')}.pt")
                 if not os.path.exists(grad_path):
                     print(f"警告: 参数 {key} 的近似梯度未找到，将使用基础模型权重。")
                     continue
@@ -435,7 +440,7 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="default", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=4, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_dataset', type=str, default="wikitext", help="用于探测激活的数据集 ('wikipedia' 或 'c4')。")
