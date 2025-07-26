@@ -208,24 +208,24 @@ class ASAMerger:
 
         print(f"正在为 {model_name} ({os.path.basename(model_path)}) 缓存激活...")
         
-        # 修正：现在函数返回的是 model 和 tokenizer
         model, tokenizer = self._get_model_and_tokenizer(model_path)
         model.to(self.device).eval()
         
         model_to_hook = self._find_target_submodule(model)
 
-        captured_activations = defaultdict(dict)
+        # 修正 1: 初始化用于收集所有批次激活的列表
+        captured_activations = defaultdict(lambda: defaultdict(list))
         hooks = []
 
         def get_hook(module_name, module_type):
             def hook_fn(module, input, output):
-                # 确保 input 不为空
                 if not input:
                     return
                 
+                # 修正 2: 在钩子函数中直接向列表追加(append)激活，而不是覆盖
                 if module_type == 'mlp':
                     if capture_inputs and len(input) > 0: 
-                        captured_activations[module_name]['input'] = input[0].detach().cpu()
+                        captured_activations[module_name]['input'].append(input[0].detach().cpu())
                     if capture_outputs: 
                         if isinstance(output, tuple):
                             if not output: return
@@ -234,12 +234,11 @@ class ASAMerger:
                             output_tensor = output
                         
                         if not isinstance(output_tensor, torch.Tensor): return
-                        captured_activations[module_name]['output'] = output_tensor.detach().cpu()
+                        captured_activations[module_name]['output'].append(output_tensor.detach().cpu())
                 
                 elif module_type == 'attn':
-                    # 对于 Attention 层，我们需要从其子模块 q_proj, k_proj, v_proj 捕获输出
                     if capture_inputs and len(input) > 0: 
-                        captured_activations[module_name]['input'] = input[0].detach().cpu()
+                        captured_activations[module_name]['input'].append(input[0].detach().cpu())
                     if capture_outputs: 
                         if isinstance(output, tuple):
                             if not output: return
@@ -248,53 +247,44 @@ class ASAMerger:
                             output_tensor = output
                         
                         if not isinstance(output_tensor, torch.Tensor): return
-                        captured_activations[module_name]['output'] = output_tensor.detach().cpu()
+                        captured_activations[module_name]['output'].append(output_tensor.detach().cpu())
 
                     if capture_qkv and len(input) > 0:
-                        # 假设 QKV 投影是模块的属性
                         try:
                             if hasattr(module, 'q_proj'):
                                 q = module.q_proj(input[0])
-                                captured_activations[module_name]['q'] = q.detach().cpu()
+                                captured_activations[module_name]['q'].append(q.detach().cpu())
                             if hasattr(module, 'k_proj'):
                                 k = module.k_proj(input[0])
-                                captured_activations[module_name]['k'] = k.detach().cpu()
+                                captured_activations[module_name]['k'].append(k.detach().cpu())
                             if hasattr(module, 'v_proj'):
                                 v = module.v_proj(input[0])
-                                captured_activations[module_name]['v'] = v.detach().cpu()
+                                captured_activations[module_name]['v'].append(v.detach().cpu())
                         except Exception as e:
                             print(f"提取 Q/K/V 时出错: {e}")
             return hook_fn
 
         for name, module in model_to_hook.named_modules():
-            is_target, module_type = self._is_merge_target(name + ".weight") # 用参数名来判断
+            is_target, module_type = self._is_merge_target(name + ".weight")
             if is_target:
-                # 我们需要在 self_attn 模块上注册钩子，而不是它的子投影
                 if module_type == 'attn':
-                    # 确保只在 self_attn 级别注册一次
                     if name.endswith("self_attn"):
                          hooks.append(module.register_forward_hook(get_hook(name, 'attn')))
                 elif module_type == 'mlp':
-                     # 确保只在 mlp 级别注册一次
                      if name.endswith("mlp"):
                         hooks.append(module.register_forward_hook(get_hook(name, 'mlp')))
 
         print(f"在 {model_name} 中注册了 {len(hooks)} 个钩子。")
 
-        # 确定是否为多模态模型，但始终使用文本数据
         is_vision_model = "VL" in model_path or "llava" in model_path.lower()
         
-        all_activations = defaultdict(lambda: defaultdict(list))
-        
+        # 修正 3: 简化前向传播循环，钩子函数会直接填充好所有数据
         with torch.no_grad():
-            # 统一使用 wikitext 数据集，无论是什么类型的模型
             try:
-                # 使用 wikitext 作为探针数据集
                 probe_dataset_raw = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True).take(self.args.probe_samples)
                 probe_texts = [item['text'] for item in probe_dataset_raw if item['text']]
             except Exception as e:
                 print(f"加载 wikitext 数据集失败: {e}")
-                # 备用文本
                 probe_texts = [
                     "The quick brown fox jumps over the lazy dog.",
                     "Machine learning models are trained on large datasets.",
@@ -302,36 +292,29 @@ class ASAMerger:
                 ] * (self.args.probe_samples // 3 + 1)
                 probe_texts = probe_texts[:self.args.probe_samples]
     
-        # 文本处理
-        if is_vision_model:
-            # 对多模态模型，使用其tokenizer处理纯文本输入
-            # 确保使用正确的格式化
-            formatted_texts = [f"<|user|>\n{text}<|endoftext|><|assistant|>" for text in probe_texts]
-            probe_inputs = tokenizer(formatted_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        else:
-            # 对纯文本模型，直接使用tokenizer
-            probe_inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        
-        probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
-        probe_dataloader = DataLoader(probe_dataset, batch_size=8)  # 使用适当的批量大小
-
-        for batch in tqdm(probe_dataloader, desc=f"前向传播 {model_name}"):
-            input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
-            # 对所有模型类型使用相同的前向传播调用
-            model(input_ids=input_ids, attention_mask=attention_mask)
+            if is_vision_model:
+                formatted_texts = [f"<|user|>\n{text}<|endoftext|><|assistant|>" for text in probe_texts]
+                probe_inputs = tokenizer(formatted_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+            else:
+                probe_inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
             
-            for module_name, activations in captured_activations.items():
-                for key, tensor in activations.items():
-                    all_activations[module_name][key].append(tensor.float())
+            probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
+            probe_dataloader = DataLoader(probe_dataset, batch_size=8)
+
+            for batch in tqdm(probe_dataloader, desc=f"前向传播 {model_name}"):
+                input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
+                model(input_ids=input_ids, attention_mask=attention_mask)
 
         for h in hooks: h.remove()
 
+        # 修正 4: 使用 torch.cat 处理不同大小的批次，然后计算平均值
         averaged_activations = {}
-        for module_name, activations_dict in all_activations.items():
+        for module_name, activations_dict in captured_activations.items():
             averaged_activations[module_name] = {}
             for key, tensor_list in activations_dict.items():
                 if tensor_list:
-                    averaged_activations[module_name][key] = torch.mean(torch.stack(tensor_list), dim=0)
+                    concatenated_tensor = torch.cat(tensor_list, dim=0)
+                    averaged_activations[module_name][key] = torch.mean(concatenated_tensor.float(), dim=0)
         
         torch.save(averaged_activations, cache_path)
         print(f"{model_name} 的激活已缓存至: {cache_path}")
