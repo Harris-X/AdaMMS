@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 # 导入指定的模型和分词器类
 from transformers import AutoTokenizer, AutoModelForVision2Seq, AutoModelForCausalLM, AutoProcessor
+from torch.utils.data import DataLoader, TensorDataset
 
 # 尝试导入 Hugging Face datasets 库
 try:
@@ -135,21 +136,31 @@ class ASAMerger:
         return False, None
 
     def _get_model_and_tokenizer(self, model_path):
-        """根据模型类型加载模型、分词器和处理器。"""
-        # Qwen-VL 使用 AutoProcessor 同时处理文本和图像
-        try:
-            processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-            model = AutoModelForVision2Seq.from_pretrained(
-                model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
-            )
-            return model, processor
-        except Exception as e:
-            print(f"作为多模态模型加载失败: {e}. 尝试作为纯语言模型加载...")
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            model = AutoModelForCausalLM.from_pretrained(
-                model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
-            )
-            return model, tokenizer
+        """
+        根据模型类型加载模型和分词器。
+        修正：始终使用 AutoTokenizer 加载分词器，以避免在纯文本输入时触发图像处理器。
+        """
+        is_vision_model = "VL" in model_path or "llava" in model_path.lower()
+        
+        # 统一加载分词器，这是关键修正点
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+        # 根据模型类型加载模型
+        if is_vision_model:
+            try:
+                model = AutoModelForVision2Seq.from_pretrained(
+                    model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+                )
+                # 对于多模态模型，返回的是模型和分词器
+                return model, tokenizer
+            except Exception as e:
+                print(f"警告: 尝试作为多模态模型加载 {model_path} 失败: {e}。将回退到纯语言模型加载。")
+
+        # 对于纯语言模型或多模态模型加载失败的情况
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+        )
+        return model, tokenizer
 
     def _find_target_submodule(self, model):
         """智能地定位到包含 'layers' 的子模块。"""
@@ -197,7 +208,8 @@ class ASAMerger:
 
         print(f"正在为 {model_name} ({os.path.basename(model_path)}) 缓存激活...")
         
-        model, processor = self._get_model_and_tokenizer(model_path)
+        # 修正：现在函数返回的是 model 和 tokenizer
+        model, tokenizer = self._get_model_and_tokenizer(model_path)
         model.to(self.device).eval()
         
         model_to_hook = self._find_target_submodule(model)
@@ -269,65 +281,48 @@ class ASAMerger:
 
         print(f"在 {model_name} 中注册了 {len(hooks)} 个钩子。")
 
-        # 确定是否为多模态模型
+        # 确定是否为多模态模型，但始终使用文本数据
         is_vision_model = "VL" in model_path or "llava" in model_path.lower()
         
         all_activations = defaultdict(lambda: defaultdict(list))
         
         with torch.no_grad():
-            if is_vision_model:
-                # 多模态模型使用图像+文本输入
-                try:
-                    probe_dataset_raw = load_dataset("laion/laion400m", split="train", streaming=True).take(self.args.probe_samples)
-                    probe_data = list(probe_dataset_raw)
-                except Exception as e:
-                    print(f"加载 LAION 数据集失败: {e}. 将使用占位符数据。", file=sys.stderr)
-                    probe_data = [{"TEXT": "a cat sitting on a couch", "URL": "http://images.cocodataset.org/val2017/000000039769.jpg"}] * self.args.probe_samples
+            # 统一使用 wikitext 数据集，无论是什么类型的模型
+            try:
+                # 使用 wikitext 作为探针数据集
+                probe_dataset_raw = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True).take(self.args.probe_samples)
+                probe_texts = [item['text'] for item in probe_dataset_raw if item['text']]
+            except Exception as e:
+                print(f"加载 wikitext 数据集失败: {e}")
+                # 备用文本
+                probe_texts = [
+                    "The quick brown fox jumps over the lazy dog.",
+                    "Machine learning models are trained on large datasets.",
+                    "Neural networks process information in a hierarchical manner."
+                ] * (self.args.probe_samples // 3 + 1)
+                probe_texts = probe_texts[:self.args.probe_samples]
+    
+        # 文本处理
+        if is_vision_model:
+            # 对多模态模型，使用其tokenizer处理纯文本输入
+            # 确保使用正确的格式化
+            formatted_texts = [f"<|user|>\n{text}<|endoftext|><|assistant|>" for text in probe_texts]
+            probe_inputs = tokenizer(formatted_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        else:
+            # 对纯文本模型，直接使用tokenizer
+            probe_inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        
+        probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
+        probe_dataloader = DataLoader(probe_dataset, batch_size=8)  # 使用适当的批量大小
 
-                for item in tqdm(probe_data, desc=f"前向传播 {model_name}"):
-                    text = item.get("TEXT", "")
-                    image_url = item.get("URL", "")
-
-                    try:
-                        image = Image.open(requests.get(image_url, stream=True).raw).convert("RGB")
-                        inputs = processor(text=[f"<|user|>\n<|image_1|>\n{text}<|endoftext|><|assistant|>"], 
-                                           images=[image], return_tensors="pt").to(self.device)
-                        model(**inputs)
-
-                        for module_name, activations in captured_activations.items():
-                            for key, tensor in activations.items():
-                                all_activations[module_name][key].append(tensor.float())
-                    except Exception as e:
-                        continue
-            else:
-                # 纯文本模型使用文本输入 (参考 v4_1.py)
-                try:
-                    # 使用 wikitext 作为探针数据集
-                    probe_dataset_raw = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True).take(self.args.probe_samples)
-                    probe_texts = [item['text'] for item in probe_dataset_raw if item['text']]
-                except Exception as e:
-                    print(f"加载 wikitext 数据集失败: {e}")
-                    # 备用文本
-                    probe_texts = [
-                        "The quick brown fox jumps over the lazy dog.",
-                        "Machine learning models are trained on large datasets.",
-                        "Neural networks process information in a hierarchical manner."
-                    ] * (self.args.probe_samples // 3 + 1)
-                    probe_texts = probe_texts[:self.args.probe_samples]
+        for batch in tqdm(probe_dataloader, desc=f"前向传播 {model_name}"):
+            input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
+            # 对所有模型类型使用相同的前向传播调用
+            model(input_ids=input_ids, attention_mask=attention_mask)
             
-                # 文本处理
-                tokenizer = processor  # 这里 processor 实际上是 tokenizer
-                probe_inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-                probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
-                probe_dataloader = DataLoader(probe_dataset, batch_size=8)  # 使用适当的批量大小
-
-                for batch in tqdm(probe_dataloader, desc=f"前向传播 {model_name}"):
-                    input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
-                    model(input_ids=input_ids, attention_mask=attention_mask)
-                    
-                    for module_name, activations in captured_activations.items():
-                        for key, tensor in activations.items():
-                            all_activations[module_name][key].append(tensor.float())
+            for module_name, activations in captured_activations.items():
+                for key, tensor in activations.items():
+                    all_activations[module_name][key].append(tensor.float())
 
         for h in hooks: h.remove()
 
@@ -341,7 +336,7 @@ class ASAMerger:
         torch.save(averaged_activations, cache_path)
         print(f"{model_name} 的激活已缓存至: {cache_path}")
 
-        del model, processor, captured_activations, averaged_activations
+        del model, tokenizer, captured_activations, averaged_activations
         gc.collect()
         torch.cuda.empty_cache()
 
