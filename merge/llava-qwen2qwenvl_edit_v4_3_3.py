@@ -264,20 +264,15 @@ class ASAMerger:
                             print(f"提取 Q/K/V 时出错: {e}")
             return hook_fn
 
-        # 修正：更精细地注册钩子
         for name, module in model_to_hook.named_modules():
-            # 我们直接在最终的线性层上注册钩子
             is_target, module_type = self._is_merge_target(name + ".weight")
             if is_target:
-                # 对于 Attention，我们仍然在 self_attn 上注册，以便于计算 QKV
                 if module_type == 'attn':
                     if name.endswith("self_attn"):
-                        hooks.append(module.register_forward_hook(get_hook(name, 'attn')))
-                # 对于 MLP，我们在其子模块上注册钩子
+                         hooks.append(module.register_forward_hook(get_hook(name, 'attn')))
                 elif module_type == 'mlp':
-                    # 检查是否为 MLP 的直接子模块
-                    if name.endswith(('.gate_proj', '.up_proj', '.down_proj')):
-                        hooks.append(module.register_forward_hook(get_hook(name, 'mlp_proj')))
+                     if name.endswith("mlp"):
+                        hooks.append(module.register_forward_hook(get_hook(name, 'mlp')))
 
         print(f"在 {model_name} 中注册了 {len(hooks)} 个钩子。")
 
@@ -379,27 +374,18 @@ class ASAMerger:
             delta_Y = Y_A - Y_C
             
             g_approx = None
-            # 修正：将 "mlp" 的判断条件扩展到其所有子投影
-            if module_type == "mlp":
-                if key.endswith(".weight"):
-                    g_approx = delta_Y.T @ X_A
-                elif key.endswith(".bias"):
-                    g_approx = delta_Y.sum(dim=0)
+            if key.endswith(".weight"):
+                g_approx = delta_Y.T @ X_A
+            elif key.endswith(".bias"):
+                g_approx = delta_Y.sum(dim=0)
         
             # --- Attention 参数梯度计算 ---
             elif module_type == "attn":
-                # 注意：这里的 module_name 应该是 self_attn 级别
-                attn_module_name = ".".join(module_name.split('.')[:-1])
-                
-                if attn_module_name not in activations_A or 'q' not in activations_A[attn_module_name]:
-                    print(f"警告: 无法为 {key} 找到 Attention 激活。")
-                    continue
-
-                X_A = activations_A[attn_module_name]['input'].to(self.device)
-                Q_A = activations_A[attn_module_name]['q'].to(self.device)
-                K_A = activations_A[attn_module_name]['k'].to(self.device)
-                V_A = activations_A[attn_module_name]['v'].to(self.device)
-                Y_A_attn = activations_A[attn_module_name]['output'].to(self.device)
+                X_A = activations_A[module_name]['input'].to(self.device)
+                Q_A = activations_A[module_name]['q'].to(self.device)
+                K_A = activations_A[module_name]['k'].to(self.device)
+                V_A = activations_A[module_name]['v'].to(self.device)
+                Y_A_attn = activations_A[module_name]['output'].to(self.device)
 
                 Q_C = activations_C[module_name]['q'].to(self.device)
                 K_C = activations_C[module_name]['k'].to(self.device)
