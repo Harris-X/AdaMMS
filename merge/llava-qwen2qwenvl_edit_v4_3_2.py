@@ -207,26 +207,51 @@ class ASAMerger:
 
         def get_hook(module_name, module_type):
             def hook_fn(module, input, output):
+                # 确保 input 不为空
+                if not input:
+                    return
+                
                 if module_type == 'mlp':
-                    if capture_inputs: captured_activations[module_name]['input'] = input[0].detach().cpu()
-                    if capture_outputs: captured_activations[module_name]['output'] = output[0].detach().cpu()
+                    if capture_inputs and len(input) > 0: 
+                        captured_activations[module_name]['input'] = input[0].detach().cpu()
+                    if capture_outputs: 
+                        if isinstance(output, tuple):
+                            if not output: return
+                            output_tensor = output[0]
+                        else:
+                            output_tensor = output
+                        
+                        if not isinstance(output_tensor, torch.Tensor): return
+                        captured_activations[module_name]['output'] = output_tensor.detach().cpu()
                 
                 elif module_type == 'attn':
                     # 对于 Attention 层，我们需要从其子模块 q_proj, k_proj, v_proj 捕获输出
-                    if capture_inputs: captured_activations[module_name]['input'] = input[0].detach().cpu()
-                    if capture_outputs: captured_activations[module_name]['output'] = output[0].detach().cpu()
+                    if capture_inputs and len(input) > 0: 
+                        captured_activations[module_name]['input'] = input[0].detach().cpu()
+                    if capture_outputs: 
+                        if isinstance(output, tuple):
+                            if not output: return
+                            output_tensor = output[0]
+                        else:
+                            output_tensor = output
+                        
+                        if not isinstance(output_tensor, torch.Tensor): return
+                        captured_activations[module_name]['output'] = output_tensor.detach().cpu()
 
-                    if capture_qkv:
+                    if capture_qkv and len(input) > 0:
                         # 假设 QKV 投影是模块的属性
-                        if hasattr(module, 'q_proj'):
-                            q = module.q_proj(input[0])
-                            captured_activations[module_name]['q'] = q.detach().cpu()
-                        if hasattr(module, 'k_proj'):
-                            k = module.k_proj(input[0])
-                            captured_activations[module_name]['k'] = k.detach().cpu()
-                        if hasattr(module, 'v_proj'):
-                            v = module.v_proj(input[0])
-                            captured_activations[module_name]['v'] = v.detach().cpu()
+                        try:
+                            if hasattr(module, 'q_proj'):
+                                q = module.q_proj(input[0])
+                                captured_activations[module_name]['q'] = q.detach().cpu()
+                            if hasattr(module, 'k_proj'):
+                                k = module.k_proj(input[0])
+                                captured_activations[module_name]['k'] = k.detach().cpu()
+                            if hasattr(module, 'v_proj'):
+                                v = module.v_proj(input[0])
+                                captured_activations[module_name]['v'] = v.detach().cpu()
+                        except Exception as e:
+                            print(f"提取 Q/K/V 时出错: {e}")
             return hook_fn
 
         for name, module in model_to_hook.named_modules():
@@ -244,32 +269,65 @@ class ASAMerger:
 
         print(f"在 {model_name} 中注册了 {len(hooks)} 个钩子。")
 
-        # 准备多模态探针数据集
-        try:
-            probe_dataset_raw = load_dataset("laion/laion400m", split="train", streaming=True).take(self.args.probe_samples)
-            probe_data = list(probe_dataset_raw)
-        except Exception as e:
-            print(f"加载 LAION 数据集失败: {e}. 将使用占位符数据。", file=sys.stderr)
-            probe_data = [{"TEXT": "a cat sitting on a couch", "URL": "http://images.cocodataset.org/val2017/000000039769.jpg"}] * self.args.probe_samples
-
+        # 确定是否为多模态模型
+        is_vision_model = "VL" in model_path or "llava" in model_path.lower()
+        
         all_activations = defaultdict(lambda: defaultdict(list))
         
         with torch.no_grad():
-            for item in tqdm(probe_data, desc=f"前向传播 {model_name}"):
-                text = item.get("TEXT", "")
-                image_url = item.get("URL", "")
-
+            if is_vision_model:
+                # 多模态模型使用图像+文本输入
                 try:
-                    image = Image.open(requests.get(image_url, stream=True).raw).convert("RGB")
-                    inputs = processor(text=[f"<|user|>\n<|image_1|>\n{text}<|endoftext|><|assistant|>"], images=[image], return_tensors="pt").to(self.device)
-                    model(**inputs)
+                    probe_dataset_raw = load_dataset("laion/laion400m", split="train", streaming=True).take(self.args.probe_samples)
+                    probe_data = list(probe_dataset_raw)
+                except Exception as e:
+                    print(f"加载 LAION 数据集失败: {e}. 将使用占位符数据。", file=sys.stderr)
+                    probe_data = [{"TEXT": "a cat sitting on a couch", "URL": "http://images.cocodataset.org/val2017/000000039769.jpg"}] * self.args.probe_samples
 
+                for item in tqdm(probe_data, desc=f"前向传播 {model_name}"):
+                    text = item.get("TEXT", "")
+                    image_url = item.get("URL", "")
+
+                    try:
+                        image = Image.open(requests.get(image_url, stream=True).raw).convert("RGB")
+                        inputs = processor(text=[f"<|user|>\n<|image_1|>\n{text}<|endoftext|><|assistant|>"], 
+                                           images=[image], return_tensors="pt").to(self.device)
+                        model(**inputs)
+
+                        for module_name, activations in captured_activations.items():
+                            for key, tensor in activations.items():
+                                all_activations[module_name][key].append(tensor.float())
+                    except Exception as e:
+                        continue
+            else:
+                # 纯文本模型使用文本输入 (参考 v4_1.py)
+                try:
+                    # 使用 wikitext 作为探针数据集
+                    probe_dataset_raw = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True).take(self.args.probe_samples)
+                    probe_texts = [item['text'] for item in probe_dataset_raw if item['text']]
+                except Exception as e:
+                    print(f"加载 wikitext 数据集失败: {e}")
+                    # 备用文本
+                    probe_texts = [
+                        "The quick brown fox jumps over the lazy dog.",
+                        "Machine learning models are trained on large datasets.",
+                        "Neural networks process information in a hierarchical manner."
+                    ] * (self.args.probe_samples // 3 + 1)
+                    probe_texts = probe_texts[:self.args.probe_samples]
+            
+                # 文本处理
+                tokenizer = processor  # 这里 processor 实际上是 tokenizer
+                probe_inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+                probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
+                probe_dataloader = DataLoader(probe_dataset, batch_size=8)  # 使用适当的批量大小
+
+                for batch in tqdm(probe_dataloader, desc=f"前向传播 {model_name}"):
+                    input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
+                    model(input_ids=input_ids, attention_mask=attention_mask)
+                    
                     for module_name, activations in captured_activations.items():
                         for key, tensor in activations.items():
                             all_activations[module_name][key].append(tensor.float())
-                except Exception as e:
-                    # print(f"处理样本失败: {text}, {image_url}. Error: {e}", file=sys.stderr)
-                    continue
 
         for h in hooks: h.remove()
 
@@ -310,34 +368,39 @@ class ASAMerger:
             is_target, module_type = self._is_merge_target(key)
             if not is_target:
                 continue
-
+            
             grad_path = os.path.join(self.grad_dir, f"{key.replace('/', '_')}.pt")
             if os.path.exists(grad_path) and not self.args.force_recompute:
                 continue
-            
-            # 从参数名找到对应的模块名
-            module_name = ".".join(key.split('.')[:-2]) # e.g., model.layers.0.self_attn
-            if module_type == 'mlp':
-                # mlp层的模块名是 model.layers.0.mlp
-                module_name = ".".join(key.split('.')[:-2])
-            elif module_type == 'attn':
-                # attn层的模块名是 model.layers.0.self_attn
-                 module_name = ".".join(key.split('.')[:-2])
 
-            # --- MLP 参数梯度计算 ---
-            if module_type == "mlp":
-                X_A = activations_A[module_name]['input'].to(self.device)
-                Y_A = activations_A[module_name]['output'].to(self.device)
-                Y_C = activations_C[module_name]['output'].to(self.device)
-                
-                delta_Y = Y_A - Y_C
-                
-                g_approx = None
-                if key.endswith(".weight"):
-                    g_approx = delta_Y.T @ X_A
-                elif key.endswith(".bias"):
-                    g_approx = delta_Y.sum(dim=0)
+            # 修正：从绝对路径key中提取出相对于语言模型部分的模块名
+            layers_idx = key.rfind("layers.")
+            if layers_idx == -1: continue
+            relative_key = key[layers_idx:]
+            module_name = ".".join(relative_key.split('.')[:-1])
             
+            # 调试信息
+            if module_name not in activations_A:
+                print(f"警告: 键 '{module_name}' 不在激活缓存中。可用的键: {list(activations_A.keys())[:5]}...")
+                continue
+                
+            if 'input' not in activations_A[module_name]:
+                print(f"警告: 键 '{module_name}' 存在，但没有'input'。可用的子键: {list(activations_A[module_name].keys())}")
+                continue
+
+            # 加载激活到设备
+            X_A = activations_A[module_name]['input'].to(self.device)
+            Y_A = activations_A[module_name]['output'].to(self.device)
+            Y_C = activations_C[module_name]['output'].to(self.device)
+            
+            delta_Y = Y_A - Y_C
+            
+            g_approx = None
+            if key.endswith(".weight"):
+                g_approx = delta_Y.T @ X_A
+            elif key.endswith(".bias"):
+                g_approx = delta_Y.sum(dim=0)
+        
             # --- Attention 参数梯度计算 ---
             elif module_type == "attn":
                 X_A = activations_A[module_name]['input'].to(self.device)
@@ -551,7 +614,7 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="default", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=6, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
