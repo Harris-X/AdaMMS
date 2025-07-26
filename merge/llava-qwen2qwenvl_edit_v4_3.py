@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 # 导入指定的模型和分词器类
 from transformers import AutoTokenizer, AutoModelForVision2Seq, AutoModelForCausalLM
-
+from torch.utils.data import DataLoader, TensorDataset
 # 尝试导入 Hugging Face datasets 库
 try:
     from datasets import load_dataset
@@ -167,7 +167,7 @@ class ASAMerger:
         tokenizer = AutoTokenizer.from_pretrained(model_path)
 
         # 智能定位到包含 "layers" 的语言模型部分
-        model_to_hook = getattr(model, 'model', getattr(model, 'language_model', model))
+        model_to_hook = getattr(model, 'language_model', getattr(model, 'model', model))
         if hasattr(model_to_hook, 'model'): # 适配更深层的嵌套
              model_to_hook = model_to_hook.model
              

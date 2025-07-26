@@ -547,9 +547,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASAM v2.0: 统一、自适应与结构感知的模型合并框架。")
     
     # 基本配置
-    parser.add_argument('--base_model_path', type=str, default="/path/to/your/base_model_A", help="基础模型A的路径。")
-    parser.add_argument('--donor_model_path', type=str, default="/path/to/your/donor_model_B", help="贡献模型B的路径。")
-    parser.add_argument('--original_model_path', type=str, default="/path/to/your/ancestor_model_C", help="原始共同祖先模型C的路径。")
+    parser.add_argument('--base_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
+    parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
+    parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="default", help="为本次合并配置命名。")
     parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
 
@@ -558,7 +558,7 @@ if __name__ == "__main__":
 
     # 合并超参数
     parser.add_argument('--lambda_s', type=float, default=1.4, help="协同分量的基础系数。")
-    parser.add_argument('--lambda_c', type=float, default=0.3, help="冲突分量的基础系数（在公式中为减去）。")
+    parser.add_argument('--lambda_c', type=float, default=0.7, help="冲突分量的基础系数（在公式中为减去）。")
     parser.add_argument('--lambda_o', type=float, default=1.0, help="正交分量的系数。")
     parser.add_argument('--alpha', type=float, default=0.5, help="自适应赋权机制的敏感度系数。")
     
