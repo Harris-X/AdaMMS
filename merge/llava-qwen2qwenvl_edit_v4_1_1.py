@@ -457,12 +457,12 @@ if __name__ == "__main__":
 
     # 探针数据集配置
     parser.add_argument('--probe_dataset', type=str, default="wikitext", help="用于探测激活的数据集 ('wikipedia' 或 'c4')。")
-    parser.add_argument('--probe_samples', type=int, default=1000, help="用于探测的样本数量。")
+    parser.add_argument('--probe_samples', type=int, default=2000, help="用于探测的样本数量。")
     parser.add_argument('--probe_batch_size', type=int, default=1, help="探测时的批处理大小，如果显存不足请减小。")
 
     # 合并超参数
-    parser.add_argument('--lambda_s', type=float, default=1.2, help="协同分量的系数。")
-    parser.add_argument('--lambda_c', type=float, default=0.8, help="冲突分量的系数。")
+    parser.add_argument('--lambda_s', type=float, default=1.4, help="协同分量的系数。")
+    parser.add_argument('--lambda_c', type=float, default=0.7, help="冲突分量的系数。")
     parser.add_argument('--lambda_o', type=float, default=1.0, help="正交分量的系数。")
     
     # 功能性参数
