@@ -502,11 +502,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="使用ASAM v2.0框架进行低显存模型合并。")
     
     # 基本配置
-    parser.add_argument('--base_model_path', type=str, required=True, help="基础模型A的路径。")
-    parser.add_argument('--donor_model_path', type=str, required=True, help="贡献模型B的路径。")
-    parser.add_argument('--original_model_path', type=str, required=True, help="原始共同祖先模型C的路径。")
+    parser.add_argument('--base_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
+    parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
+    parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--config_name', type=str, default="default", help="为本次合并配置命名，用于创建输出目录。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=3, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
@@ -522,7 +522,7 @@ if __name__ == "__main__":
     parser.add_argument('--alpha', type=float, default=0.5, help="自适应赋权机制的敏感度系数。")
     
     # 功能性参数
-    parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或梯度。")
+    parser.add_argument('--force_recompute', action='store_true', default=True ,help="强制重新计算缓存的激活或梯度。")
     parser.add_argument('--run_validation', action='store_true', help="在合并后执行阶段四的验证。")
 
     args = parser.parse_args()

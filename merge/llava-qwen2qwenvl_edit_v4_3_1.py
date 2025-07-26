@@ -562,19 +562,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASAM v2.0: 统一、自适应与结构感知的低显存模型合并框架。")
     
     # 基本配置
-    parser.add_argument('--base_model_path', type=str, required=True, help="基础模型A的路径。")
-    parser.add_argument('--donor_model_path', type=str, required=True, help="贡献模型B的路径。")
-    parser.add_argument('--original_model_path', type=str, required=True, help="原始共同祖先模型C的路径。")
+    parser.add_argument('--base_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
+    parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
+    parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="default", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=3, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
-    parser.add_argument('--probe_batch_size', type=int, default=2, help="探测时的批处理大小，如果显存不足请减小。")
+    parser.add_argument('--probe_batch_size', type=int, default=1, help="探测时的批处理大小，如果显存不足请减小。")
 
     # 自适应合并超参数
     parser.add_argument('--lambda_s', type=float, default=1.4, help="协同分量的基础系数。")
-    parser.add_argument('--lambda_c', type=float, default=0.3, help="冲突分量的基础系数。")
+    parser.add_argument('--lambda_c', type=float, default=0.7, help="冲突分量的基础系数。")
     parser.add_argument('--lambda_o', type=float, default=1.0, help="正交分量的系数。")
     parser.add_argument('--alpha', type=float, default=0.5, help="自适应赋权机制的敏感度系数。")
     
