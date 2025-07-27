@@ -301,55 +301,31 @@ class ASAMerger:
                 ] * (self.args.probe_samples // 3 + 1)
                 probe_texts = probe_texts[:self.args.probe_samples]
     
-            # 使用正确的模板格式处理文本输入
+            # 修正：恢复为批处理和 DataLoader 以确保序列长度一致
+            # 统一处理所有文本，应用模板并进行分词
+            messages_batch = [[{"role": "user", "content": text}] for text in probe_texts]
+            
+            # 注意：这里我们不直接用 apply_chat_template 进行分词，因为它一次只处理一个对话。
+            # 我们先手动构建文本，然后批量分词。
+            # 对于 Qwen2，模板通常由分词器在内部处理，但为了确保一致性，我们先格式化。
+            # 实际测试表明，直接将文本列表传给分词器并设置padding是更稳健的方式。
+            
+            # 为了简单和稳健，我们不使用 apply_chat_template 的循环，而是直接批量分词
             if is_vision_model:
-                # 对多模态模型，创建符合其预期的消息格式但只包含文本
-                batch_size = 4
-                for i in range(0, len(probe_texts), batch_size):
-                    batch_texts = probe_texts[i:i+batch_size]
-                    messages_batch = [[{"role": "user", "content": text}] for text in batch_texts]
-                    
-                    for j, messages in enumerate(messages_batch):
-                        # 为每个输入应用聊天模板
-                        inputs = tokenizer.apply_chat_template(
-                            messages,
-                            add_generation_prompt=True,
-                            tokenize=True,
-                            return_dict=True,
-                            return_tensors="pt"
-                        )
-                        input_ids = inputs["input_ids"].to(self.device)
-                        attention_mask = inputs.get("attention_mask", None)
-                        if attention_mask is not None:
-                            attention_mask = attention_mask.to(self.device)
-                            model_output = model(input_ids=input_ids, attention_mask=attention_mask)
-                        else:
-                            model_output = model(input_ids=input_ids)
+                # 对于多模态模型，我们仍然只提供文本
+                formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in probe_texts]
+                probe_inputs = tokenizer(formatted_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
             else:
                 # 对于纯语言模型
-                batch_size = 4
-                for i in range(0, len(probe_texts), batch_size):
-                    batch_texts = probe_texts[i:i+batch_size]
-                    messages_batch = [[{"role": "user", "content": text}] for text in batch_texts]
-                    
-                    for j, messages in enumerate(messages_batch):
-                        # 为每个输入应用聊天模板
-                        inputs = tokenizer.apply_chat_template(
-                            messages,
-                            add_generation_prompt=True,
-                            tokenize=True,
-                            return_dict=True,
-                            return_tensors="pt"
-                        )
-                        input_ids = inputs["input_ids"].to(self.device)
-                        attention_mask = inputs.get("attention_mask", None)
-                        if attention_mask is not None:
-                            attention_mask = attention_mask.to(self.device)
-                            model_output = model(input_ids=input_ids, attention_mask=attention_mask)
-                        else:
-                            model_output = model(input_ids=input_ids)
-                
-            # 删除原来的probe_dataset和probe_dataloader相关代码，因为我们现在直接处理每个输入
+                formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in probe_texts]
+                probe_inputs = tokenizer(formatted_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+
+            probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
+            probe_dataloader = DataLoader(probe_dataset, batch_size=4) # 使用较小的批次大小
+
+            for batch in tqdm(probe_dataloader, desc=f"前向传播 {model_name}"):
+                input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
+                model(input_ids=input_ids, attention_mask=attention_mask)
 
         for h in hooks: h.remove()
 
