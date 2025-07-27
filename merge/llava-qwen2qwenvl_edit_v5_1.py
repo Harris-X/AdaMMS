@@ -10,7 +10,7 @@ import shutil
 from collections import defaultdict
 
 # 导入指定的模型和分词器类
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForVision2Seq, AutoTokenizer, AutoModelForCausalLM
 
 # 尝试导入 Hugging Face datasets 库
 try:
@@ -134,6 +134,30 @@ class ASAMerger:
             return model.model
         return model
 
+    def _get_model_and_tokenizer(self, model_path):
+        """
+        根据模型类型智能加载模型和分词器。
+        参考 v4.3.2 的实现。
+        """
+        is_vision_model = "VL" in model_path or "llava" in model_path.lower()
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+        if is_vision_model:
+            try:
+                model = AutoModelForVision2Seq.from_pretrained(
+                    model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+                )
+                return model, tokenizer
+            except Exception as e:
+                print(f"警告: 尝试作为多模态模型加载 {model_path} 失败: {e}。将回退到纯语言模型加载。")
+
+        # 对于纯语言模型或多模态模型加载失败的情况
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+        )
+        return model, tokenizer
+
     def _cache_activations_for_model(self, model_name, model_path, cache_path, capture_inputs):
         """阶段一的核心函数：为单个模型执行前向传播并缓存激活。"""
         if os.path.exists(cache_path) and not self.args.force_recompute:
@@ -141,8 +165,10 @@ class ASAMerger:
             return
 
         print(f"正在为 {model_name} ({os.path.basename(model_path)}) 缓存激活...")
-        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True).to(self.device)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        # 修正：使用新的辅助函数来加载模型和分词器
+        model, tokenizer = self._get_model_and_tokenizer(model_path)
+        model.to(self.device)
+        
         model_to_hook = self._find_target_submodule(model)
 
         captured_activations = defaultdict(lambda: defaultdict(list))
@@ -437,11 +463,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASAM v3.0: 对称与组件感知的模型合并框架。")
     
     # 基本配置
-    parser.add_argument('--base_model_path', type=str, required=True, help="基础模型A的路径 (e.g., qwen2-vl-7b-instruct)。")
-    parser.add_argument('--donor_model_path', type=str, required=True, help="贡献模型B的路径 (e.g., llava-onevision-qwen2-7b-si-hf)。")
-    parser.add_argument('--original_model_path', type=str, required=True, help="原始共同祖先模型C的路径 (e.g., qwen2-7b-instruct)。")
+    parser.add_argument('--base_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径 (e.g., qwen2-vl-7b-instruct)。")
+    parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径 (e.g., llava-onevision-qwen2-7b-si-hf)。")
+    parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径 (e.g., qwen2-7b-instruct)。")
     parser.add_argument('--mode', type=str, default="symmetric_merge", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=6, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
