@@ -45,14 +45,22 @@ def load_weights(base_path, index_filename="model.safetensors.index.json"):
         weights.update(safetensors.torch.load_file(os.path.join(base_path, file)))
     return weights
 
-def normalize_keys(weights: dict, prefixes_to_remove=["language_model.model."]) -> dict:
-    """通用key标准化函数。"""
+def normalize_keys(weights: dict, prefixes_to_remove=["language_model.model.", "model."]) -> dict:
+    """
+    通用key标准化函数。
+    修正：确保能处理多种前缀，并按最长前缀优先的顺序移除。
+    """
+    # 按长度降序排序，以优先匹配更具体的前缀
+    # 例如，优先匹配 "language_model.model." 而不是 "model."
+    sorted_prefixes = sorted(prefixes_to_remove, key=len, reverse=True)
+    
     normalized_weights = {}
     for key, value in weights.items():
         processed_key = key
-        for prefix in prefixes_to_remove:
+        for prefix in sorted_prefixes:
             if processed_key.startswith(prefix):
                 processed_key = processed_key[len(prefix):]
+                break # 找到第一个匹配项后就停止
         normalized_weights[processed_key] = value
     return normalized_weights
 
@@ -290,7 +298,9 @@ class ASAMerger:
             grad_path = os.path.join(grad_dir, f"{key.replace('/', '_')}.pt")
             if os.path.exists(grad_path) and not self.args.force_recompute: continue
 
-            norm_key = normalize_keys({key:0}, prefixes_to_remove=["language_model.model."]).popitem()[0]
+            # 修正：提供所有可能的前缀以进行正确的标准化
+            all_prefixes = ["language_model.model.", "language_model.", "model."]
+            norm_key = normalize_keys({key:0}, prefixes_to_remove=all_prefixes).popitem()[0]
             
             # 定位模块名
             module_name = ".".join(norm_key.split('.')[:-1])
