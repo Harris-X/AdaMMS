@@ -11,6 +11,7 @@ from collections import defaultdict
 
 # 导入指定的模型和分词器类
 from transformers import AutoModelForVision2Seq, AutoTokenizer, AutoModelForCausalLM
+from torch.utils.data import DataLoader, TensorDataset
 
 # 尝试导入 Hugging Face datasets 库
 try:
@@ -98,8 +99,17 @@ class ASAMerger:
         self.merge_scope = {}
 
     def _is_llm_param(self, param_name: str) -> bool:
-        """判断一个参数是否属于语言模型部分。"""
-        return "language_model.model." in param_name
+        """
+        判断一个参数是否属于语言模型部分。
+        修正：通过检查 'layers' 关键字并排除视觉关键字来更灵活地识别LLM参数。
+        """
+        # 视觉模型的参数通常包含 'visual' 或 'vision_tower'
+        if 'visual' in param_name or 'vision_tower' in param_name:
+            return False
+        # 语言模型的 Transformer 层通常包含 'layers'
+        if 'layers' in param_name:
+            return True
+        return False
 
     def _should_merge(self, param_name: str) -> bool:
         """判断一个参数是否在合并范围内。"""
