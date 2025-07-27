@@ -10,7 +10,7 @@ import shutil
 from collections import defaultdict
 
 # 导入指定的模型和分词器类
-from transformers import AutoModelForVision2Seq, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForVision2Seq, AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from torch.utils.data import DataLoader, TensorDataset
 
 # 尝试导入 Hugging Face datasets 库
@@ -280,9 +280,11 @@ class ASAMerger:
         # 假设所有模型的语言部分key是一致的
         base_weights = load_weights(self.args.base_model_path)
         
-        config = AutoModelForCausalLM.from_pretrained(self.args.base_model_path).config
-        num_heads = config.num_attention_heads
-        head_dim = config.hidden_size // num_heads
+        # 修正：使用 AutoConfig 智能加载配置，并处理嵌套结构以兼容多模态模型
+        config = AutoConfig.from_pretrained(self.args.base_model_path, trust_remote_code=True)
+        lang_config = getattr(config, "language_config", config)
+        num_heads = lang_config.num_attention_heads
+        head_dim = lang_config.hidden_size // num_heads
 
         for key in tqdm(self.merge_scope['language_model'], desc=f"计算 {model_label} 的梯度"):
             grad_path = os.path.join(grad_dir, f"{key.replace('/', '_')}.pt")
