@@ -264,15 +264,24 @@ class ASAMerger:
                             print(f"提取 Q/K/V 时出错: {e}")
             return hook_fn
 
+        # 修正：将钩子注册到具体的子模块上，而不是父模块
         for name, module in model_to_hook.named_modules():
+            # 使用一个假设的权重名称来判断模块是否为我们的目标
             is_target, module_type = self._is_merge_target(name + ".weight")
+            
             if is_target:
-                if module_type == 'attn':
-                    if name.endswith("self_attn"):
-                         hooks.append(module.register_forward_hook(get_hook(name, 'attn')))
-                elif module_type == 'mlp':
-                     if name.endswith("mlp"):
-                        hooks.append(module.register_forward_hook(get_hook(name, 'mlp')))
+                # 对于 Attention，在 self_attn 级别注册钩子以捕获 QKV
+                if module_type == 'attn' and name.endswith('.self_attn'):
+                    hooks.append(module.register_forward_hook(get_hook(name, 'attn')))
+                
+                # 对于 MLP 的子模块，直接在它们上面注册钩子
+                elif module_type == 'mlp' and any(name.endswith(p) for p in ['.gate_proj', '.up_proj', '.down_proj']):
+                    hooks.append(module.register_forward_hook(get_hook(name, 'mlp')))
+
+                # 对于 Attention 的子模块，也直接在它们上面注册钩子
+                elif module_type == 'attn' and any(name.endswith(p) for p in ['.q_proj', '.k_proj', '.v_proj', '.o_proj']):
+                    hooks.append(module.register_forward_hook(get_hook(name, 'attn')))
+
 
         print(f"在 {model_name} 中注册了 {len(hooks)} 个钩子。")
 
@@ -299,7 +308,7 @@ class ASAMerger:
                 probe_inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
             
             probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
-            probe_dataloader = DataLoader(probe_dataset, batch_size=8)
+            probe_dataloader = DataLoader(probe_dataset, batch_size=4)
 
             for batch in tqdm(probe_dataloader, desc=f"前向传播 {model_name}"):
                 input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
@@ -495,8 +504,8 @@ class ASAMerger:
                                 ratio = norms["delta_S_norm"] / norms["delta_Y_attn_norm"]
                                 alpha = self.args.alpha
                                 # 动态调整 λs 和 λc
-                                lambda_s = self.args.lambda_s * max(0.5, 1 - alpha * ratio)
-                                lambda_c = self.args.lambda_c * min(1.5, 0.1 + alpha * ratio)
+                                lambda_s = self.args.lambda_s * max(1.0, 1 - alpha * ratio)
+                                lambda_c = self.args.lambda_c * min(1.0, 0.1 + alpha * ratio)
 
                     w_star = W_A + (lambda_s * tau_B_synergy) - \
                                  (lambda_c * tau_B_conflict) + \
@@ -598,10 +607,10 @@ if __name__ == "__main__":
     parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
 
     # 合并超参数
-    parser.add_argument('--lambda_s', type=float, default=1.4, help="协同分量的基础系数。")
-    parser.add_argument('--lambda_c', type=float, default=0.7, help="冲突分量的基础系数（在公式中为减去）。")
+    parser.add_argument('--lambda_s', type=float, default=1.0, help="协同分量的基础系数。")
+    parser.add_argument('--lambda_c', type=float, default=1.0, help="冲突分量的基础系数（在公式中为减去）。")
     parser.add_argument('--lambda_o', type=float, default=1.0, help="正交分量的系数。")
-    parser.add_argument('--alpha', type=float, default=0.5, help="自适应赋权机制的敏感度系数。")
+    parser.add_argument('--alpha', type=float, default=0.8, help="自适应赋权机制的敏感度系数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或梯度。")
