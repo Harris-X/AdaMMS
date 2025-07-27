@@ -51,7 +51,7 @@ def normalize_keys(weights: dict, prefixes_to_remove=["language_model.model.", "
     修正：确保能处理多种前缀，并按最长前缀优先的顺序移除。
     """
     # 按长度降序排序，以优先匹配更具体的前缀
-    # 例如，优先匹配 "model.language_model." 而不是 "model."
+    # 例如，优先匹配 "language_model.model." 而不是 "model."
     sorted_prefixes = sorted(prefixes_to_remove, key=len, reverse=True)
     
     normalized_weights = {}
@@ -290,7 +290,7 @@ class ASAMerger:
         
         # 修正：使用 AutoConfig 智能加载配置，并处理嵌套结构以兼容多模态模型
         config = AutoConfig.from_pretrained(self.args.base_model_path, trust_remote_code=True)
-        lang_config = getattr(config, "text_config", config)
+        lang_config = getattr(config, "language_config", config)
         num_heads = lang_config.num_attention_heads
         head_dim = lang_config.hidden_size // num_heads
 
@@ -299,7 +299,7 @@ class ASAMerger:
             if os.path.exists(grad_path) and not self.args.force_recompute: continue
 
             # 修正：提供所有可能的前缀以进行正确的标准化
-            all_prefixes = ["model.language_model.", "language_model.", "model."]
+            all_prefixes = ["language_model.model.", "language_model.", "model."]
             norm_key = normalize_keys({key:0}, prefixes_to_remove=all_prefixes).popitem()[0]
             
             # 定位模块名
@@ -421,8 +421,8 @@ class ASAMerger:
             grad_path = os.path.join(consensus_grad_dir, f"{key.replace('/', '_')}.pt")
             
             # 标准化key以匹配非多模态模型C
-            norm_key_A = normalize_keys({key:0}, prefixes_to_remove=["model.language_model."]).popitem()[0]
-            norm_key_B = normalize_keys({key:0}, prefixes_to_remove=["model.language_model."]).popitem()[0]
+            norm_key_A = normalize_keys({key:0}, prefixes_to_remove=["language_model.model."]).popitem()[0]
+            norm_key_B = normalize_keys({key:0}, prefixes_to_remove=["language_model."]).popitem()[0]
 
             W_A = W_A_all[key].float().to(self.device)
             # 在llava-onevision-qwen2-7b-si-hf中，语言模型没有前缀
