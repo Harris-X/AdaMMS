@@ -175,7 +175,6 @@ class ASAMerger:
             return
 
         print(f"正在为 {model_name} ({os.path.basename(model_path)}) 缓存激活...")
-        # 修正：使用新的辅助函数来加载模型和分词器
         model, tokenizer = self._get_model_and_tokenizer(model_path)
         model.to(self.device)
         
@@ -184,18 +183,29 @@ class ASAMerger:
         captured_activations = defaultdict(lambda: defaultdict(list))
         hooks = []
 
-        def get_hook(module_name):
-            def hook_fn(module, input_tensors, output_tensors):
-                input_tensor = input_tensors[0]
-                output_tensor = output_tensors[0] if isinstance(output_tensors, tuple) else output_tensors
+        # 修正1：修改钩子函数签名以接收 kwargs
+        def get_hook(module_name, module_type):
+            def hook_fn(module, args, kwargs, output):
+                # 修正2：健壮地获取输入张量
+                input_tensor = None
+                if args:
+                    input_tensor = args[0]
+                elif "hidden_states" in kwargs:
+                    input_tensor = kwargs["hidden_states"]
+                
+                if input_tensor is None:
+                    # print(f"警告: 无法在模块 {module_name} 中找到输入张量。")
+                    return
+
+                output_tensor = output[0] if isinstance(output, tuple) else output
 
                 if capture_inputs:
                     captured_activations[module_name]['input'].append(input_tensor.detach().cpu())
                 
                 captured_activations[module_name]['output'].append(output_tensor.detach().cpu())
                 
-                # 为Attention层捕获Q,K,V
-                if ".self_attn" in module_name:
+                # 修正3：仅在 self_attn 级别捕获 QKV
+                if module_type == "attn_block":
                     with torch.no_grad():
                         q = module.q_proj(input_tensor)
                         k = module.k_proj(input_tensor)
@@ -204,25 +214,34 @@ class ASAMerger:
                         captured_activations[module_name]['k'].append(k.detach().cpu())
                         captured_activations[module_name]['v'].append(v.detach().cpu())
 
+            # PyTorch 2.1+ 推荐使用新的签名
             return hook_fn
 
-        # 注册钩子到叶子模块
+        # 修正4：调整钩子注册逻辑
         for name, module in model_to_hook.named_modules():
-            key_for_check = "language_model.model." + name + ".weight" # 构造一个虚拟的完整键名
+            # 构造一个虚拟的完整键名来检查是否需要合并
+            # 我们检查 .weight 后缀，因为 _should_merge 是基于参数名设计的
+            key_for_check = "model." + name + ".weight"
+            
             if self._should_merge(key_for_check):
-                # 仅在 self_attn 级别注册一个钩子来捕获所有内容
+                # 在 self_attn 级别注册一个钩子来捕获 QKV 和输入输出
                 if name.endswith(".self_attn"):
-                    hooks.append(module.register_forward_hook(get_hook(name)))
-                # 对于MLP的子模块
+                    # 使用新的钩子签名
+                    hooks.append(module.register_forward_hook(get_hook(name, "attn_block"), with_kwargs=True))
+                # 对于MLP的子模块，也注册钩子
                 elif any(name.endswith(p) for p in [".gate_proj", ".up_proj", ".down_proj"]):
-                    hooks.append(module.register_forward_hook(get_hook(name)))
+                    hooks.append(module.register_forward_hook(get_hook(name, "mlp"), with_kwargs=True))
 
         print(f"在 {model_name} 中注册了 {len(hooks)} 个钩子。")
 
         # 准备探针数据集
         probe_dataset_raw = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True).take(self.args.probe_samples)
         probe_texts = [item['text'] for item in probe_dataset_raw if item['text'].strip()]
-        inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        
+        # 使用 apply_chat_template 来格式化文本
+        formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in probe_texts]
+        inputs = tokenizer(formatted_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        
         dataloader = DataLoader(TensorDataset(inputs['input_ids'], inputs['attention_mask']), batch_size=self.args.probe_batch_size)
 
         model.eval()
