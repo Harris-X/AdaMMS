@@ -225,20 +225,29 @@ class ASAMerger:
             # PyTorch 2.1+ 推荐使用新的签名
             return hook_fn
 
-        # 修正4：调整钩子注册逻辑
+        # 修正：严格按照 v4.7.md 实现钩子注册逻辑
+        registered_hooks = set() # 防止对同一模块重复挂钩
         for name, module in model_to_hook.named_modules():
+            # 检查模块的参数是否需要合并，避免重复挂钩
+            if name in registered_hooks:
+                continue
+
             # 构造一个虚拟的完整键名来检查是否需要合并
             # 我们检查 .weight 后缀，因为 _should_merge 是基于参数名设计的
-            key_for_check = "model." + name + ".weight"
-            
+            key_for_check = "model." + name + ".weight" # 假设所有模块都有weight
+
             if self._should_merge(key_for_check):
-                # 在 self_attn 级别注册一个钩子来捕获 QKV 和输入输出
-                if name.endswith(".self_attn"):
-                    # 使用新的钩子签名
+                # 挂钩到 Attention 和 MLP 的叶子模块
+                if any(name.endswith(p) for p in [".q_proj", ".k_proj", ".v_proj", ".o_proj", ".gate_proj", ".up_proj", ".down_proj"]):
+                    hooks.append(module.register_forward_hook(get_hook(name, "leaf_module"), with_kwargs=True))
+                    registered_hooks.add(name)
+
+            # 额外：为 self_attn 整体挂钩，以捕获 QKV 和最终输出
+            if name.endswith(".self_attn"):
+                if name not in registered_hooks:
                     hooks.append(module.register_forward_hook(get_hook(name, "attn_block"), with_kwargs=True))
-                # 对于MLP的子模块，也注册钩子
-                elif any(name.endswith(p) for p in [".gate_proj", ".up_proj", ".down_proj"]):
-                    hooks.append(module.register_forward_hook(get_hook(name, "mlp"), with_kwargs=True))
+                    registered_hooks.add(name)
+
 
         print(f"在 {model_name} 中注册了 {len(hooks)} 个钩子。")
 
