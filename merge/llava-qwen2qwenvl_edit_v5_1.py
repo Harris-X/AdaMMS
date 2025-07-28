@@ -212,17 +212,18 @@ class ASAMerger:
                 
                 captured_activations[module_name]['output'].append(output_tensor.detach().cpu())
                 
-                # 修正3：不再重新计算QKV，而是准备从模型输出中捕获
+                # 修正3：对于 attn_block，直接计算并缓存 Q、K、V
                 if module_type == "attn_block":
-                    # 我们期望在模型输出中找到 'attentions'
-                    if isinstance(output, tuple) and len(output) > 2:
-                        # 'attentions' 通常是第三个或更后的元素，是一个元组
-                        # 我们需要找到对应当前层的 attention
-                        layer_idx = int(module_name.split('.')[1]) # 从 'layers.X.self_attn' 中提取 X
-                        if len(output.attentions) > layer_idx:
-                            # Qwen2的attention矩阵形状是 (batch, n_head, seq, seq)
-                            # 我们需要它来进行梯度计算
-                            captured_activations[module_name]['attention_matrix'].append(output.attentions[layer_idx].detach().cpu())
+                    try:
+                        with torch.no_grad():
+                            q = module.q_proj(input_tensor)
+                            k = module.k_proj(input_tensor)
+                            v = module.v_proj(input_tensor)
+                            captured_activations[module_name]['q'].append(q.detach().cpu())
+                            captured_activations[module_name]['k'].append(k.detach().cpu())
+                            captured_activations[module_name]['v'].append(v.detach().cpu())
+                    except Exception as e:
+                        print(f"警告: 提取 Q/K/V 时出错在模块 {module_name}: {e}")
 
             # PyTorch 2.1+ 推荐使用新的签名
             return hook_fn
@@ -267,8 +268,8 @@ class ASAMerger:
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"前向传播 {model_name}"):
                 input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
-                # 修正：增加 output_attentions=True 来获取注意力矩阵
-                model(input_ids=input_ids, attention_mask=attention_mask, output_attentions=True)
+                # 移除 output_attentions=True，直接进行前向传播
+                model(input_ids=input_ids, attention_mask=attention_mask)
 
         for h in hooks: h.remove()
         
@@ -331,43 +332,103 @@ class ASAMerger:
                 
                 # --- Attention 梯度计算 ---
                 elif "self_attn" in norm_key:
-                    X_attn = activations_model[attn_block_name]['input'].to(self.device)
-                    # 修正：直接加载缓存的注意力矩阵，不再需要Q,K
-                    A_model = activations_model[attn_block_name]['attention_matrix'].to(self.device)
-                    A_C = activations_C[attn_block_name]['attention_matrix'].to(self.device)
+                    # 修正：为GQA正确处理多头注意力
+                    num_kv_heads = lang_config.num_key_value_heads
+                    num_q_heads = lang_config.num_attention_heads
+                    num_repetition_groups = num_q_heads // num_kv_heads
 
-                    V_model = activations_model[attn_block_name]['v'].to(self.device)
+                    X_attn = activations_model[attn_block_name]['input'].to(self.device)
                     Y_attn_model = activations_model[attn_block_name]['output'].to(self.device)
                     Y_attn_C = activations_C[attn_block_name]['output'].to(self.device)
 
-                    # 修正：delta_S 现在是注意力矩阵的差值
-                    delta_S = A_model - A_C 
+                    # --- Reshape and Repeat K/V for GQA ---
+                    def reshape_and_repeat(tensor, num_heads):
+                        batch_size, seq_len, _ = tensor.shape
+                        tensor = tensor.view(batch_size, seq_len, num_heads, head_dim)
+                        if num_heads == num_kv_heads: # Only repeat K and V
+                            tensor = tensor.unsqueeze(3).expand(batch_size, seq_len, num_heads, num_repetition_groups, head_dim)
+                            tensor = tensor.reshape(batch_size, seq_len, num_q_heads, head_dim)
+                        return tensor.transpose(1, 2) # (batch, num_heads, seq_len, head_dim)
+
+                    # 加载并处理模型A的激活
+                    Q_model_raw = activations_model[attn_block_name]['q'].to(self.device)
+                    K_model_raw = activations_model[attn_block_name]['k'].to(self.device)
+                    V_model_raw = activations_model[attn_block_name]['v'].to(self.device)
+                    
+                    Q_model = reshape_and_repeat(Q_model_raw.unsqueeze(0), num_q_heads)
+                    K_model = reshape_and_repeat(K_model_raw.unsqueeze(0), num_kv_heads)
+                    V_model = reshape_and_repeat(V_model_raw.unsqueeze(0), num_kv_heads)
+
+                    # 加载并处理模型C的激活
+                    Q_C_raw = activations_C[attn_block_name]['q'].to(self.device)
+                    K_C_raw = activations_C[attn_block_name]['k'].to(self.device)
+                    V_C_raw = activations_C[attn_block_name]['v'].to(self.device)
+
+                    Q_C = reshape_and_repeat(Q_C_raw.unsqueeze(0), num_q_heads)
+                    K_C = reshape_and_repeat(K_C_raw.unsqueeze(0), num_kv_heads)
+                    V_C = reshape_and_repeat(V_C_raw.unsqueeze(0), num_kv_heads)
+
+                    # 计算注意力分数的差值
+                    S_model = Q_model @ K_model.transpose(-2, -1) / (head_dim ** 0.5)
+                    S_C = Q_C @ K_C.transpose(-2, -1) / (head_dim ** 0.5)
+                    delta_S = (S_model - S_C).squeeze(0) # (num_q_heads, seq_len, seq_len)
                     delta_Y_attn = Y_attn_model - Y_attn_C
                     
-                    # 重新加载Q, K用于计算梯度
-                    Q_model = activations_model[attn_block_name]['q'].to(self.device)
-                    K_model = activations_model[attn_block_name]['k'].to(self.device)
+                    # 计算注意力权重用于V投影梯度
+                    A_model = torch.softmax(S_model.squeeze(0), dim=-1)
 
+                    # --- 梯度计算（保持不变，但输入维度已正确）---
                     if norm_key.endswith("q_proj.weight"):
-                        g_space = delta_S @ K_model
+                        g_space = delta_S @ K_model.squeeze(0)
+                        g_space = g_space.transpose(0, 1).reshape(Q_model_raw.shape)
                         g_approx = g_space.T @ X_attn
                     elif norm_key.endswith("q_proj.bias"):
-                        g_approx = delta_S @ K_model
+                        g_space = delta_S @ K_model.squeeze(0)
+                        g_approx = g_space.transpose(0, 1).reshape(Q_model_raw.shape).sum(dim=0)
                     elif norm_key.endswith("k_proj.weight"):
-                        g_space = delta_S.T @ Q_model
-                        g_approx = g_space.T @ X_attn
+                        # 修正：对于K，需要从num_q_heads汇总到num_kv_heads
+                        g_space = delta_S.transpose(-2, -1) @ Q_model.squeeze(0)
+                        # 将g_space从(seq_len, num_q_heads, head_dim)重塑，然后按num_repetition_groups汇总
+                        g_space = g_space.transpose(0, 1).reshape(K_model_raw.shape[0], num_q_heads, head_dim)
+                        # 重塑为(seq_len, num_kv_heads, num_repetition_groups, head_dim)，然后在repetition维度上求和
+                        g_space = g_space.reshape(K_model_raw.shape[0], num_kv_heads, num_repetition_groups, head_dim).sum(dim=2)
+                        g_approx = g_space.reshape(K_model_raw.shape).T @ X_attn
                     elif norm_key.endswith("k_proj.bias"):
-                        g_approx = delta_S.T @ Q_model
+                        g_space = delta_S.transpose(-2, -1) @ Q_model.squeeze(0)
+                        g_space = g_space.transpose(0, 1).reshape(K_model_raw.shape[0], num_q_heads, head_dim)
+                        g_space = g_space.reshape(K_model_raw.shape[0], num_kv_heads, num_repetition_groups, head_dim).sum(dim=2)
+                        g_approx = g_space.reshape(K_model_raw.shape).sum(dim=0)
                     elif norm_key.endswith("v_proj.weight"):
-                        g_space = A_model.T @ delta_Y_attn
-                        g_approx = g_space.T @ X_attn
+                        # 修正：处理GQA中V投影的梯度计算
+                        # 首先，将delta_Y_attn重塑为每头的形式
+                        delta_Y_reshaped = delta_Y_attn.view(delta_Y_attn.shape[0], num_q_heads, head_dim)
+                        
+                        # 将注意力权重应用到delta_Y上
+                        # A_model形状: (num_q_heads, seq_len, seq_len)
+                        # delta_Y_reshaped形状: (seq_len, num_q_heads, head_dim)
+                        g_space = A_model.transpose(-2, -1) @ delta_Y_reshaped.transpose(0, 1)  # (num_q_heads, seq_len, head_dim)
+                        
+                        # 转置回来并重塑为(seq_len, num_q_heads, head_dim)
+                        g_space = g_space.transpose(0, 1)  # (seq_len, num_q_heads, head_dim)
+                        
+                        # 将g_space重塑并在重复维度上汇总，以匹配V的原始形状
+                        g_space = g_space.reshape(V_model_raw.shape[0], num_kv_heads, num_repetition_groups, head_dim).sum(dim=2)
+                        
+                        # 计算最终梯度
+                        g_approx = g_space.reshape(V_model_raw.shape).T @ X_attn
                     elif norm_key.endswith("v_proj.bias"):
-                        g_approx = A_model.T @ delta_Y_attn
+                        # 类似地修复v_proj.bias的梯度计算
+                        delta_Y_reshaped = delta_Y_attn.view(delta_Y_attn.shape[0], num_q_heads, head_dim)
+                        g_space = A_model.transpose(-2, -1) @ delta_Y_reshaped.transpose(0, 1)
+                        g_space = g_space.transpose(0, 1)
+                        g_space = g_space.reshape(V_model_raw.shape[0], num_kv_heads, num_repetition_groups, head_dim).sum(dim=2)
+                        g_approx = g_space.reshape(V_model_raw.shape).sum(dim=0)
                     elif norm_key.endswith("o_proj.weight"):
-                        Z_out = A_model @ V_model
+                        Z_out = A_model @ V_model.squeeze(0)
+                        Z_out = Z_out.transpose(0, 1).reshape(Y_attn_model.shape)
                         g_approx = Z_out.T @ delta_Y_attn
                     elif norm_key.endswith("o_proj.bias"):
-                        g_approx = delta_Y_attn
+                        g_approx = delta_Y_attn.sum(dim=0)
             
             except KeyError as e:
                 print(f"警告: 计算 {key} 梯度时激活未找到: {e}。跳过。")
