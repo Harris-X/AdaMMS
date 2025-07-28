@@ -212,17 +212,15 @@ class ASAMerger:
                 
                 captured_activations[module_name]['output'].append(output_tensor.detach().cpu())
                 
-                # 修正3：不再重新计算QKV，而是准备从模型输出中捕获
+                # 修正3：仅在 self_attn 级别捕获 QKV
                 if module_type == "attn_block":
-                    # 我们期望在模型输出中找到 'attentions'
-                    if isinstance(output, tuple) and len(output) > 2:
-                        # 'attentions' 通常是第三个或更后的元素，是一个元组
-                        # 我们需要找到对应当前层的 attention
-                        layer_idx = int(module_name.split('.')[1]) # 从 'layers.X.self_attn' 中提取 X
-                        if len(output.attentions) > layer_idx:
-                            # Qwen2的attention矩阵形状是 (batch, n_head, seq, seq)
-                            # 我们需要它来进行梯度计算
-                            captured_activations[module_name]['attention_matrix'].append(output.attentions[layer_idx].detach().cpu())
+                    with torch.no_grad():
+                        q = module.q_proj(input_tensor)
+                        k = module.k_proj(input_tensor)
+                        v = module.v_proj(input_tensor)
+                        captured_activations[module_name]['q'].append(q.detach().cpu())
+                        captured_activations[module_name]['k'].append(k.detach().cpu())
+                        captured_activations[module_name]['v'].append(v.detach().cpu())
 
             # PyTorch 2.1+ 推荐使用新的签名
             return hook_fn
@@ -267,8 +265,7 @@ class ASAMerger:
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"前向传播 {model_name}"):
                 input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
-                # 修正：增加 output_attentions=True 来获取注意力矩阵
-                model(input_ids=input_ids, attention_mask=attention_mask, output_attentions=True)
+                model(input_ids=input_ids, attention_mask=attention_mask)
 
         for h in hooks: h.remove()
         
@@ -332,21 +329,21 @@ class ASAMerger:
                 # --- Attention 梯度计算 ---
                 elif "self_attn" in norm_key:
                     X_attn = activations_model[attn_block_name]['input'].to(self.device)
-                    # 修正：直接加载缓存的注意力矩阵，不再需要Q,K
-                    A_model = activations_model[attn_block_name]['attention_matrix'].to(self.device)
-                    A_C = activations_C[attn_block_name]['attention_matrix'].to(self.device)
-
-                    V_model = activations_model[attn_block_name]['v'].to(self.device)
-                    Y_attn_model = activations_model[attn_block_name]['output'].to(self.device)
-                    Y_attn_C = activations_C[attn_block_name]['output'].to(self.device)
-
-                    # 修正：delta_S 现在是注意力矩阵的差值
-                    delta_S = A_model - A_C 
-                    delta_Y_attn = Y_attn_model - Y_attn_C
-                    
-                    # 重新加载Q, K用于计算梯度
                     Q_model = activations_model[attn_block_name]['q'].to(self.device)
                     K_model = activations_model[attn_block_name]['k'].to(self.device)
+                    V_model = activations_model[attn_block_name]['v'].to(self.device)
+                    Y_attn_model = activations_model[attn_block_name]['output'].to(self.device)
+                    
+                    Q_C = activations_C[attn_block_name]['q'].to(self.device)
+                    K_C = activations_C[attn_block_name]['k'].to(self.device)
+                    V_C = activations_C[attn_block_name]['v'].to(self.device)
+                    Y_attn_C = activations_C[attn_block_name]['output'].to(self.device)
+                    
+                    S_model = Q_model @ K_model.T
+                    S_C = Q_C @ K_C.T
+                    delta_S = S_model - S_C
+                    delta_Y_attn = Y_attn_model - Y_attn_C
+                    A_model = torch.softmax(S_model / (head_dim**0.5), dim=-1)
 
                     if norm_key.endswith("q_proj.weight"):
                         g_space = delta_S @ K_model
