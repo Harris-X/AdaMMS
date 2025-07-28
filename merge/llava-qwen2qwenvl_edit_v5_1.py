@@ -517,61 +517,133 @@ class ASAMerger:
         consensus_grad_dir = os.path.join(self.cache_dir, "consensus_grads")
         merged_weights = {}
 
+        # 跟踪不同情况的统计数据
+        stats = {
+            "直接复制": 0,
+            "直接合并": 0,
+            "分解合并": 0,
+            "跳过_找不到梯度": 0,
+            "跳过_权重形状不匹配": 0,
+            "跳过_梯度形状不匹配": 0
+        }
+
         # 1. 直接复制保留的权重
         for key in self.merge_scope['preserve_from_A']:
             merged_weights[key] = W_A_all[key]
+            stats["直接复制"] += 1
         
         # 2. 对称合并语言模型权重
         for key in tqdm(self.merge_scope['language_model'], desc="对称合并语言模型层"):
-            grad_path = os.path.join(consensus_grad_dir, f"{key.replace('/', '_')}.pt")
-            
-            norm_key_A = normalize_keys({key:0}, prefixes_to_remove=["model.language_model."]).popitem()[0]
-            norm_key_B = normalize_keys({key:0}, prefixes_to_remove=["model.language_model."]).popitem()[0]
+            try:
+                grad_path = os.path.join(consensus_grad_dir, f"{key.replace('/', '_')}.pt")
+                
+                # 尝试获取对应的权重键
+                try:
+                    norm_key_A = normalize_keys({key:0}, prefixes_to_remove=["model.language_model."]).popitem()[0]
+                    norm_key_B = normalize_keys({key:0}, prefixes_to_remove=["model.language_model."]).popitem()[0]
+                    
+                    W_A = W_A_all[key].float().to(self.device)
+                    
+                    # 安全地找到模型B中的对应键
+                    matching_B_keys = [k for k in W_B_all if k.endswith(norm_key_B)]
+                    if not matching_B_keys:
+                        print(f"[警告] 在模型B中找不到对应的键 {norm_key_B}，直接保留A模型参数。")
+                        merged_weights[key] = W_A_all[key]
+                        stats["跳过_找不到梯度"] += 1
+                        continue
+                        
+                    W_B_key = matching_B_keys[0]
+                    W_B = W_B_all[W_B_key].float().to(self.device)
+                    
+                    # 安全地找到模型C中的对应键
+                    if norm_key_A not in W_C_all:
+                        print(f"[警告] 在模型C中找不到对应的键 {norm_key_A}，直接保留A模型参数。")
+                        merged_weights[key] = W_A_all[key]
+                        stats["跳过_找不到梯度"] += 1
+                        continue
+                        
+                    W_C = W_C_all[norm_key_A].float().to(self.device)
+                except Exception as e:
+                    print(f"[错误] 加载权重时出错 {key}: {e}，直接保留A模型参数。")
+                    merged_weights[key] = W_A_all[key]
+                    stats["跳过_找不到梯度"] += 1
+                    continue
 
-            W_A = W_A_all[key].float().to(self.device)
-            W_B_key = [k for k in W_B_all if k.endswith(norm_key_B)][0]
-            W_B = W_B_all[W_B_key].float().to(self.device)
-            W_C = W_C_all[norm_key_A].float().to(self.device)
+                # 检查shape一致性
+                if W_A.shape != W_B.shape or W_A.shape != W_C.shape:
+                    print(f"[警告] 参数 {key} 维度不一致: A={W_A.shape}, B={W_B.shape}, C={W_C.shape}，直接保留A模型参数。")
+                    merged_weights[key] = W_A_all[key]
+                    stats["跳过_权重形状不匹配"] += 1
+                    continue
 
-            # 检查shape一致性
-            if W_A.shape != W_B.shape or W_A.shape != W_C.shape:
-                print(f"[警告] 参数 {key} 维度不一致: A={W_A.shape}, B={W_B.shape}, C={W_C.shape}，直接保留A模型参数。")
-                merged_weights[key] = W_A_all[key]
-                continue
-
-            tau_A = W_A - W_C
-            tau_B = W_B - W_C
-            
-            if not os.path.exists(grad_path):
-                w_star = W_C + self.args.lambda_A * tau_A + self.args.lambda_B * tau_B
-            else:
-                g_consensus = torch.load(grad_path, map_location=self.device).float()
+                tau_A = W_A - W_C
+                tau_B = W_B - W_C
+                
+                if not os.path.exists(grad_path):
+                    # 简单线性合并
+                    w_star = W_C + self.args.lambda_o_A * tau_A + self.args.lambda_o_B * tau_B
+                    merged_weights[key] = w_star.to(W_A_all[key].dtype).cpu()
+                    stats["直接合并"] += 1
+                    continue
+                    
+                # 安全地加载共识梯度
+                try:
+                    g_consensus = torch.load(grad_path, map_location=self.device).float()
+                except Exception as e:
+                    print(f"[错误] 加载共识梯度时出错 {key}: {e}，直接保留A模型参数。")
+                    merged_weights[key] = W_A_all[key]
+                    stats["跳过_找不到梯度"] += 1
+                    continue
+                    
+                # 检查梯度和tau_A的形状是否匹配
+                if g_consensus.shape != tau_A.shape:
+                    print(f"[警告] 共识梯度与tau_A维度不一致: {g_consensus.shape} vs {tau_A.shape}，直接保留A模型参数。")
+                    merged_weights[key] = W_A_all[key]
+                    stats["跳过_梯度形状不匹配"] += 1
+                    continue
+                    
                 g_norm_sq = torch.sum(g_consensus * g_consensus)
                 
                 if g_norm_sq < 1e-9:
+                    # 梯度过小，使用简单线性合并
                     w_star = W_C + self.args.lambda_o_A * tau_A + self.args.lambda_o_B * tau_B
+                    merged_weights[key] = w_star.to(W_A_all[key].dtype).cpu()
+                    stats["直接合并"] += 1
                 else:
-                    # 分解 tau_A
-                    if g_consensus.shape != tau_A.shape:
-                        print(f"[警告] 共识梯度与tau_A维度不一致: {g_consensus.shape} vs {tau_A.shape}，直接保留A模型参数。")
+                    # 安全地计算投影和分解
+                    try:
+                        # 分解 tau_A
+                        proj_A = torch.sum(g_consensus * tau_A) / g_norm_sq
+                        tau_A_syn = torch.clamp_min(-proj_A, 0) * g_consensus
+                        tau_A_con = torch.clamp_min(proj_A, 0) * g_consensus
+                        tau_A_ortho = tau_A - tau_A_syn - tau_A_con
+
+                        # 分解 tau_B
+                        proj_B = torch.sum(g_consensus * tau_B) / g_norm_sq
+                        tau_B_syn = torch.clamp_min(-proj_B, 0) * g_consensus
+                        tau_B_con = torch.clamp_min(proj_B, 0) * g_consensus
+                        tau_B_ortho = tau_B - tau_B_syn - tau_B_con
+                        
+                        # 合并
+                        w_star = W_C + \
+                                self.args.lambda_s_A * tau_A_syn - self.args.lambda_c_A * tau_A_con + self.args.lambda_o_A * tau_A_ortho + \
+                                self.args.lambda_s_B * tau_B_syn - self.args.lambda_c_B * tau_B_con + self.args.lambda_o_B * tau_B_ortho
+                                
+                        merged_weights[key] = w_star.to(W_A_all[key].dtype).cpu()
+                        stats["分解合并"] += 1
+                    except Exception as e:
+                        print(f"[错误] 计算分解时出错 {key}: {e}，直接保留A模型参数。")
                         merged_weights[key] = W_A_all[key]
-                        continue
-                    proj_A = torch.sum(g_consensus * tau_A) / g_norm_sq
-                    tau_A_syn = torch.clamp_min(-proj_A, 0) * g_consensus
-                    tau_A_con = torch.clamp_min(proj_A, 0) * g_consensus
-                    tau_A_ortho = tau_A - tau_A_syn - tau_A_con
-
-                    # 分解 tau_B
-                    proj_B = torch.sum(g_consensus * tau_B) / g_norm_sq
-                    tau_B_syn = torch.clamp_min(-proj_B, 0) * g_consensus
-                    tau_B_con = torch.clamp_min(proj_B, 0) * g_consensus
-                    tau_B_ortho = tau_B - tau_B_syn - tau_B_con
-                    
-                    w_star = W_C + \
-                             self.args.lambda_s_A * tau_A_syn - self.args.lambda_c_A * tau_A_con + self.args.lambda_o_A * tau_A_ortho + \
-                             self.args.lambda_s_B * tau_B_syn - self.args.lambda_c_B * tau_B_con + self.args.lambda_o_B * tau_B_ortho
-
-            merged_weights[key] = w_star.to(W_A_all[key].dtype).cpu()
+                        stats["跳过_梯度形状不匹配"] += 1
+            except Exception as e:
+                print(f"[错误] 处理参数 {key} 时发生未捕获的异常: {e}，直接保留A模型参数。")
+                merged_weights[key] = W_A_all[key]
+                stats["跳过_找不到梯度"] += 1
+    
+        # 打印统计信息
+        print("\n合并统计:")
+        for stat_name, count in stats.items():
+            print(f"  {stat_name}: {count} 参数")
         
         # --- 保存模型 ---
         print("\n正在保存合并后的模型...")
