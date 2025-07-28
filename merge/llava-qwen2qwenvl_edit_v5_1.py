@@ -455,30 +455,56 @@ class ASAMerger:
         self._calculate_and_save_gradients("B", self.grad_dir_B)
 
         print("正在融合为共识梯度...")
-        # 此处简化，实际可以在阶段三加载时动态融合
-        # 为了演示，可以创建一个 consensus_grad 目录
         consensus_grad_dir = os.path.join(self.cache_dir, "consensus_grads")
         os.makedirs(consensus_grad_dir, exist_ok=True)
+        
+        # 保存一个日志，记录处理的层和跳过的层
+        fusion_log = {"processed": [], "skipped": [], "dimension_mismatch": []}
         
         for key in tqdm(self.merge_scope['language_model'], desc="融合共识梯度"):
             path_A = os.path.join(self.grad_dir_A, f"{key.replace('/', '_')}.pt")
             path_B = os.path.join(self.grad_dir_B, f"{key.replace('/', '_')}.pt")
             path_consensus = os.path.join(consensus_grad_dir, f"{key.replace('/', '_')}.pt")
 
-            if os.path.exists(path_consensus) and not self.args.force_recompute: continue
-            if not os.path.exists(path_A) or not os.path.exists(path_B): continue
+            if os.path.exists(path_consensus) and not self.args.force_recompute: 
+                fusion_log["processed"].append(key)
+                continue
+                
+            if not os.path.exists(path_A) or not os.path.exists(path_B): 
+                fusion_log["skipped"].append(key)
+                continue
 
             g_A = torch.load(path_A)
             g_B = torch.load(path_B)
             
-            # 符号选举法
+            # 检查形状是否匹配
+            if g_A.shape != g_B.shape:
+                fusion_log["dimension_mismatch"].append(f"{key}: {g_A.shape} vs {g_B.shape}")
+                # 模型结构不同时，优先保留基础模型A的梯度
+                torch.save(g_A, path_consensus)
+                continue
+                
+            # 符号选举法 - 只对形状匹配的层进行
             g_consensus = torch.zeros_like(g_A)
             mask_same_sign = (torch.sign(g_A) == torch.sign(g_B))
             g_consensus[mask_same_sign] = (g_A[mask_same_sign] + g_B[mask_same_sign]) / 2.0
             
             torch.save(g_consensus, path_consensus)
+            fusion_log["processed"].append(key)
         
-        print("共识梯度计算完毕。")
+        # 保存处理日志
+        log_path = os.path.join(self.cache_dir, "fusion_log.json")
+        with open(log_path, 'w') as f:
+            json.dump({
+                "processed_count": len(fusion_log["processed"]),
+                "skipped_count": len(fusion_log["skipped"]),
+                "dimension_mismatch_count": len(fusion_log["dimension_mismatch"]),
+                "dimension_mismatch": fusion_log["dimension_mismatch"]
+            }, f, indent=2)
+        
+        print(f"共识梯度计算完毕。处理了 {len(fusion_log['processed'])} 个参数，跳过了 {len(fusion_log['skipped'])} 个参数。")
+        print(f"发现 {len(fusion_log['dimension_mismatch'])} 个参数因维度不匹配而使用了模型A的梯度。")
+        print(f"详细日志已保存至 {log_path}")
 
     def stage3_merge_models(self):
         """阶段三（对称）：从共同祖先 W_C 出发，对称地融合 τ_A 和 τ_B。"""
@@ -499,21 +525,24 @@ class ASAMerger:
         for key in tqdm(self.merge_scope['language_model'], desc="对称合并语言模型层"):
             grad_path = os.path.join(consensus_grad_dir, f"{key.replace('/', '_')}.pt")
             
-            # 标准化key以匹配非多模态模型C
             norm_key_A = normalize_keys({key:0}, prefixes_to_remove=["model.language_model."]).popitem()[0]
             norm_key_B = normalize_keys({key:0}, prefixes_to_remove=["model.language_model."]).popitem()[0]
 
             W_A = W_A_all[key].float().to(self.device)
-            # 在llava-onevision-qwen2-7b-si-hf中，语言模型没有前缀
             W_B_key = [k for k in W_B_all if k.endswith(norm_key_B)][0]
             W_B = W_B_all[W_B_key].float().to(self.device)
             W_C = W_C_all[norm_key_A].float().to(self.device)
+
+            # 检查shape一致性
+            if W_A.shape != W_B.shape or W_A.shape != W_C.shape:
+                print(f"[警告] 参数 {key} 维度不一致: A={W_A.shape}, B={W_B.shape}, C={W_C.shape}，直接保留A模型参数。")
+                merged_weights[key] = W_A_all[key]
+                continue
 
             tau_A = W_A - W_C
             tau_B = W_B - W_C
             
             if not os.path.exists(grad_path):
-                # 如果没有共识梯度，执行简单平均
                 w_star = W_C + self.args.lambda_A * tau_A + self.args.lambda_B * tau_B
             else:
                 g_consensus = torch.load(grad_path, map_location=self.device).float()
@@ -523,6 +552,10 @@ class ASAMerger:
                     w_star = W_C + self.args.lambda_o_A * tau_A + self.args.lambda_o_B * tau_B
                 else:
                     # 分解 tau_A
+                    if g_consensus.shape != tau_A.shape:
+                        print(f"[警告] 共识梯度与tau_A维度不一致: {g_consensus.shape} vs {tau_A.shape}，直接保留A模型参数。")
+                        merged_weights[key] = W_A_all[key]
+                        continue
                     proj_A = torch.sum(g_consensus * tau_A) / g_norm_sq
                     tau_A_syn = torch.clamp_min(-proj_A, 0) * g_consensus
                     tau_A_con = torch.clamp_min(proj_A, 0) * g_consensus
@@ -534,7 +567,6 @@ class ASAMerger:
                     tau_B_con = torch.clamp_min(proj_B, 0) * g_consensus
                     tau_B_ortho = tau_B - tau_B_syn - tau_B_con
                     
-                    # 对称合并公式
                     w_star = W_C + \
                              self.args.lambda_s_A * tau_A_syn - self.args.lambda_c_A * tau_A_con + self.args.lambda_o_A * tau_A_ortho + \
                              self.args.lambda_s_B * tau_B_syn - self.args.lambda_c_B * tau_B_con + self.args.lambda_o_B * tau_B_ortho
@@ -587,7 +619,7 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径 (e.g., llava-onevision-qwen2-7b-si-hf)。")
     parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径 (e.g., qwen2-7b-instruct)。")
     parser.add_argument('--mode', type=str, default="symmetric_merge", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=6, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
