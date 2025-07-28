@@ -299,10 +299,16 @@ class ASAMerger:
         activations_C = torch.load(os.path.join(self.cache_dir, "activations_C.pt"), map_location="cpu")
 
         # 假设所有模型的语言部分key是一致的
-        base_weights = load_weights(self.args.base_model_path)
+        if model_label == "A":
+            # 修正：加载模型A的权重
+            base_weights = load_weights(self.args.base_model_path)
+            config = AutoConfig.from_pretrained(self.args.base_model_path, trust_remote_code=True)
+        elif model_label == "B":
+            # 修正：加载模型B的权重
+            base_weights = load_weights(self.args.donor_model_path)
+            config = AutoConfig.from_pretrained(self.args.donor_model_path, trust_remote_code=True)
         
         # 修正：使用 AutoConfig 智能加载配置，并处理嵌套结构以兼容多模态模型
-        config = AutoConfig.from_pretrained(self.args.base_model_path, trust_remote_code=True)
         lang_config = getattr(config, "text_config", config)
         num_heads = lang_config.num_attention_heads
         head_dim = lang_config.hidden_size // num_heads
