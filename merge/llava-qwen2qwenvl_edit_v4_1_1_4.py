@@ -11,7 +11,7 @@ from collections import defaultdict
 from typing import Dict
 
 # 导入指定的模型和分词器类
-from transformers import AutoTokenizer, AutoModelForVision2Seq
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForVision2Seq
 from torch.utils.data import DataLoader, TensorDataset
 
 # 尝试导入 Hugging Face datasets 库
