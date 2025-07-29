@@ -316,11 +316,16 @@ class LowMemoryGradientMerger:
 
         merged_weights = {}
 
-        # 【新方法修改】梯度显著性加权门控合并的辅助函数
+        # 【BUG FIX】梯度显著性加权门控合并的辅助函数
         def get_gated_saliency_weighted_vector(tau, g_approx, lambda_s, lambda_c, temperature):
             # 步骤1：计算梯度显著图 S
-            saliency_map = torch.softmax(torch.abs(g_approx) / temperature, dim=None)
+            # saliency_map = torch.softmax(torch.abs(g_approx) / temperature, dim=None) # 旧的错误代码
             
+            # 【BUG FIX】替换为更稳定的 flatten -> softmax -> reshape 操作
+            input_tensor = torch.abs(g_approx) / temperature
+            original_shape = input_tensor.shape
+            saliency_map = torch.softmax(input_tensor.flatten(), dim=0).reshape(original_shape)
+
             # 步骤2：构建协同/冲突门控 M
             product = tau * g_approx
             synergy_mask = (product < 0).float()
@@ -332,7 +337,6 @@ class LowMemoryGradientMerger:
                        lambda_c * (tau * conflict_mask * saliency_map)
             
             return tau_star
-
 
         for key in tqdm(base_weights.keys(), desc="逐层合并权重"):
             # 默认使用原始模型C的权重作为起点
