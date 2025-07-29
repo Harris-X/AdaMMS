@@ -205,20 +205,19 @@ class LowMemoryGradientMerger:
             ] * (self.args.probe_samples // 3 + 1)
             probe_texts = probe_texts[:self.args.probe_samples]
     
-        probe_inputs = tokenizer(probe_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        probe_dataset = TensorDataset(probe_inputs['input_ids'], probe_inputs['attention_mask'])
-        probe_dataloader = DataLoader(probe_dataset, batch_size=self.args.probe_batch_size)
+
+        # 使用 apply_chat_template 来格式化文本
+        formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in probe_texts]
+        inputs = tokenizer(formatted_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+        
+        probe_dataloader = DataLoader(TensorDataset(inputs['input_ids'], inputs['attention_mask']), batch_size=self.args.probe_batch_size)
+
 
         model.eval()
         with torch.no_grad():
             for batch in tqdm(probe_dataloader, desc=f"前向传播 {os.path.basename(model_path)}"):
                 input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
-                # 适配多模态模型的调用
-                if is_vision_model:
-                     dummy_pixels = torch.zeros((input_ids.shape[0], 3, 224, 224), dtype=torch.bfloat16).to(self.device)
-                     model(input_ids=input_ids, attention_mask=attention_mask, pixel_values=dummy_pixels)
-                else:
-                    model(input_ids=input_ids, attention_mask=attention_mask)
+                model(input_ids=input_ids, attention_mask=attention_mask)
 
         for h in hooks: h.remove()
         
@@ -413,11 +412,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="使用混合策略（分解+插值）进行低显存模型合并。")
     
     # 基本配置
-    parser.add_argument('--base_model_path', type=str, required=True, help="基础模型A的路径。")
-    parser.add_argument('--donor_model_path', type=str, required=True, help="贡献模型B的路径。")
-    parser.add_argument('--original_model_path', type=str, required=True, help="原始共同祖先模型C的路径。")
+    parser.add_argument('--base_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
+    parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
+    parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="hybrid-merge", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=5, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
@@ -427,13 +426,13 @@ if __name__ == "__main__":
     parser.add_argument('--lambda_A_s', type=float, default=1.0, help="[分解] 基础模型A的协同分量(synergy)系数。")
     parser.add_argument('--lambda_A_c', type=float, default=1.0, help="[分解] 基础模型A的冲突分量(conflict)系数。")
     parser.add_argument('--lambda_A_o', type=float, default=1.0, help="[分解] 基础模型A的正交分量(orthogonal)系数。")
-    parser.add_argument('--lambda_B_s', type=float, default=1.0, help="[分解] 贡献模型B的协同分量(synergy)系数。")
-    parser.add_argument('--lambda_B_c', type=float, default=0.0, help="[分解] 贡献模型B的冲突分量(conflict)系数。")
-    parser.add_argument('--lambda_B_o', type=float, default=0.0, help="[分解] 贡献模型B的正交分量(orthogonal)系数。")
+    parser.add_argument('--lambda_B_s', type=float, default=1.4, help="[分解] 贡献模型B的协同分量(synergy)系数。")
+    parser.add_argument('--lambda_B_c', type=float, default=0.7, help="[分解] 贡献模型B的冲突分量(conflict)系数。")
+    parser.add_argument('--lambda_B_o', type=float, default=1.0, help="[分解] 贡献模型B的正交分量(orthogonal)系数。")
 
     # --- 线性插值组 (α系列, 用于self-attn投影层) ---
     parser.add_argument('--alpha_A', type=float, default=1.0, help="[插值] 基础模型A任务向量的系数。")
-    parser.add_argument('--alpha_B', type=float, default=0.5, help="[插值] 贡献模型B任务向量的系数。")
+    parser.add_argument('--alpha_B', type=float, default=0.1, help="[插值] 贡献模型B任务向量的系数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或梯度。")
