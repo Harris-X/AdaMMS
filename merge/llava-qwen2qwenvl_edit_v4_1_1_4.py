@@ -194,13 +194,17 @@ class LowMemoryGradientMerger:
             if name in target_module_names:
                 hooks.append(module.register_forward_hook(get_hook(name)))
 
+        # 准备探针数据集 - 使用更可靠的 wikitext
         try:
+            # 避免使用 wikipedia 以防止冲突
             probe_dataset_raw = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True).take(self.args.probe_samples)
             probe_texts = [item['text'] for item in probe_dataset_raw if item['text']]
         except Exception as e:
             print(f"加载 wikitext 数据集失败: {e}")
+            # 备用文本
             probe_texts = [
-                "The quick brown fox jumps over the lazy dog.", "Machine learning models are trained on large datasets.",
+                "The quick brown fox jumps over the lazy dog.",
+                "Machine learning models are trained on large datasets.",
                 "Neural networks process information in a hierarchical manner."
             ] * (self.args.probe_samples // 3 + 1)
             probe_texts = probe_texts[:self.args.probe_samples]
@@ -213,12 +217,7 @@ class LowMemoryGradientMerger:
         with torch.no_grad():
             for batch in tqdm(probe_dataloader, desc=f"前向传播 {os.path.basename(model_path)}"):
                 input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
-                # 适配多模态模型的调用
-                if is_vision_model:
-                     dummy_pixels = torch.zeros((input_ids.shape[0], 3, 224, 224), dtype=torch.bfloat16).to(self.device)
-                     model(input_ids=input_ids, attention_mask=attention_mask, pixel_values=dummy_pixels)
-                else:
-                    model(input_ids=input_ids, attention_mask=attention_mask)
+                model(input_ids=input_ids, attention_mask=attention_mask)
 
         for h in hooks: h.remove()
         
@@ -412,7 +411,7 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="saliency-gated-merge", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=5, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=3, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
