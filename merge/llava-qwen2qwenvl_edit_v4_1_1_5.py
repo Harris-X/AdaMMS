@@ -506,7 +506,7 @@ if __name__ == "__main__":
 
     # 探针数据集配置
     parser.add_argument('--probe_dataset', type=str, default="wikitext", help="用于探测激活的数据集 ('wikipedia' 或 'c4')。")
-    parser.add_argument('--probe_samples', type=int, default=2000, help="用于探测的样本数量。")
+    parser.add_argument('--probe_samples', type=int, default=1500, help="用于探测的样本数量。")
     parser.add_argument('--probe_batch_size', type=int, default=1, help="探测时的批处理大小，如果显存不足请减小。")
 
     # 合并超参数
@@ -516,7 +516,7 @@ if __name__ == "__main__":
     # =======================================================================================
     # MODIFICATION START: Add new hyperparameter for LERP
     # =======================================================================================
-    parser.add_argument('--lerp_alpha', type=float, default=0.5, help="线性插值 (LERP) 的系数 (用于Self-Attention)。")
+    parser.add_argument('--lerp_alpha', type=float, default=0.1, help="线性插值 (LERP) 的系数 (用于Self-Attention)。")
     # =======================================================================================
     # MODIFICATION END
     # =======================================================================================
