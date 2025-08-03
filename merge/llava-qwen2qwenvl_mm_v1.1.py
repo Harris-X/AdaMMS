@@ -142,7 +142,7 @@ class VQAv2ProbeDataset(Dataset):
     def __getitem__(self, idx):
         item = self.samples[idx]
         image = item["image"]
-        text = f"Question: {item['text']} Answer:"
+        text = item['text']
 
         # 如果图像是 RGBA，转换为 RGB
         if image.mode == 'RGBA':
@@ -344,7 +344,7 @@ class LowMemoryGradientMerger:
             # 准备探针数据集
             # probe_dataset_raw = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True).take(self.args.probe_samples)
             # probe_texts = [item['text'] for item in probe_dataset_raw if item['text'].strip()]
-            probe_texts = [f"Question: {item['text']} Answer:" for item in probe_dataset_raw.take(self.args.probe_samples)]
+            probe_texts = [item['question'] for item in probe_dataset_raw.take(self.args.probe_samples)]
             # 使用 apply_chat_template 来格式化文本
             formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in probe_texts]
             inputs = tokenizer(formatted_texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
@@ -376,26 +376,69 @@ class LowMemoryGradientMerger:
 
         for h in hooks: h.remove()
 
-        # --- 求平均并保存 ---
+        # # --- 求平均并保存 ---
+        # averaged_activations = {}
+        # for name, data in captured_activations.items():
+        #     averaged_activations[name] = {}
+        #     if data["outputs"]:
+        #         try:
+        #             # 正确的修改：将所有激活扁平化后再求平均
+        #             # 1. 将每个批次的激活张量 [batch, seq, dim] 扁平化为 [batch*seq, dim]
+        #             # 2. 将所有扁平化后的张量拼接起来
+        #             # 3. 在拼接后的大张量上求平均
+        #             all_tokens = torch.cat([t.float().view(-1, t.shape[-1]) for t in data["outputs"]], dim=0)
+        #             averaged_activations[name]["output"] = torch.mean(all_tokens, dim=0)
+        #         except Exception as e:
+        #             print(f"处理 {name} 的输出激活时出错: {e}")
+        #             continue
+        #     if data["inputs"]:
+        #         try:
+        #             # 对输入也采用同样的处理方式
+        #             all_tokens = torch.cat([t.float().view(-1, t.shape[-1]) for t in data["inputs"]], dim=0)
+        #             averaged_activations[name]["input"] = torch.mean(all_tokens, dim=0)
+        #         except Exception as e:
+        #             print(f"处理 {name} 的输入激活时出错: {e}")
+        #             continue
+
+        # 求平均并保存 (修正: 处理可变序列长度但保持维度结构)
         averaged_activations = {}
         for name, data in captured_activations.items():
             averaged_activations[name] = {}
-            if data["outputs"]:
+            if data["outputs"] and len(data["outputs"]) > 0:
                 try:
-                    # 正确的修改：将所有激活扁平化后再求平均
-                    # 1. 将每个批次的激活张量 [batch, seq, dim] 扁平化为 [batch*seq, dim]
-                    # 2. 将所有扁平化后的张量拼接起来
-                    # 3. 在拼接后的大张量上求平均
-                    all_tokens = torch.cat([t.float().view(-1, t.shape[-1]) for t in data["outputs"]], dim=0)
-                    averaged_activations[name]["output"] = torch.mean(all_tokens, dim=0)
+                    # 找到所有输出张量中的最大序列长度
+                    max_seq_len = max(t.shape[1] for t in data["outputs"])
+                    # 将所有张量填充到相同长度
+                    padded_outputs = []
+                    for t in data["outputs"]:
+                        if t.shape[1] < max_seq_len:
+                            # 在序列维度上填充0
+                            padding = torch.zeros(t.shape[0], max_seq_len - t.shape[1], t.shape[2], dtype=t.dtype)
+                            padded_t = torch.cat([t, padding], dim=1)
+                        else:
+                            padded_t = t
+                        padded_outputs.append(padded_t)
+                    
+                    # 现在可以安全地拼接和求平均
+                    averaged_activations[name]["output"] = torch.mean(torch.cat(padded_outputs, dim=0).float(), dim=0)
                 except Exception as e:
                     print(f"处理 {name} 的输出激活时出错: {e}")
                     continue
-            if data["inputs"]:
+                    
+            if data["inputs"] and len(data["inputs"]) > 0:
                 try:
-                    # 对输入也采用同样的处理方式
-                    all_tokens = torch.cat([t.float().view(-1, t.shape[-1]) for t in data["inputs"]], dim=0)
-                    averaged_activations[name]["input"] = torch.mean(all_tokens, dim=0)
+                    # 对输入采用同样的处理方式
+                    max_seq_len = max(t.shape[1] for t in data["inputs"])
+                    padded_inputs = []
+                    for t in data["inputs"]:
+                        if t.shape[1] < max_seq_len:
+                            padding = torch.zeros(t.shape[0], max_seq_len - t.shape[1], t.shape[2], dtype=t.dtype)
+                            padded_t = torch.cat([t, padding], dim=1)
+                        else:
+                            padded_t = t
+                        padded_inputs.append(padded_t)
+                    
+                    averaged_activations[name]["input"] = torch.mean(torch.cat(padded_inputs, dim=0).float(), dim=0)
                 except Exception as e:
                     print(f"处理 {name} 的输入激活时出错: {e}")
                     continue
@@ -403,7 +446,11 @@ class LowMemoryGradientMerger:
         torch.save(averaged_activations, cache_path)
         print(f"激活已缓存至: {cache_path}")
         
-        del model, tokenizer, captured_activations, averaged_activations, probe_dataloader
+        del model, captured_activations, averaged_activations, probe_dataloader
+        if is_vision_model:
+            del processor
+        else:
+            del tokenizer
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -459,13 +506,29 @@ class LowMemoryGradientMerger:
             Y_A = activations_A[module_name]["output"].to(self.device)
             Y_C = activations_C[module_name]["output"].to(self.device)
             
+            # --- 新增：对齐多模态和纯文本模型的激活张量 ---
+            # 假设模型C的激活对应于模型A激活的末尾部分（文本部分）
+            len_C = Y_C.shape[0]
+            len_A = Y_A.shape[0]
+            
+            if len_A > len_C:
+                # 从 Y_A 和 X_A 的末尾切片，以匹配 Y_C 的长度
+                Y_A_sliced = Y_A[-len_C:, :]
+                X_A_sliced = X_A[-len_C:, :]
+            else:
+                # 如果A的长度不比C长，可能出现了问题，但为了健壮性，按原样使用
+                print(f"警告: 模块 {module_name} 的激活长度 A({len_A}) 不大于 C({len_C})。")
+                Y_A_sliced = Y_A
+                X_A_sliced = X_A
+
             # 计算期望变化方向 (近似的梯度信号)
-            delta_Y = Y_A - Y_C #
+            # 使用切片后的张量进行计算
+            delta_Y = Y_A_sliced - Y_C
             
             g_approx = None
             if key.endswith(".weight"):
-                # 权重梯度: g' ≈ ΔY^T @ X_A
-                g_approx = delta_Y.T @ X_A #
+                # 权重梯度: g' ≈ ΔY^T @ X_A (使用切片后的 X_A)
+                g_approx = delta_Y.T @ X_A_sliced
             elif key.endswith(".bias"):
                 # 偏置梯度: g' ≈ sum(ΔY) over batch/seq dim
                 g_approx = delta_Y.sum(dim=0) #
@@ -574,7 +637,7 @@ if __name__ == "__main__":
 
     # 探针数据集配置
     # parser.add_argument('--probe_dataset', type=str, default="wikitext", help="用于探测激活的数据集 ('wikipedia' 或 'c4')。")
-    parser.add_argument('--probe_samples', type=int, default=500, help="用于探测的样本数量。")
+    parser.add_argument('--probe_samples', type=int, default=100, help="用于探测的样本数量。")
     parser.add_argument('--probe_batch_size', type=int, default=2, help="探测时的批处理大小，如果显存不足请减小。")
 
     # 合并超参数
