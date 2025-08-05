@@ -331,7 +331,9 @@ class AGIDPMMerger:
     
         # 收集原始数据样本
         original_samples = []
-        for item in dataset_raw:
+        # 重置流式数据集的迭代器
+        dataset_iterator = iter(dataset_raw)
+        for item in dataset_iterator:
             if len(original_samples) >= self.args.probe_samples:
                 break
             # 保存原始PIL图像和文本
@@ -352,17 +354,28 @@ class AGIDPMMerger:
                 
                 # 根据不同模型使用正确的处理方式
                 if is_llava:
-                    # LLaVA的处理方式
-                    inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
+                    # LLaVA的处理方式 (修正)
+                    # 1. 创建对话结构
+                    conversations = [
+                        {"role": "user", "content": [{"type": "text", "text": t}, {"type": "image"}]}
+                        for t in texts
+                    ]
+                    # 2. 应用聊天模板生成带<image>占位符的提示
+                    prompts = [processor.apply_chat_template([conv], tokenize=False, add_generation_prompt=True) for conv in conversations]
+                    # 3. 将提示和图像传递给处理器
+                    inputs = processor(text=prompts, images=images, return_tensors="pt", padding=True)
+
                 elif is_vision_model:
-                    # Qwen2-VL的处理方式
-                    messages_batch = [[{"role": "user", "content": [{"type": "text", "text": text},{"type": "image"}]}] for text in texts]
+                    # Qwen2-VL的处理方式 (修正模板顺序)
+                    messages_batch = [[{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}] for text in texts]
                     prompt_batch = [processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_batch]
                     inputs = processor(text=prompt_batch, images=images, return_tensors="pt", padding=True)
                 else:
                     # 纯文本模型处理方式
-                    formatted_texts = [processor.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in texts]
-                    inputs = processor(text=formatted_texts, return_tensors="pt", padding=True, truncation=True)
+                    # 对于纯文本模型，处理器就是分词器
+                    tokenizer = processor
+                    formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in texts]
+                    inputs = tokenizer(text=formatted_texts, return_tensors="pt", padding=True, truncation=True)
                 
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 model(**inputs)
