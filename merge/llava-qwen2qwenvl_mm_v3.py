@@ -107,8 +107,8 @@ class VQAv2ProbeDataset(Dataset):
 def collate_fn_factory(processor):
     def collate_fn(batch):
         images = [item["image"] for item in batch]
-        texts = [f"Question: {item['text']} Answer:" for item in batch]
-        messages_batch = [[{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}] for text in texts]
+        texts = [item['text'] for item in batch]
+        messages_batch = [[{"role": "user", "content": [{"type": "text", "text": text},{"type": "image"}]}] for text in texts]
         prompt_batch = [processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_batch]
         inputs = processor(text=prompt_batch, images=images, return_tensors="pt", padding=True)
         return inputs
@@ -146,62 +146,272 @@ class AGIDPMMerger:
 
         print(f"正在为 {model_info} ({os.path.basename(model_path)}) 缓存激活...")
         is_vision_model = "VL" in model_path or "llava" in model_path.lower()
+        is_llava = "llava" in model_path.lower()
         
+        # 加载模型和处理器
         ModelClass = AutoModelForVision2Seq if is_vision_model else AutoModelForCausalLM
         model = ModelClass.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(self.device)
+        processor = AutoProcessor.from_pretrained(model_path)
         model.eval()
 
         model_to_hook = model.model
         target_modules = self._get_target_module_map(model_to_hook)
         
         hooks, captured_activations = [], defaultdict(lambda: {"inputs": [], "outputs": []})
-        def get_hook(name, req_act):
-            def hook_fn(module, input, output):
+    
+        # 使用带kwargs的钩子函数，更加健壮
+        def get_hook_with_kwargs(name, req_act):
+            def hook_fn(module, args, kwargs, output):
+                # 处理输出
                 if "output" in req_act:
-                    out_tensor = output[0] if isinstance(output, tuple) else output
+                    out_tensor = None
+                    if isinstance(output, tuple) and len(output) > 0:
+                        out_tensor = output[0]
+                    else:
+                        out_tensor = output
+                    
                     if isinstance(out_tensor, torch.Tensor):
                         captured_activations[name]["outputs"].append(out_tensor.detach().cpu())
+            
+                # 处理输入 - 从kwargs和args都尝试获取
                 if "input" in req_act:
-                    in_tensor = input[0] if isinstance(input, tuple) else input
+                    in_tensor = None
+                    if "hidden_states" in kwargs:
+                        in_tensor = kwargs["hidden_states"]
+                    elif isinstance(args, tuple) and len(args) > 0 and isinstance(args[0], torch.Tensor):
+                        in_tensor = args[0]
+                        
                     if isinstance(in_tensor, torch.Tensor):
                         captured_activations[name]["inputs"].append(in_tensor.detach().cpu())
             return hook_fn
-
+    
+        # 注册钩子
         for name, module in target_modules.items():
-            hooks.append(module.register_forward_hook(get_hook(name, required_activations)))
+            hooks.append(module.register_forward_hook(
+                get_hook_with_kwargs(name, required_activations), 
+                with_kwargs=True
+            ))
+    
+        # 为不同模型准备不同的数据
+        if is_vision_model:
+            # 从原始dataloader中提取原始数据
+            original_data = []
+            for batch in dataloader:
+                for i in range(len(batch["input_ids"])):
+                    original_data.append({
+                        "image": batch["pixel_values"][i].cpu(),
+                        "text": "Describe this image."  # 简单提示，确保模型处理图像
+                    })
+                    if len(original_data) >= self.args.probe_samples:
+                        break
+                if len(original_data) >= self.args.probe_samples:
+                    break
             
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc=f"前向传播 {model_info}"):
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                model(**batch)
-        for h in hooks: h.remove()
-        
+            # 为每个模型创建特定的批处理
+            with torch.no_grad():
+                for i in range(0, len(original_data), self.args.probe_batch_size):
+                    batch_data = original_data[i:i+self.args.probe_batch_size]
+                    images = [item["image"] for item in batch_data]
+                    texts = [item["text"] for item in batch_data]
+                    
+                    # 特定于LLaVA的处理
+                    if is_llava:
+                        # 使用LLaVA特定的处理方式
+                        inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
+                        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    else:
+                        # 使用Qwen2-VL特定的处理方式
+                        messages_batch = [[{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}] for text in texts]
+                        prompt_batch = [processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_batch]
+                        inputs = processor(text=prompt_batch, images=images, return_tensors="pt", padding=True)
+                        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    
+                    model(**inputs)
+                    print(f"处理批次 {i//self.args.probe_batch_size + 1}/{(len(original_data)-1)//self.args.probe_batch_size + 1}")
+        else:
+            # 处理纯文本模型
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            texts = ["This is a sample text for probing the model."] * self.args.probe_samples
+            probe_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+            probe_dataset = TensorDataset(probe_inputs["input_ids"], probe_inputs["attention_mask"])
+            probe_dataloader = DataLoader(probe_dataset, batch_size=self.args.probe_batch_size)
+            
+            with torch.no_grad():
+                for batch in tqdm(probe_dataloader, desc=f"前向传播 {model_info}"):
+                    input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
+                    model(input_ids=input_ids, attention_mask=attention_mask)
+    
+        for h in hooks:
+            h.remove()
+    
+        # 处理和保存激活
         averaged_activations = {}
         for name, data in captured_activations.items():
             averaged_activations[name] = {}
             for act_type in ["inputs", "outputs"]:
                 if data[act_type]:
-                    all_tokens = torch.cat([t.float().view(-1, t.shape[-1]) for t in data[act_type]], dim=0)
-                    averaged_activations[name][act_type[:-1]] = torch.mean(all_tokens, dim=0)
+                    try:
+                        # 尝试将所有张量转换为相同大小再取平均
+                        all_tensors = [t.float() for t in data[act_type]]
+                        
+                        # 检查是否所有张量的形状相同
+                        shapes_same = all(t.shape == all_tensors[0].shape for t in all_tensors)
+                        
+                        if shapes_same:
+                            # 形状相同时直接拼接
+                            all_tokens = torch.cat(all_tensors, dim=0)
+                        else:
+                            # 形状不同时先展平再拼接
+                            all_tokens = torch.cat([t.reshape(-1, t.shape[-1]) for t in all_tensors], dim=0)
+                            
+                        averaged_activations[name][act_type[:-1]] = torch.mean(all_tokens, dim=0)
+                    except Exception as e:
+                        print(f"处理 {name} 的 {act_type} 时出错: {e}")
 
         torch.save(averaged_activations, cache_path)
-        del model, hooks, captured_activations
+        del model, processor, hooks, captured_activations
         gc.collect()
         torch.cuda.empty_cache()
         return averaged_activations
 
-    def stage1_cache_all_activations(self):
-        """阶段一：为所有模型缓存所需的激活。"""
-        print("\n--- [阶段一: 缓存所有激活] ---")
-        processor = AutoProcessor.from_pretrained(self.args.base_model_path)
-        probe_dataset_raw = load_dataset("lmms-lab/VQAv2", split="validation", streaming=True)
-        probe_dataset = VQAv2ProbeDataset(probe_dataset_raw, max_samples=self.args.probe_samples)
-        collate_function = collate_fn_factory(processor)
-        dataloader = DataLoader(probe_dataset, batch_size=self.args.probe_batch_size, collate_fn=collate_function)
+    def _cache_activations_raw(self, model_info, model_path, required_activations, dataset_raw):
+        """为每个模型从原始数据集处理数据并缓存激活。"""
+        cache_path = os.path.join(self.cache_dir, f"activations_{model_info}.pt")
+        if os.path.exists(cache_path) and not self.args.force_recompute:
+            print(f"激活缓存文件 {cache_path} 已存在, 跳过。")
+            return torch.load(cache_path, map_location="cpu")
+
+        print(f"正在为 {model_info} ({os.path.basename(model_path)}) 缓存激活...")
+        is_vision_model = "VL" in model_path or "llava" in model_path.lower()
+        is_llava = "llava" in model_path.lower()
         
-        self._cache_activations("A", self.args.base_model_path, "input_output", dataloader)
-        self._cache_activations("B", self.args.donor_model_path, "input_output", dataloader)
-        self._cache_activations("C", self.args.original_model_path, "output", dataloader)
+        # 加载模型和处理器
+        ModelClass = AutoModelForVision2Seq if is_vision_model else AutoModelForCausalLM
+        model = ModelClass.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(self.device)
+        processor = AutoProcessor.from_pretrained(model_path)
+        model.eval()
+
+        model_to_hook = model.model
+        target_modules = self._get_target_module_map(model_to_hook)
+        
+        hooks, captured_activations = [], defaultdict(lambda: {"inputs": [], "outputs": []})
+    
+        # 使用带kwargs的钩子函数，更加健壮
+        def get_hook_with_kwargs(name, req_act):
+            def hook_fn(module, args, kwargs, output):
+                # 处理输出
+                if "output" in req_act:
+                    out_tensor = None
+                    if isinstance(output, tuple) and len(output) > 0:
+                        out_tensor = output[0]
+                    else:
+                        out_tensor = output
+                    
+                    if isinstance(out_tensor, torch.Tensor):
+                        captured_activations[name]["outputs"].append(out_tensor.detach().cpu())
+            
+                # 处理输入 - 从kwargs和args都尝试获取
+                if "input" in req_act:
+                    in_tensor = None
+                    if "hidden_states" in kwargs:
+                        in_tensor = kwargs["hidden_states"]
+                    elif isinstance(args, tuple) and len(args) > 0 and isinstance(args[0], torch.Tensor):
+                        in_tensor = args[0]
+                        
+                    if isinstance(in_tensor, torch.Tensor):
+                        captured_activations[name]["inputs"].append(in_tensor.detach().cpu())
+            return hook_fn
+    
+        # 注册钩子
+        for name, module in target_modules.items():
+            hooks.append(module.register_forward_hook(
+                get_hook_with_kwargs(name, required_activations), 
+                with_kwargs=True
+            ))
+    
+        # 收集原始数据样本
+        original_samples = []
+        for item in dataset_raw:
+            if len(original_samples) >= self.args.probe_samples:
+                break
+            # 保存原始PIL图像和文本
+            image = item["image"]
+            if image.mode == 'RGBA': 
+                image = image.convert('RGB')
+            original_samples.append({
+                "image": image,  # 保存PIL图像
+                "text": item["question"]
+            })
+        
+        # 根据模型类型处理数据
+        with torch.no_grad():
+            for i in range(0, len(original_samples), self.args.probe_batch_size):
+                batch_data = original_samples[i:i+self.args.probe_batch_size]
+                images = [item["image"] for item in batch_data]  # 现在是PIL图像
+                texts = [item["text"] for item in batch_data]
+                
+                # 根据不同模型使用正确的处理方式
+                if is_llava:
+                    # LLaVA的处理方式
+                    inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
+                elif is_vision_model:
+                    # Qwen2-VL的处理方式
+                    messages_batch = [[{"role": "user", "content": [{"type": "text", "text": text},{"type": "image"}]}] for text in texts]
+                    prompt_batch = [processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_batch]
+                    inputs = processor(text=prompt_batch, images=images, return_tensors="pt", padding=True)
+                else:
+                    # 纯文本模型处理方式
+                    formatted_texts = [processor.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in texts]
+                    inputs = processor(text=formatted_texts, return_tensors="pt", padding=True, truncation=True)
+                
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                model(**inputs)
+                print(f"处理批次 {i//self.args.probe_batch_size + 1}/{(len(original_samples)-1)//self.args.probe_batch_size + 1}")
+    
+        for h in hooks:
+            h.remove()
+    
+        # 处理和保存激活
+        averaged_activations = {}
+        for name, data in captured_activations.items():
+            averaged_activations[name] = {}
+            for act_type in ["inputs", "outputs"]:
+                if data[act_type]:
+                    try:
+                        # 尝试将所有张量转换为相同大小再取平均
+                        all_tensors = [t.float() for t in data[act_type]]
+                        
+                        # 检查是否所有张量的形状相同
+                        shapes_same = all(t.shape == all_tensors[0].shape for t in all_tensors)
+                        
+                        if shapes_same:
+                            # 形状相同时直接拼接
+                            all_tokens = torch.cat(all_tensors, dim=0)
+                        else:
+                            # 形状不同时先展平再拼接
+                            all_tokens = torch.cat([t.reshape(-1, t.shape[-1]) for t in all_tensors], dim=0)
+                            
+                        averaged_activations[name][act_type[:-1]] = torch.mean(all_tokens, dim=0)
+                    except Exception as e:
+                        print(f"处理 {name} 的 {act_type} 时出错: {e}")
+
+        torch.save(averaged_activations, cache_path)
+        del model, processor, hooks, captured_activations
+        gc.collect() 
+        torch.cuda.empty_cache()
+        return averaged_activations
+
+    def stage1_cache_all_activations(self):
+        """阶段一：为所有模型分别缓存所需的激活。"""
+        print("\n--- [阶段一: 缓存所有激活] ---")
+        
+        # 直接加载原始数据集，不预先处理
+        probe_dataset_raw = load_dataset("lmms-lab/VQAv2", split="validation", streaming=True)
+        
+        # 为每个模型单独处理数据并缓存激活
+        self._cache_activations_raw("A", self.args.base_model_path, "input_output", probe_dataset_raw)
+        self._cache_activations_raw("B", self.args.donor_model_path, "input_output", probe_dataset_raw)
+        self._cache_activations_raw("C", self.args.original_model_path, "output", probe_dataset_raw)
 
     def stage2_analyze_neurons_and_get_masks(self):
         """阶段二：计算近似SNIP并生成非冲突掩码。"""
