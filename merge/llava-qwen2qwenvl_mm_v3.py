@@ -78,16 +78,17 @@ def normalize_llm_keys(weights_to_norm: dict, reference_keys: list) -> dict:
 
 def need_merge(name: str) -> bool:
     """根据层名判断是否需要合并 - 仅合并LLM的权重参数。"""
-    if "language_model.layers" not in name:
-        return False
-    
-    if not name.endswith(".weight"): # 只处理权重，忽略偏置等
-        return False
-
-    if "layernorm" in name or "embed_tokens" in name or "norm" in name or ".inv_freq" in name:
-        return False
+    if ("language_model.layers" not in name) or ("model.layers" not in name):
         
-    return True
+        if not name.endswith(".weight"): # 只处理权重，忽略偏置等
+            return False
+
+        if "layernorm" in name or "embed_tokens" in name or "norm" in name or ".inv_freq" in name:
+            return False
+            
+        return True
+    else:
+        return False
 
 # --- 数据集处理函数 ---
 class VQAv2ProbeDataset(Dataset):
@@ -137,145 +138,8 @@ class AGIDPMMerger:
                 module_map[name] = module
         return module_map
     
-    def _cache_activations(self, model_info, model_path, required_activations, dataloader):
-        """通用激活缓存函数。"""
-        cache_path = os.path.join(self.cache_dir, f"activations_{model_info}.pt")
-        if os.path.exists(cache_path) and not self.args.force_recompute:
-            print(f"激活缓存文件 {cache_path} 已存在, 跳过。")
-            return torch.load(cache_path, map_location="cpu")
-
-        print(f"正在为 {model_info} ({os.path.basename(model_path)}) 缓存激活...")
-        is_vision_model = "VL" in model_path or "llava" in model_path.lower()
-        is_llava = "llava" in model_path.lower()
-        
-        # 加载模型和处理器
-        ModelClass = AutoModelForVision2Seq if is_vision_model else AutoModelForCausalLM
-        model = ModelClass.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(self.device)
-        processor = AutoProcessor.from_pretrained(model_path)
-        model.eval()
-
-        model_to_hook = model.model
-        target_modules = self._get_target_module_map(model_to_hook)
-        
-        hooks, captured_activations = [], defaultdict(lambda: {"inputs": [], "outputs": []})
-    
-        # 使用带kwargs的钩子函数，更加健壮
-        def get_hook_with_kwargs(name, req_act):
-            def hook_fn(module, args, kwargs, output):
-                # 处理输出
-                if "output" in req_act:
-                    out_tensor = None
-                    if isinstance(output, tuple) and len(output) > 0:
-                        out_tensor = output[0]
-                    else:
-                        out_tensor = output
-                    
-                    if isinstance(out_tensor, torch.Tensor):
-                        captured_activations[name]["outputs"].append(out_tensor.detach().cpu())
-            
-                # 处理输入 - 从kwargs和args都尝试获取
-                if "input" in req_act:
-                    in_tensor = None
-                    if "hidden_states" in kwargs:
-                        in_tensor = kwargs["hidden_states"]
-                    elif isinstance(args, tuple) and len(args) > 0 and isinstance(args[0], torch.Tensor):
-                        in_tensor = args[0]
-                        
-                    if isinstance(in_tensor, torch.Tensor):
-                        captured_activations[name]["inputs"].append(in_tensor.detach().cpu())
-            return hook_fn
-    
-        # 注册钩子
-        for name, module in target_modules.items():
-            hooks.append(module.register_forward_hook(
-                get_hook_with_kwargs(name, required_activations), 
-                with_kwargs=True
-            ))
-    
-        # 为不同模型准备不同的数据
-        if is_vision_model:
-            # 从原始dataloader中提取原始数据
-            original_data = []
-            for batch in dataloader:
-                for i in range(len(batch["input_ids"])):
-                    original_data.append({
-                        "image": batch["pixel_values"][i].cpu(),
-                        "text": "Describe this image."  # 简单提示，确保模型处理图像
-                    })
-                    if len(original_data) >= self.args.probe_samples:
-                        break
-                if len(original_data) >= self.args.probe_samples:
-                    break
-            
-            # 为每个模型创建特定的批处理
-            with torch.no_grad():
-                for i in range(0, len(original_data), self.args.probe_batch_size):
-                    batch_data = original_data[i:i+self.args.probe_batch_size]
-                    images = [item["image"] for item in batch_data]
-                    texts = [item["text"] for item in batch_data]
-                    
-                    # 特定于LLaVA的处理
-                    if is_llava:
-                        # 使用LLaVA特定的处理方式
-                        inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
-                        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                    else:
-                        # 使用Qwen2-VL特定的处理方式
-                        messages_batch = [[{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}] for text in texts]
-                        prompt_batch = [processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_batch]
-                        inputs = processor(text=prompt_batch, images=images, return_tensors="pt", padding=True)
-                        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                    
-                    model(**inputs)
-                    print(f"处理批次 {i//self.args.probe_batch_size + 1}/{(len(original_data)-1)//self.args.probe_batch_size + 1}")
-        else:
-            # 处理纯文本模型
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
-            texts = ["This is a sample text for probing the model."] * self.args.probe_samples
-            probe_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-            probe_dataset = TensorDataset(probe_inputs["input_ids"], probe_inputs["attention_mask"])
-            probe_dataloader = DataLoader(probe_dataset, batch_size=self.args.probe_batch_size)
-            
-            with torch.no_grad():
-                for batch in tqdm(probe_dataloader, desc=f"前向传播 {model_info}"):
-                    input_ids, attention_mask = batch[0].to(self.device), batch[1].to(self.device)
-                    model(input_ids=input_ids, attention_mask=attention_mask)
-    
-        for h in hooks:
-            h.remove()
-    
-        # 处理和保存激活
-        averaged_activations = {}
-        for name, data in captured_activations.items():
-            averaged_activations[name] = {}
-            for act_type in ["inputs", "outputs"]:
-                if data[act_type]:
-                    try:
-                        # 尝试将所有张量转换为相同大小再取平均
-                        all_tensors = [t.float() for t in data[act_type]]
-                        
-                        # 检查是否所有张量的形状相同
-                        shapes_same = all(t.shape == all_tensors[0].shape for t in all_tensors)
-                        
-                        if shapes_same:
-                            # 形状相同时直接拼接
-                            all_tokens = torch.cat(all_tensors, dim=0)
-                        else:
-                            # 形状不同时先展平再拼接
-                            all_tokens = torch.cat([t.reshape(-1, t.shape[-1]) for t in all_tensors], dim=0)
-                            
-                        averaged_activations[name][act_type[:-1]] = torch.mean(all_tokens, dim=0)
-                    except Exception as e:
-                        print(f"处理 {name} 的 {act_type} 时出错: {e}")
-
-        torch.save(averaged_activations, cache_path)
-        del model, processor, hooks, captured_activations
-        gc.collect()
-        torch.cuda.empty_cache()
-        return averaged_activations
-
     def _cache_activations_raw(self, model_info, model_path, required_activations, dataset_raw):
-        """为每个模型从原始数据集处理数据并缓存激活。"""
+        """为每个模型从原始数据集处理数据并缓存激活（内存优化版）。"""
         cache_path = os.path.join(self.cache_dir, f"activations_{model_info}.pt")
         if os.path.exists(cache_path) and not self.args.force_recompute:
             print(f"激活缓存文件 {cache_path} 已存在, 跳过。")
@@ -285,7 +149,6 @@ class AGIDPMMerger:
         is_vision_model = "VL" in model_path or "llava" in model_path.lower()
         is_llava = "llava" in model_path.lower()
         
-        # 加载模型和处理器
         ModelClass = AutoModelForVision2Seq if is_vision_model else AutoModelForCausalLM
         model = ModelClass.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(self.device)
         processor = AutoProcessor.from_pretrained(model_path)
@@ -294,9 +157,13 @@ class AGIDPMMerger:
         model_to_hook = model.model
         target_modules = self._get_target_module_map(model_to_hook)
         
-        hooks, captured_activations = [], defaultdict(lambda: {"inputs": [], "outputs": []})
+        # 内存优化：不再存储所有张量，而是存储运行总和和计数
+        activation_stats = defaultdict(lambda: {
+            "input_sum": None, "input_tokens": 0,
+            "output_sum": None, "output_tokens": 0
+        })
     
-        # 使用带kwargs的钩子函数，更加健壮
+        # 内存优化：钩子函数直接更新总和，而不是追加到列表
         def get_hook_with_kwargs(name, req_act):
             def hook_fn(module, args, kwargs, output):
                 # 处理输出
@@ -308,9 +175,17 @@ class AGIDPMMerger:
                         out_tensor = output
                     
                     if isinstance(out_tensor, torch.Tensor):
-                        captured_activations[name]["outputs"].append(out_tensor.detach().cpu())
+                        t_float = out_tensor.detach().cpu().float()
+                        t_reshaped = t_float.view(-1, t_float.shape[-1])
+                        current_sum = torch.sum(t_reshaped, dim=0)
+                        
+                        if activation_stats[name]["output_sum"] is None:
+                            activation_stats[name]["output_sum"] = current_sum
+                        else:
+                            activation_stats[name]["output_sum"] += current_sum
+                        activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
             
-                # 处理输入 - 从kwargs和args都尝试获取
+                # 处理输入
                 if "input" in req_act:
                     in_tensor = None
                     if "hidden_states" in kwargs:
@@ -319,100 +194,73 @@ class AGIDPMMerger:
                         in_tensor = args[0]
                         
                     if isinstance(in_tensor, torch.Tensor):
-                        captured_activations[name]["inputs"].append(in_tensor.detach().cpu())
+                        t_float = in_tensor.detach().cpu().float()
+                        t_reshaped = t_float.view(-1, t_float.shape[-1])
+                        current_sum = torch.sum(t_reshaped, dim=0)
+
+                        if activation_stats[name]["input_sum"] is None:
+                            activation_stats[name]["input_sum"] = current_sum
+                        else:
+                            activation_stats[name]["input_sum"] += current_sum
+                        activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
             return hook_fn
     
-        # 注册钩子
+        hooks = []
         for name, module in target_modules.items():
             hooks.append(module.register_forward_hook(
                 get_hook_with_kwargs(name, required_activations), 
                 with_kwargs=True
             ))
     
-        # 收集原始数据样本
         original_samples = []
-        # 重置流式数据集的迭代器
         dataset_iterator = iter(dataset_raw)
         for item in dataset_iterator:
-            if len(original_samples) >= self.args.probe_samples:
-                break
-            # 保存原始PIL图像和文本
+            if len(original_samples) >= self.args.probe_samples: break
             image = item["image"]
-            if image.mode == 'RGBA': 
-                image = image.convert('RGB')
-            original_samples.append({
-                "image": image,  # 保存PIL图像
-                "text": item["question"]
-            })
+            if image.mode == 'RGBA': image = image.convert('RGB')
+            original_samples.append({"image": image, "text": item["question"]})
         
-        # 根据模型类型处理数据
         with torch.no_grad():
-            for i in range(0, len(original_samples), self.args.probe_batch_size):
+            num_batches = (len(original_samples) + self.args.probe_batch_size - 1) // self.args.probe_batch_size
+            pbar = tqdm(range(0, len(original_samples), self.args.probe_batch_size), total=num_batches, desc=f"前向传播 {model_info}")
+            for i in pbar:
                 batch_data = original_samples[i:i+self.args.probe_batch_size]
-                images = [item["image"] for item in batch_data]  # 现在是PIL图像
+                images = [item["image"] for item in batch_data]
                 texts = [item["text"] for item in batch_data]
                 
-                # 根据不同模型使用正确的处理方式
                 if is_llava:
-                    # LLaVA的处理方式 (修正)
-                    # 1. 创建对话结构
-                    conversations = [
-                        {"role": "user", "content": [{"type": "text", "text": t}, {"type": "image"}]}
-                        for t in texts
-                    ]
-                    # 2. 应用聊天模板生成带<image>占位符的提示
+                    conversations = [{"role": "user", "content": [{"type": "text", "text": t}, {"type": "image"}]} for t in texts]
                     prompts = [processor.apply_chat_template([conv], tokenize=False, add_generation_prompt=True) for conv in conversations]
-                    # 3. 将提示和图像传递给处理器
                     inputs = processor(text=prompts, images=images, return_tensors="pt", padding=True)
-
                 elif is_vision_model:
-                    # Qwen2-VL的处理方式 (修正模板顺序)
                     messages_batch = [[{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}] for text in texts]
                     prompt_batch = [processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_batch]
                     inputs = processor(text=prompt_batch, images=images, return_tensors="pt", padding=True)
                 else:
-                    # 纯文本模型处理方式
-                    # 对于纯文本模型，处理器就是分词器
                     tokenizer = processor
                     formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in texts]
                     inputs = tokenizer(text=formatted_texts, return_tensors="pt", padding=True, truncation=True)
                 
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 model(**inputs)
-                print(f"处理批次 {i//self.args.probe_batch_size + 1}/{(len(original_samples)-1)//self.args.probe_batch_size + 1}")
     
-        for h in hooks:
-            h.remove()
+        for h in hooks: h.remove()
     
-        # 处理和保存激活
+        # 内存优化：从运行总和计算最终平均值
         averaged_activations = {}
-        for name, data in captured_activations.items():
+        for name, stats in activation_stats.items():
             averaged_activations[name] = {}
-            for act_type in ["inputs", "outputs"]:
-                if data[act_type]:
-                    try:
-                        # 尝试将所有张量转换为相同大小再取平均
-                        all_tensors = [t.float() for t in data[act_type]]
-                        
-                        # 检查是否所有张量的形状相同
-                        shapes_same = all(t.shape == all_tensors[0].shape for t in all_tensors)
-                        
-                        if shapes_same:
-                            # 形状相同时直接拼接
-                            all_tokens = torch.cat(all_tensors, dim=0)
-                        else:
-                            # 形状不同时先展平再拼接
-                            all_tokens = torch.cat([t.reshape(-1, t.shape[-1]) for t in all_tensors], dim=0)
-                            
-                        averaged_activations[name][act_type[:-1]] = torch.mean(all_tokens, dim=0)
-                    except Exception as e:
-                        print(f"处理 {name} 的 {act_type} 时出错: {e}")
+            if stats["input_sum"] is not None and stats["input_tokens"] > 0:
+                averaged_activations[name]["input"] = stats["input_sum"] / stats["input_tokens"]
+            if stats["output_sum"] is not None and stats["output_tokens"] > 0:
+                averaged_activations[name]["output"] = stats["output_sum"] / stats["output_tokens"]
 
         torch.save(averaged_activations, cache_path)
-        del model, processor, hooks, captured_activations
+        del model, processor, hooks, activation_stats, averaged_activations
         gc.collect() 
         torch.cuda.empty_cache()
-        return averaged_activations
+        # 返回值是可选的，因为结果已经保存到文件了
+        # return averaged_activations
 
     def stage1_cache_all_activations(self):
         """阶段一：为所有模型分别缓存所需的激活。"""
@@ -453,20 +301,22 @@ class AGIDPMMerger:
             key_in_c = key.replace("model.language_model.", "model.")
             if not (key_in_c in weights_B and key_in_c in weights_C): continue
                 
-            module_name = ".".join(key.split('.')[2:-1]) # e.g., layers.0.mlp
-            
+            module_name = ".".join(key.split('.')[1:-1]) # e.g., layers.0.mlp
+            module_name_A = "language_model." + module_name
+            module_name_B = "language_model." + module_name
+            module_name_C = module_name
             try:
                 # 计算近似梯度
-                delta_Y_A = activations['A'][module_name]['output'] - activations['C'][module_name]['output']
-                g_approx_A = torch.outer(delta_Y_A, activations['A'][module_name]['input'])
+                delta_Y_A = activations['A'][module_name_A]['output'] - activations['C'][module_name_C]['output']
+                g_approx_A = torch.outer(delta_Y_A, activations['A'][module_name_A]['input'])
                 
-                delta_Y_B = activations['B'][module_name]['output'] - activations['C'][module_name]['output']
-                g_approx_B = torch.outer(delta_Y_B, activations['B'][module_name]['input'])
+                delta_Y_B = activations['B'][module_name_B]['output'] - activations['C'][module_name_C]['output']
+                g_approx_B = torch.outer(delta_Y_B, activations['B'][module_name_B]['input'])
                 
                 # 计算近似SNIP分数
                 W_A, W_B, W_C = weights_A[key], weights_B[key_in_c], weights_C[key_in_c]
-                snip_A = (W_A.float() * g_approx_A.T).abs()
-                snip_B = (W_B.float() * g_approx_B.T).abs()
+                snip_A = (W_A.float() * g_approx_A).abs()
+                snip_B = (W_B.float() * g_approx_B).abs()
 
                 # 选举与分离
                 k = int(snip_A.numel() * self.args.top_k_ratio)
@@ -566,7 +416,7 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="agidpm-default", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 数据集配置
     parser.add_argument('--probe_samples', type=int, default=100, help="用于引导合并的目标域样本数量。")
