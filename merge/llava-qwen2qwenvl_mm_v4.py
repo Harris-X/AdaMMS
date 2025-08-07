@@ -331,11 +331,11 @@ class FAPMMerger:
                 # 计算近似梯度并转换到频域
                 delta_Y_A = activations['A'][module_name]['output'] - activations['C'][module_name.replace("language_model.","")]['output']
                 g_approx_A = torch.outer(delta_Y_A, activations['A'][module_name]['input'])
-                fft_g_A = torch.fft.fftn(g_approx_A.T) # Transpose to match weight shape
+                fft_g_A = torch.fft.fftn(g_approx_A) # Transpose to match weight shape
 
                 delta_Y_B = activations['B'][module_name]['output'] - activations['C'][module_name.replace("language_model.","")]['output']
                 g_approx_B = torch.outer(delta_Y_B, activations['B'][module_name]['input'])
-                fft_g_B = torch.fft.fftn(g_approx_B.T)
+                fft_g_B = torch.fft.fftn(g_approx_B)
 
                 # 构建自适应滤波器
                 fft_tau_A, fft_tau_B = fft_taus['A'], fft_taus['B']
