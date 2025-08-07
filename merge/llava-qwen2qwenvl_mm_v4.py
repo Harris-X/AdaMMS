@@ -153,7 +153,7 @@ class FAPMMerger:
                 model_to_hook = model.model.language_model
         else:
             model_to_hook = model.model
-            
+
         target_modules = self._get_target_module_map(model_to_hook)
        
         # 内存优化：不再存储所有张量，而是存储运行总和和计数
@@ -319,7 +319,7 @@ class FAPMMerger:
 
         filtered_task_vectors = {}
         for key, fft_taus in tqdm(fft_task_vectors.items(), desc="自适应滤波"):
-            module_name = ".".join(key.split('.')[1:-1]) # e.g., language_model.layers.0.mlp
+            module_name = ".".join(key.split('.')[1:-1]) # e.g., layers.0.mlp
             
             try:
                 # 计算近似梯度并转换到频域

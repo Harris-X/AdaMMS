@@ -308,16 +308,13 @@ class AGIDPMMerger:
             if not (key_in_c in weights_B and key_in_c in weights_C): continue
                 
             module_name = ".".join(key.split('.')[1:-1]) # e.g., layers.0.mlp
-            module_name_A = "language_model." + module_name
-            module_name_B = "language_model." + module_name
-            module_name_C = module_name
             try:
                 # 计算近似梯度
-                delta_Y_A = activations['A'][module_name_A]['output'] - activations['C'][module_name_C]['output']
-                g_approx_A = torch.outer(delta_Y_A, activations['A'][module_name_A]['input'])
+                delta_Y_A = activations['A'][module_name]['output'] - activations['C'][module_name]['output']
+                g_approx_A = torch.outer(delta_Y_A, activations['A'][module_name]['input'])
                 
-                delta_Y_B = activations['B'][module_name_B]['output'] - activations['C'][module_name_C]['output']
-                g_approx_B = torch.outer(delta_Y_B, activations['B'][module_name_B]['input'])
+                delta_Y_B = activations['B'][module_name]['output'] - activations['C'][module_name]['output']
+                g_approx_B = torch.outer(delta_Y_B, activations['B'][module_name]['input'])
                 
                 # 计算近似SNIP分数
                 W_A, W_B, W_C = weights_A[key], weights_B[key_in_c], weights_C[key_in_c]
