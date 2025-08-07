@@ -117,73 +117,143 @@ class FAPMMerger:
         print(f"使用设备: {self.device}")
         print(f"输出将保存至: {self.output_dir}")
 
-    def _cache_activations(self, model_info, model_path, required_activations, dataloader):
+    def _cache_activations(self, model_info, model_path, required_activations, dataset_raw):
         """通用激活缓存函数（内存优化版）。"""
         cache_path = os.path.join(self.cache_dir, f"activations_{model_info}.pt")
         if os.path.exists(cache_path) and not self.args.force_recompute:
             print(f"激活缓存文件 {cache_path} 已存在, 跳过。")
-            return
+            return torch.load(cache_path, map_location="cpu")
 
         print(f"正在为 {model_info} ({os.path.basename(model_path)}) 缓存激活...")
-        ModelClass = AutoModelForVision2Seq if "VL" in model_path or "llava" in model_path.lower() else AutoModelForCausalLM
+        is_vision_model = "VL" in model_path or "llava" in model_path.lower()
+        is_llava = "llava" in model_path.lower()
+        
+        ModelClass = AutoModelForVision2Seq if is_vision_model else AutoModelForCausalLM
         model = ModelClass.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(self.device)
         processor = AutoProcessor.from_pretrained(model_path)
         model.eval()
 
         model_to_hook = model.model
-        target_modules = {name: module for name, module in model_to_hook.named_modules() if any(need_merge(f"model.{name}.{p}") for p, _ in module.named_parameters())}
-
-        activation_stats = defaultdict(lambda: {"input_sum": 0, "input_tokens": 0, "output_sum": 0, "output_tokens": 0})
-        
-        def get_hook(name, req_act):
-            def hook_fn(module, input, output):
+        target_modules = self._get_target_module_map(model_to_hook)
+       
+        # 内存优化：不再存储所有张量，而是存储运行总和和计数
+        activation_stats = defaultdict(lambda: {
+            "input_sum": None, "input_tokens": 0,
+            "output_sum": None, "output_tokens": 0
+        })
+    
+        # 内存优化：钩子函数直接更新总和，而不是追加到列表
+        def get_hook_with_kwargs(name, req_act):
+            def hook_fn(module, args, kwargs, output):
+                # 处理输出
                 if "output" in req_act:
-                    out_tensor = output[0] if isinstance(output, tuple) else output
+                    out_tensor = None
+                    if isinstance(output, tuple) and len(output) > 0:
+                        out_tensor = output[0]
+                    else:
+                        out_tensor = output
+                    
                     if isinstance(out_tensor, torch.Tensor):
-                        flat_out = out_tensor.detach().cpu().float().view(-1, out_tensor.shape[-1])
-                        activation_stats[name]["output_sum"] += torch.sum(flat_out, dim=0)
-                        activation_stats[name]["output_tokens"] += flat_out.shape[0]
+                        t_float = out_tensor.detach().cpu().float()
+                        t_reshaped = t_float.view(-1, t_float.shape[-1])
+                        current_sum = torch.sum(t_reshaped, dim=0)
+                        
+                        if activation_stats[name]["output_sum"] is None:
+                            activation_stats[name]["output_sum"] = current_sum
+                        else:
+                            activation_stats[name]["output_sum"] += current_sum
+                        activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
+            
+                # 处理输入
                 if "input" in req_act:
-                    in_tensor = input[0] if isinstance(input, tuple) else input
+                    in_tensor = None
+                    if "hidden_states" in kwargs:
+                        in_tensor = kwargs["hidden_states"]
+                    elif isinstance(args, tuple) and len(args) > 0 and isinstance(args[0], torch.Tensor):
+                        in_tensor = args[0]
+                        
                     if isinstance(in_tensor, torch.Tensor):
-                        flat_in = in_tensor.detach().cpu().float().view(-1, in_tensor.shape[-1])
-                        activation_stats[name]["input_sum"] += torch.sum(flat_in, dim=0)
-                        activation_stats[name]["input_tokens"] += flat_in.shape[0]
+                        t_float = in_tensor.detach().cpu().float()
+                        t_reshaped = t_float.view(-1, t_float.shape[-1])
+                        current_sum = torch.sum(t_reshaped, dim=0)
+
+                        if activation_stats[name]["input_sum"] is None:
+                            activation_stats[name]["input_sum"] = current_sum
+                        else:
+                            activation_stats[name]["input_sum"] += current_sum
+                        activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
             return hook_fn
 
-        hooks = [module.register_forward_hook(get_hook(name, required_activations)) for name, module in target_modules.items()]
-            
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc=f"前向传播 {model_info}"):
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                model(**batch)
-        for h in hooks: h.remove()
+        hooks = []
+        for name, module in target_modules.items():
+            hooks.append(module.register_forward_hook(
+                get_hook_with_kwargs(name, required_activations), 
+                with_kwargs=True
+            ))
+
+        original_samples = []
+        dataset_iterator = iter(dataset_raw)
+        for item in dataset_iterator:
+            if len(original_samples) >= self.args.probe_samples: break
+            image = item["image"]
+            if image.mode == 'RGBA': image = image.convert('RGB')
+            original_samples.append({"image": image, "text": item["question"]})
         
+        with torch.no_grad():
+            num_batches = (len(original_samples) + self.args.probe_batch_size - 1) // self.args.probe_batch_size
+            pbar = tqdm(range(0, len(original_samples), self.args.probe_batch_size), total=num_batches, desc=f"前向传播 {model_info}")
+            for i in pbar:
+                batch_data = original_samples[i:i+self.args.probe_batch_size]
+                images = [item["image"] for item in batch_data]
+                texts = [item["text"] for item in batch_data]
+                
+                if is_llava:
+                    conversations = [{"role": "user", "content": [{"type": "text", "text": t}, {"type": "image"}]} for t in texts]
+                    prompts = [processor.apply_chat_template([conv], tokenize=False, add_generation_prompt=True) for conv in conversations]
+                    inputs = processor(text=prompts, images=images, return_tensors="pt", padding=True)
+                elif is_vision_model:
+                    messages_batch = [[{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}] for text in texts]
+                    prompt_batch = [processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_batch]
+                    inputs = processor(text=prompt_batch, images=images, return_tensors="pt", padding=True)
+                else:
+                    tokenizer = processor
+                    formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in texts]
+                    inputs = tokenizer(text=formatted_texts, return_tensors="pt", padding=True, truncation=True)
+                
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                model(**inputs)
+    
+        for h in hooks: h.remove()
+    
+        # 内存优化：从运行总和计算最终平均值
         averaged_activations = {}
         for name, stats in activation_stats.items():
             averaged_activations[name] = {}
-            if stats["input_tokens"] > 0:
+            if stats["input_sum"] is not None and stats["input_tokens"] > 0:
                 averaged_activations[name]["input"] = stats["input_sum"] / stats["input_tokens"]
-            if stats["output_tokens"] > 0:
+            if stats["output_sum"] is not None and stats["output_tokens"] > 0:
                 averaged_activations[name]["output"] = stats["output_sum"] / stats["output_tokens"]
 
         torch.save(averaged_activations, cache_path)
-        del model, processor, hooks, activation_stats
-        gc.collect(); torch.cuda.empty_cache()
+        del model, processor, hooks, activation_stats, averaged_activations
+        gc.collect() 
+        torch.cuda.empty_cache()
+        # 返回值是可选的，因为结果已经保存到文件了
+        # return averaged_activations
 
     def stage1_cache_and_decompose(self):
         """阶段一：缓存激活，计算任务向量并进行频域分解。"""
         print("\n--- [阶段一: 激活缓存与频域分解] ---")
         
-        # 缓存激活
+        """阶段一：为所有模型分别缓存所需的激活。"""
+        print("\n--- [阶段一: 缓存所有激活] ---")
+        
+        # 直接加载原始数据集，不预先处理
         probe_dataset_raw = load_dataset("lmms-lab/VQAv2", split="validation", streaming=True)
-        dataset = VQAv2ProbeDataset(probe_dataset_raw, max_samples=self.args.probe_samples)
-        processor = AutoProcessor.from_pretrained(self.args.base_model_path)
-        dataloader = DataLoader(dataset, batch_size=self.args.probe_batch_size, collate_fn=collate_fn_factory(processor))
 
-        self._cache_activations("A", self.args.base_model_path, "input_output", dataloader)
-        self._cache_activations("B", self.args.donor_model_path, "input_output", dataloader)
-        self._cache_activations("C", self.args.original_model_path, "output", dataloader)
+        self._cache_activations("A", self.args.base_model_path, "input_output", probe_dataset_raw)
+        self._cache_activations("B", self.args.donor_model_path, "input_output", probe_dataset_raw)
+        self._cache_activations("C", self.args.original_model_path, "output", probe_dataset_raw)
 
         # 计算并分解任务向量
         fft_cache_path = os.path.join(self.cache_dir, "fft_task_vectors.pt")
@@ -335,11 +405,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="使用FAPM进行频域感知下的自适应投影合并。")
     
     # 基本配置
-    parser.add_argument('--base_model_path', type=str, default="./models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
-    parser.add_argument('--donor_model_path', type=str, default="./models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
+    parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
+    parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="fapm-default", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=1, help="使用的 CUDA 设备编号。")
 
     # 数据集配置
     parser.add_argument('--probe_samples', type=int, default=100, help="用于引导合并的目标域样本数量。")
