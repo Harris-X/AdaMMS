@@ -116,6 +116,15 @@ class FAPMMerger:
         os.makedirs(self.cache_dir, exist_ok=True)
         print(f"使用设备: {self.device}")
         print(f"输出将保存至: {self.output_dir}")
+    
+    def _get_target_module_map(self, model):
+        """获取需要hook的模块名到模块实例的映射。"""
+        module_map = {}
+        for name, module in model.named_modules():
+            # 检查是否有任何权重参数需要合并
+            if any(need_merge(f"{name}.{param_name}") for param_name, _ in module.named_parameters()):
+                module_map[name] = module
+        return module_map
 
     def _cache_activations(self, model_info, model_path, required_activations, dataset_raw):
         """通用激活缓存函数（内存优化版）。"""
