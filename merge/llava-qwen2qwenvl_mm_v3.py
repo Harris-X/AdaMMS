@@ -176,7 +176,7 @@ class AGIDPMMerger:
                     
                     if isinstance(out_tensor, torch.Tensor):
                         t_float = out_tensor.detach().cpu().float()
-                        t_reshaped = t_float.view(-1, t_float.shape[-1])
+                        t_reshaped = t_float.reshape(-1, t_float.shape[-1])
                         current_sum = torch.sum(t_reshaped, dim=0)
                         
                         if activation_stats[name]["output_sum"] is None:
@@ -195,7 +195,7 @@ class AGIDPMMerger:
                         
                     if isinstance(in_tensor, torch.Tensor):
                         t_float = in_tensor.detach().cpu().float()
-                        t_reshaped = t_float.view(-1, t_float.shape[-1])
+                        t_reshaped = t_float.reshape(-1, t_float.shape[-1])
                         current_sum = torch.sum(t_reshaped, dim=0)
 
                         if activation_stats[name]["input_sum"] is None:
@@ -418,7 +418,7 @@ if __name__ == "__main__":
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--mode', type=str, default="agidpm-default", help="为本次合并配置命名。")
+    parser.add_argument('--mode', type=str, default="agidpm-0.2", help="为本次合并配置命名。")
     parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 数据集配置
@@ -428,7 +428,7 @@ if __name__ == "__main__":
     # AGIDPM 合并超参数
     parser.add_argument('--top_k_ratio', type=float, default=0.2, help="用于选举关键神经元的Top-K比率。")
     parser.add_argument('--lambda_proj', type=float, default=1.0, help="投影（相关）分量的系数。")
-    parser.add_argument('--lambda_ortho', type=float, default=0.5, help="正交（无关）分量的系数。")
+    parser.add_argument('--lambda_ortho', type=float, default=0.4, help="正交（无关）分量的系数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或掩码。")

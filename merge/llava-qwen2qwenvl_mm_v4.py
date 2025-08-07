@@ -69,17 +69,21 @@ def normalize_llm_keys(weights_to_norm: dict, reference_keys: list) -> dict:
 
 def need_merge(name: str) -> bool:
     """根据层名判断是否需要合并 - 仅合并LLM的权重参数。"""
-    # MODIFIED: 确保只处理 language_model 内部的层权重
-    if "language_model.layers" not in name:
+    if ("language_model.layers" not in name) or ("model.layers" not in name):
+        
+        if not name.endswith(".weight"): # 只处理权重，忽略偏置等
+            return False
+
+        if "layernorm" in name or "embed_tokens" in name or "norm" in name or ".inv_freq" in name:
+            return False
+            
+        return True
+    else:
         return False
-    if not name.endswith(".weight"):
-        return False
-    if "layernorm" in name or "embed_tokens" in name or "norm" in name or ".inv_freq" in name:
-        return False
-    return True
+
 
 # --- 数据集处理函数 ---
-class VQAv2ProbeDataset(Dataset):
+class VQAv2ProbeDattaset(Dataset):
     def __init__(self, hf_dataset, max_samples=100):
         self.samples = []
         for item in hf_dataset:
@@ -183,7 +187,7 @@ class FAPMMerger:
                         
                     if isinstance(in_tensor, torch.Tensor):
                         t_float = in_tensor.detach().cpu().float()
-                        t_reshaped = t_float.view(-1, t_float.shape[-1])
+                        t_reshaped = t_float.reshape(-1, t_float.shape[-1])
                         current_sum = torch.sum(t_reshaped, dim=0)
 
                         if activation_stats[name]["input_sum"] is None:
@@ -416,7 +420,7 @@ if __name__ == "__main__":
     # 基本配置
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
-    parser.add_argument('--original_model_path', type=str, default="./models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
+    parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="fapm-default", help="为本次合并配置命名。")
     parser.add_argument('--cuda_device', type=int, default=1, help="使用的 CUDA 设备编号。")
 
