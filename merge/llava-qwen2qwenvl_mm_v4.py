@@ -146,7 +146,14 @@ class FAPMMerger:
         processor = AutoProcessor.from_pretrained(model_path)
         model.eval()
 
-        model_to_hook = model.model
+        if is_vision_model:
+            if is_llava:
+                model_to_hook = model.model.language_model
+            else:
+                model_to_hook = model.model.language_model
+        else:
+            model_to_hook = model.model
+            
         target_modules = self._get_target_module_map(model_to_hook)
        
         # 内存优化：不再存储所有张量，而是存储运行总和和计数
