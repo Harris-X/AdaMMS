@@ -301,6 +301,10 @@ class AGIDPMMerger:
         }
 
         non_conflict_masks = {}
+        if os.path.exists(mask_cache_path) and not self.args.force_recompute:
+            print(f"激活缓存文件 {mask_cache_path} 已存在, 跳过。")
+            return torch.load(mask_cache_path, map_location="cpu")
+        
         for key in tqdm(weights_A.keys(), desc="分析神经元"):
             if not need_merge(key): continue
             
@@ -356,12 +360,12 @@ class AGIDPMMerger:
         for key, mask_B in tqdm(non_conflict_masks.items(), desc="执行合并"):
             key_in_c = key.replace("model.language_model.", "model.")
             module_name = ".".join(key.split('.')[1:-1])
-            module_name_A = "language_model." + module_name
+            # module_name_A = "language_model." + module_name
             # module_name_B = "language_model." + module_name
             # module_name_C = module_name
 
             W_A, W_B, W_C = weights_A[key], weights_B[key_in_c], weights_C[key_in_c]
-            d_i = activations_A[module_name_A]['input'].to(self.device) # 投影方向
+            d_i = activations_A[module_name]['input'].to(self.device) # 投影方向
             
             tau_B = (W_B - W_C).to(self.device)
             tau_B_disjoint = tau_B * mask_B.to(self.device)

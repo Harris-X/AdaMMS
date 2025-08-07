@@ -288,6 +288,9 @@ class FAPMMerger:
         weights_B = normalize_llm_keys(weights_B_raw, list(weights_C.keys())); del weights_B_raw
 
         fft_task_vectors = {}
+        if os.path.exists(fft_cache_path) and not self.args.force_recompute:
+            print(f"激活缓存文件 {fft_cache_path} 已存在, 跳过。")
+            return torch.load(fft_cache_path, map_location="cpu")
         for key in tqdm(weights_A.keys(), desc="FFT分解"):
             if not need_merge(key): continue
             key_in_c = key.replace("model.language_model.", "model.")
@@ -318,6 +321,9 @@ class FAPMMerger:
         fft_task_vectors = torch.load(os.path.join(self.cache_dir, "fft_task_vectors.pt"))
 
         filtered_task_vectors = {}
+        if os.path.exists(filtered_tau_cache_path) and not self.args.force_recompute:
+            print(f"激活缓存文件 {filtered_tau_cache_path} 已存在, 跳过。")
+            return torch.load(filtered_tau_cache_path, map_location="cpu")
         for key, fft_taus in tqdm(fft_task_vectors.items(), desc="自适应滤波"):
             module_name = ".".join(key.split('.')[1:-1]) # e.g., layers.0.mlp
             
