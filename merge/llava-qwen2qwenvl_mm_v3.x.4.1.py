@@ -263,10 +263,11 @@ class FAPISAMerger:
         pbar = tqdm(weights_A.keys(), desc="【FA-PISAM】分析神经元")
         for key in pbar:
             if not need_merge(key): continue
-            if not (key in weights_B and key in weights_C): continue
-
-            # 统一模块名提取逻辑
-            module_name = ".".join(key.split("language_model.")[-1].split('.')[:-1])
+            
+            key_in_c = key.replace("model.language_model.", "model.")
+            if not (key_in_c in weights_B and key_in_c in weights_C): continue
+                
+            module_name = ".".join(key.split('.')[1:-1]) # e.g., layers.0.mlp
             
             try:
                 # 步骤 1: 计算目标域显著性 S_spec (来自TAG-M)
