@@ -110,7 +110,6 @@ class PISAMerger:
                 module_map[name] = module
         return module_map
     
-    # _cache_activations_raw 保持不变
     def _cache_activations_raw(self, model_info, model_path, required_activations, dataset_raw):
         """为每个模型从原始数据集处理数据并缓存激活（内存优化版）。"""
         cache_path = os.path.join(self.cache_dir, f"activations_{model_info}.pt")
@@ -120,38 +119,61 @@ class PISAMerger:
 
         print(f"正在为 {model_info} ({os.path.basename(model_path)}) 缓存激活...")
         is_vision_model = "VL" in model_path or "llava" in model_path.lower()
+        is_llava = "llava" in model_path.lower()
+        
         ModelClass = AutoModelForVision2Seq if is_vision_model else AutoModelForCausalLM
         model = ModelClass.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(self.device)
         processor = AutoProcessor.from_pretrained(model_path)
         model.eval()
 
         target_modules = self._get_target_module_map(model)
-        activation_stats = defaultdict(lambda: {"input_sum": None, "input_tokens": 0, "output_sum": None, "output_tokens": 0})
-
+        
+        activation_stats = defaultdict(lambda: {
+            "input_sum": None, "input_tokens": 0,
+            "output_sum": None, "output_tokens": 0
+        })
+    
         def get_hook_with_kwargs(name, req_act):
             def hook_fn(module, args, kwargs, output):
                 if "output" in req_act:
                     out_tensor = output[0] if isinstance(output, tuple) else output
                     if isinstance(out_tensor, torch.Tensor):
-                        t_reshaped = out_tensor.detach().cpu().float().reshape(-1, out_tensor.shape[-1])
+                        t_float = out_tensor.detach().cpu().float()
+                        t_reshaped = t_float.reshape(-1, t_float.shape[-1])
                         current_sum = torch.sum(t_reshaped, dim=0)
-                        if activation_stats[name]["output_sum"] is None: activation_stats[name]["output_sum"] = current_sum
-                        else: activation_stats[name]["output_sum"] += current_sum
+                        
+                        if activation_stats[name]["output_sum"] is None:
+                            activation_stats[name]["output_sum"] = current_sum
+                        else:
+                            activation_stats[name]["output_sum"] += current_sum
                         activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
                 
                 if "input" in req_act:
                     in_tensor = kwargs.get("hidden_states", args[0] if args and isinstance(args[0], torch.Tensor) else None)
                     if isinstance(in_tensor, torch.Tensor):
-                        t_reshaped = in_tensor.detach().cpu().float().reshape(-1, in_tensor.shape[-1])
+                        t_float = in_tensor.detach().cpu().float()
+                        t_reshaped = t_float.reshape(-1, t_float.shape[-1])
                         current_sum = torch.sum(t_reshaped, dim=0)
-                        if activation_stats[name]["input_sum"] is None: activation_stats[name]["input_sum"] = current_sum
-                        else: activation_stats[name]["input_sum"] += current_sum
+
+                        if activation_stats[name]["input_sum"] is None:
+                            activation_stats[name]["input_sum"] = current_sum
+                        else:
+                            activation_stats[name]["input_sum"] += current_sum
                         activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
             return hook_fn
-
-        hooks = [module.register_forward_hook(get_hook_with_kwargs(name, required_activations), with_kwargs=True) for name, module in target_modules.items()]
-
-        original_samples = [{"image": item["image"].convert('RGB'), "text": item["question"]} for i, item in enumerate(dataset_raw) if i < self.args.probe_samples]
+    
+        hooks = [
+            module.register_forward_hook(get_hook_with_kwargs(name, required_activations), with_kwargs=True)
+            for name, module in target_modules.items()
+        ]
+    
+        original_samples = []
+        dataset_iterator = iter(dataset_raw)
+        for item in dataset_iterator:
+            if len(original_samples) >= self.args.probe_samples: break
+            image = item["image"]
+            if image.mode == 'RGBA': image = image.convert('RGB')
+            original_samples.append({"image": image, "text": item["question"]})
         
         with torch.no_grad():
             num_batches = (len(original_samples) + self.args.probe_batch_size - 1) // self.args.probe_batch_size
@@ -161,9 +183,6 @@ class PISAMerger:
                 images = [item["image"] for item in batch_data]
                 texts = [item["text"] for item in batch_data]
                 
-                # 此处省略了与模板相同的不同模型类型prompt处理逻辑
-                # ... (same prompt handling logic as template)
-                is_llava = "llava" in model_path.lower()
                 if is_llava:
                     conversations = [{"role": "user", "content": [{"type": "text", "text": t}, {"type": "image"}]} for t in texts]
                     prompts = [processor.apply_chat_template([conv], tokenize=False, add_generation_prompt=True) for conv in conversations]
@@ -176,17 +195,19 @@ class PISAMerger:
                     tokenizer = processor
                     formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in texts]
                     inputs = tokenizer(text=formatted_texts, return_tensors="pt", padding=True, truncation=True)
-
+                
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 model(**inputs)
-    
+
         for h in hooks: h.remove()
     
         averaged_activations = {}
         for name, stats in activation_stats.items():
             averaged_activations[name] = {}
-            if stats["input_sum"] is not None: averaged_activations[name]["input"] = stats["input_sum"] / (stats["input_tokens"] + self.EPS)
-            if stats["output_sum"] is not None: averaged_activations[name]["output"] = stats["output_sum"] / (stats["output_tokens"] + self.EPS)
+            if stats["input_sum"] is not None and stats["input_tokens"] > 0:
+                averaged_activations[name]["input"] = stats["input_sum"] / stats["input_tokens"]
+            if stats["output_sum"] is not None and stats["output_tokens"] > 0:
+                averaged_activations[name]["output"] = stats["output_sum"] / stats["output_tokens"]
 
         torch.save(averaged_activations, cache_path)
         del model, processor, hooks, activation_stats, averaged_activations
