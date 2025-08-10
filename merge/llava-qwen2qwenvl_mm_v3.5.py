@@ -78,7 +78,7 @@ def normalize_llm_keys(weights_to_norm: dict, reference_keys: list) -> dict:
 
 def need_merge(name: str) -> bool:
     """根据层名判断是否需要合并 - 仅合并LLM的权重参数。"""
-    if ("language_model.layers" not in name) or ("model.layers" not in name):
+    if ("language_model.layers" in name) or ("model.layers" in name):
         
         if not name.endswith(".weight"): # 只处理权重，忽略偏置等
             return False
@@ -437,9 +437,9 @@ if __name__ == "__main__":
 
     # TAG-M 合并超参数
     parser.add_argument('--top_k_ratio', type=float, default=0.2, help="用于选举关键神经元的Top-K比率。")
-    parser.add_argument('--alpha', type=float, default=1.0, help="【TAG-M新增】平衡泰勒展开一阶和二阶项的超参数。")
+    parser.add_argument('--alpha', type=float, default=0.8, help="【TAG-M新增】平衡泰勒展开一阶和二阶项的超参数。")
     parser.add_argument('--lambda_proj', type=float, default=1.0, help="投影（相关）分量的系数。")
-    parser.add_argument('--lambda_ortho', type=float, default=0.4, help="正交（无关）分量的系数。")
+    parser.add_argument('--lambda_ortho', type=float, default=0.5, help="正交（无关）分量的系数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或掩码。")

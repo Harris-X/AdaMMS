@@ -78,7 +78,7 @@ def normalize_llm_keys(weights_to_norm: dict, reference_keys: list) -> dict:
 
 def need_merge(name: str) -> bool:
     """根据层名判断是否需要合并 - 仅合并LLM的权重参数。"""
-    if ("language_model.layers" not in name) or ("model.layers" not in name):
+    if ("language_model.layers" in name) or ("model.layers" in name):
         
         if not name.endswith(".weight"): # 只处理权重，忽略偏置等
             return False
@@ -425,7 +425,7 @@ if __name__ == "__main__":
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--mode', type=str, default="agidpm-0.2", help="为本次合并配置命名。")
+    parser.add_argument('--mode', type=str, default="agidpm-default", help="为本次合并配置命名。")
     parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 数据集配置
