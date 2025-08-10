@@ -436,10 +436,10 @@ if __name__ == "__main__":
     parser.add_argument('--probe_batch_size', type=int, default=2, help="处理引导数据时的批处理大小。")
 
     # TAG-M 合并超参数
-    parser.add_argument('--top_k_ratio', type=float, default=0.2, help="用于选举关键神经元的Top-K比率。")
+    parser.add_argument('--top_k_ratio', type=float, default=0.1, help="用于选举关键神经元的Top-K比率。")
     parser.add_argument('--alpha', type=float, default=0.8, help="【TAG-M新增】平衡泰勒展开一阶和二阶项的超参数。")
     parser.add_argument('--lambda_proj', type=float, default=1.0, help="投影（相关）分量的系数。")
-    parser.add_argument('--lambda_ortho', type=float, default=0.5, help="正交（无关）分量的系数。")
+    parser.add_argument('--lambda_ortho', type=float, default=0.4, help="正交（无关）分量的系数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或掩码。")
