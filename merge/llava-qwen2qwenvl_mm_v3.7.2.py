@@ -129,7 +129,7 @@ class IDREAMMerger:
         # 1. 加载并处理 VQA v2 (综合能力)
         if self.args.n_vqa > 0:
             print(f"从 VQA v2 加载 {self.args.n_vqa} 个样本...")
-            vqa_dataset = load_dataset("lmms-lab/VQAv2", split="train", streaming=True).shuffle(seed=42).take(self.args.n_vqa)
+            vqa_dataset = load_dataset("lmms-lab/VQAv2", split="validation", streaming=True).shuffle(seed=42).take(self.args.n_vqa)
             for item in vqa_dataset:
                 meta_probe_samples.append({"image": item["image"], "question": item["question"]})
 
@@ -151,7 +151,7 @@ class IDREAMMerger:
         if self.args.n_stvqa > 0:
             print(f"从 ST-VQA 加载 {self.args.n_stvqa} 个样本...")
             # ST-VQA 字段名为 'question', 'image'
-            stvqa_dataset = load_dataset("vikhyatk/st-vqa", split="train", streaming=True).shuffle(seed=42).take(self.args.n_stvqa)
+            stvqa_dataset = load_dataset("danjacobellis/stvqa_task1", split="train", streaming=True).shuffle(seed=42).take(self.args.n_stvqa)
             for item in stvqa_dataset:
                  meta_probe_samples.append({"image": item["image"], "question": item["question"]})
 
@@ -165,7 +165,7 @@ class IDREAMMerger:
     # #                           关键代码修改区域 (2/4)                         # #
     # ########################################################################## #
 
-    def _cache_activations_raw(self, model_info, model_path, required_activations, dataset_raw):
+    def _cache_activations_raw(self, model_info, model_path, required_activations, probe_dataset_list):
         """为每个模型从原始数据集处理数据并缓存激活（内存优化版）。"""
         cache_path = os.path.join(self.cache_dir, f"activations_{model_info}.pt")
         if os.path.exists(cache_path) and not self.args.force_recompute:
@@ -222,10 +222,9 @@ class IDREAMMerger:
             for name, module in target_modules.items()
         ]
     
+        # 直接使用传入的样本列表
         original_samples = []
-        dataset_iterator = iter(dataset_raw)
-        for item in dataset_iterator:
-            if len(original_samples) >= self.args.probe_samples: break
+        for item in probe_dataset_list:
             image = item["image"]
             if image.mode == 'RGBA': image = image.convert('RGB')
             original_samples.append({"image": image, "text": item["question"]})
@@ -319,7 +318,7 @@ class IDREAMMerger:
             if not need_merge(key): continue
             if not (key in weights_B and key in weights_C): continue
 
-            module_name = ".".join(key.split("language_model.")[-1].split('.')[:-1])
+            module_name = ".".join(key.replace("model.language_model.", "model.").split('.')[1:-1])
             
             try:
                 W_A, W_B, W_C = weights_A[key].float(), weights_B[key].float(), weights_C[key].float()
@@ -381,7 +380,7 @@ class IDREAMMerger:
             W_A, W_B, W_C = weights_A[key].float(), weights_B[key].float(), weights_C[key].float()
             M_prime_B = M_prime_B.to(self.device)
 
-            module_name = ".".join(key.split("language_model.")[-1].split('.')[:-1])
+            module_name = ".".join(key.replace("model.language_model.", "model.").split('.')[1:-1])
             
             tau_B = W_B - W_C
             tau_B_update = tau_B.to(self.device) * M_prime_B
