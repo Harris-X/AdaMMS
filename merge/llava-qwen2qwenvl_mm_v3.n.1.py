@@ -434,9 +434,6 @@ class SAMSDREAMMerger:
         
         self._save_model(final_merged_weights)
 
-        
-        self._save_model(final_merged_weights)
-
     def _save_model(self, merged_weights):
         """保存模型权重。"""
         print("\n正在保存合并后的模型...")
@@ -482,16 +479,16 @@ if __name__ == "__main__":
     parser.add_argument('--cuda_device', type=int, default=7, help="使用的 CUDA 设备编号。")
 
     # 数据集配置 (修改为元探测数据集)
-    parser.add_argument('--n_vqa', type=int, default=80, help="用于元探测集的VQA v2样本数。")
-    parser.add_argument('--n_scienceqa', type=int, default=80, help="用于元探测集的ScienceQA样本数。")
-    parser.add_argument('--n_stvqa', type=int, default=80, help="用于元探测集的ST-VQA样本数。")
+    parser.add_argument('--n_vqa', type=int, default=100, help="用于元探测集的VQA v2样本数。")
+    parser.add_argument('--n_scienceqa', type=int, default=100, help="用于元探测集的ScienceQA样本数。")
+    parser.add_argument('--n_stvqa', type=int, default=100, help="用于元探测集的ST-VQA样本数。")
     parser.add_argument('--probe_batch_size', type=int, default=2, help="处理引导数据时的批处理大小。")
 
     # I-DREAM 合并超参数
-    parser.add_argument('--top_k_ratio', type=float, default=0.2, help="【阶段二】用于选举关键神经元的Top-K比率。")
-    parser.add_argument('--alpha', type=float, default=0.8, help="【阶段二】夏普斯惩罚系数，控制对高曲率区域的惩罚力度。")
+    parser.add_argument('--top_k_ratio', type=float, default=0.1, help="【阶段二】用于选举关键神经元的Top-K比率。")
+    parser.add_argument('--alpha', type=float, default=0.4, help="【阶段二】夏普斯惩罚系数，控制对高曲率区域的惩罚力度。")
     parser.add_argument('--lambda_proj', type=float, default=1.0, help="【阶段三】投影（相关）分量的合并系数。")
-    parser.add_argument('--lambda_ortho', type=float, default=0.4, help="【阶段三】正交（无关）分量的合并系数，保护泛化性。")
+    parser.add_argument('--lambda_ortho', type=float, default=0.7, help="【阶段三】正交（无关）分量的合并系数，保护泛化性。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的数据。")
