@@ -450,11 +450,11 @@ class AMetaDREAMMerger:
                 tau_A_ortho, tau_B_prime_ortho = tau_A, tau_B_prime
             else:
                 # 同时分解 tau_A 和 tau_B_prime
-                proj_scalar_A = (tau_A.flatten() @ d_i.flatten()) / d_i_norm_sq
+                proj_scalar_A = (tau_A @ d_i) / d_i_norm_sq
                 tau_A_proj = torch.outer(proj_scalar_A, d_i) if tau_A.ndim > 1 else proj_scalar_A * d_i
                 tau_A_ortho = tau_A - tau_A_proj
 
-                proj_scalar_B = (tau_B_prime.flatten() @ d_i.flatten()) / d_i_norm_sq
+                proj_scalar_B = (tau_B_prime @ d_i) / d_i_norm_sq
                 tau_B_prime_proj = torch.outer(proj_scalar_B, d_i) if tau_B_prime.ndim > 1 else proj_scalar_B * d_i
                 tau_B_prime_ortho = tau_B_prime - tau_B_prime_proj
 
