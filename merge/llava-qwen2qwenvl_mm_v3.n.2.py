@@ -532,7 +532,6 @@ if __name__ == "__main__":
     parser.add_argument('--n_vqa', type=int, default=50, help="用于元探测集的VQA v2样本数。")
     parser.add_argument('--n_scienceqa', type=int, default=50, help="用于元探测集的ScienceQA样本数。")
     parser.add_argument('--n_stvqa', type=int, default=50, help="用于元探测集的ST-VQA样本数。")
-    parser.add_argument('--probe_samples', type=int, default=100, help="用于引导合并的目标域样本数量。")
     parser.add_argument('--probe_batch_size', type=int, default=2, help="处理引导数据时的批处理大小。")
 
     # A-Meta-DREAM 合并超参数
