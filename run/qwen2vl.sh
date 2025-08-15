@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-#                  mplug-owl2-llama2-7b 模型评测脚本 (最终修正版)
+#                  mplug-owl2-llama2-7b 模型评测脚本 (最终修正版 v2)
 # ==============================================================================
 
 # --- 1. 基本设置 ---
-GPU=7                     # 设置要使用的 GPU ID
+GPU=0                     # 设置要使用的 GPU ID
 # 模型路径现在已在 config.py 中设置，此处仅作记录
-MODEL_PATH="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct"
-EVAL_DIR="/home/user/xieqiuhao/AdaMMS/mplug_owl2_eval_results"  # 评测结果保存目录
+MODEL_PATH="/home/user/xieqiuhao/AdaMMS/downloaded_models/mplug-owl2-llama2-7b"
+EVAL_DIR="./mplug_owl2_eval_results"  # 评测结果保存目录
 VLMKIT_DIR="/home/user/xieqiuhao/AdaMMS/VLMEvalKit"  # VLMEvalKit 目录
 
 # 检查模型路径是否存在
@@ -19,6 +19,7 @@ fi
 
 # --- 2. 评测任务列表 ---
 TASK_LIST="MMMU_DEV_VAL MME SEEDBench_IMG OCRBench TextVQA_VAL GQA_TestDev_Balanced VizWiz"
+
 
 # --- 3. 环境准备 ---
 echo "--- 准备环境和目录 ---"
@@ -38,14 +39,13 @@ SECONDS=0
 # --- 4. 进入VLMEvalKit目录并运行评测 ---
 cd $VLMKIT_DIR
 
-# 确保 transformers 版本兼容 mPLUG-Owl2
-# 根据文档，推荐使用 4.33.0
-pip install transformers==4.31.0
+# 修正：确保安装 mplug-owl2 所需的、且唯一的 transformers 版本
+echo "--- 正在检查并设置正确的 transformers 版本 (4.33.0) ---"
+pip install transformers==4.33.0 --force-reinstall
 
 for task in $TASK_LIST; do
     echo "--- 正在评测任务: $task ---"
     
-    # 最终修正：移除无效的 --model-path 参数。
     # run.py 会自动从 config.py 中读取 'mPLUG-Owl2' 的路径。
     python run.py \
         --data $task \
