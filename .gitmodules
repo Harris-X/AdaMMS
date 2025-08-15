@@ -1,0 +1,9 @@
+[submodule "VLMEvalKit"]
+	path = VLMEvalKit
+	url = ./VLMEvalKit
+[submodule "lmms-eval"]
+	path = lmms-eval
+	url = ./lmms-eval/
+[submodule "mPLUG-Owl"]
+	path = mPLUG-Owl
+	url = ./mPLUG-Owl/
