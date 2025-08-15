@@ -5,10 +5,10 @@
 # ==============================================================================
 
 # --- 1. 基本设置 (请根据你的环境修改) ---
-GPU=4 # 请设置为你希望使用的 GPU ID
+GPU=5 # 请设置为你希望使用的 GPU ID 6 
 PORT=29517 # 建议为每个独立脚本使用不同端口，避免冲突
-MODEL_PATH="/home/user/xieqiuhao/AdaMMS/merged_models/qwen-merged-interpolation-a0.5" # <--- 在这里设置你要评测的模型路径
-EVAL_BASE="./eval_results_single_run" # 评测结果的根目录
+MODEL_PATH="/home/user/xieqiuhao/AdaMMS/merged_models/idream-sams-dream-0.3-0.75" # <--- 在这里设置你要评测的模型路径 merged_models/grafted-s1.0-c0.0
+EVAL_BASE="./eval_results_single_run" # 评测结果的根目录 
 
 # 检查模型路径是否存在
 if [ ! -d "$MODEL_PATH" ]; then
@@ -18,8 +18,8 @@ fi
 
 # --- 2. 评测任务列表 ---
 # 根据需要取消注释或添加任务
-# 完整任务列表参考: textvqa_val vizwiz_vqa_val gqa mme seedbench ok_vqa ocrbench mmmu_val
-TASK_LIST="ok_vqa mme mmmu_val"
+# 完整任务列表参考:ok_vqa  textvqa_val vizwiz_vqa_val gqa mme seedbench ocrbench mmmu_val
+TASK_LIST="mme mmmu_val ocrbench textvqa_val vizwiz_vqa_val ok_vqa gqa seedbench  "
 
 # --- 3. 环境准备 ---
 echo "--- Preparing environment and directories ---"
