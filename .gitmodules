@@ -1,9 +1,9 @@
 [submodule "VLMEvalKit"]
 	path = VLMEvalKit
-	url = ./VLMEvalKit
+	url = https://github.com/open-compass/VLMEvalKit
 [submodule "lmms-eval"]
 	path = lmms-eval
 	url = https://github.com/EvolvingLMMs-Lab/lmms-eval
 [submodule "mPLUG-Owl"]
 	path = mPLUG-Owl
-	url = ./mPLUG-Owl/
+	url = https://github.com/X-PLUG/mPLUG-Owl
