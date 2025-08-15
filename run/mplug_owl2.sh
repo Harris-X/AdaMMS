@@ -41,7 +41,7 @@ cd $VLMKIT_DIR
 
 # 修正：确保安装 mplug-owl2 所需的、且唯一的 transformers 版本
 echo "--- 正在检查并设置正确的 transformers 版本 (4.33.0) ---"
-pip install transformers==4.33.0 --force-reinstall
+pip install transformers==4.33.0
 
 for task in $TASK_LIST; do
     echo "--- 正在评测任务: $task ---"

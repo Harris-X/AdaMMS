@@ -5,10 +5,10 @@
 # ==============================================================================
 
 # --- 1. 基本设置 ---
-GPU=0                     # 设置要使用的 GPU ID
+GPU=6                     # 设置要使用的 GPU ID
 # 模型路径现在已在 config.py 中设置，此处仅作记录
-MODEL_PATH="/home/user/xieqiuhao/AdaMMS/downloaded_models/mplug-owl2-llama2-7b"
-EVAL_DIR="./mplug_owl2_eval_results"  # 评测结果保存目录
+MODEL_PATH="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct"
+EVAL_DIR="/home/user/xieqiuhao/AdaMMS/eval_results_single_run/Qwen2-VL-7B-Instruct_eval_results"  # 评测结果保存目录
 VLMKIT_DIR="/home/user/xieqiuhao/AdaMMS/VLMEvalKit"  # VLMEvalKit 目录
 
 # 检查模型路径是否存在
@@ -41,7 +41,7 @@ cd $VLMKIT_DIR
 
 # 修正：确保安装 mplug-owl2 所需的、且唯一的 transformers 版本
 echo "--- 正在检查并设置正确的 transformers 版本 (4.33.0) ---"
-pip install transformers==4.33.0 --force-reinstall
+pip install transformers==4.33.0 
 
 for task in $TASK_LIST; do
     echo "--- 正在评测任务: $task ---"
