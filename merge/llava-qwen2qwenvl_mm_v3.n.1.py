@@ -79,7 +79,7 @@ def need_merge(name: str) -> bool:
     is_in_llm_layers = "language_model.layers" in name or "model.layers" in name
     if not is_in_llm_layers: return False
     if not name.endswith(".weight"): return False
-    if "layernorm" in name or "embed_tokens" in name or "norm" in name or ".inv_freq" in name: return False
+    if ".inv_freq" in name: return False # "layernorm" in name or "embed_tokens" in name or "norm" in name or 
     return True
 
 # --- 核心实现类 ---
@@ -579,8 +579,8 @@ if __name__ == "__main__":
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--mode', type=str, default="sams-dream-final", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=5, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--mode', type=str, default="sams-dream-0.3-0.8-norm", help="为本次合并配置命名。")
+    parser.add_argument('--cuda_device', type=int, default=6, help="使用的 CUDA 设备编号。")
 
     # 数据集配置 (修改为元探测数据集)
     parser.add_argument('--n_mmbench', type=int, default=40, help="用于元探测集的MMBench样本数。")
@@ -589,13 +589,13 @@ if __name__ == "__main__":
     parser.add_argument('--n_vqa', type=int, default=50, help="用于元探测集的VQA v2样本数。")
     parser.add_argument('--n_scienceqa', type=int, default=50, help="用于元探测集的ScienceQA样本数。")
     parser.add_argument('--n_stvqa', type=int, default=50, help="用于元探测集的ST-VQA样本数。")
-    parser.add_argument('--probe_batch_size', type=int, default=2, help="处理引导数据时的批处理大小。")
+    parser.add_argument('--probe_batch_size', type=int, default=1, help="处理引导数据时的批处理大小。")
 
     # I-DREAM 合并超参数
     parser.add_argument('--top_k_ratio', type=float, default=0.1, help="【阶段二】用于选举关键神经元的Top-K比率。")
     parser.add_argument('--alpha', type=float, default=0.3, help="【阶段二】夏普斯惩罚系数，控制对高曲率区域的惩罚力度。")
     parser.add_argument('--lambda_proj', type=float, default=1.0, help="【阶段三】投影（相关）分量的合并系数。")
-    parser.add_argument('--lambda_ortho', type=float, default=0.7, help="【阶段三】正交（无关）分量的合并系数，保护泛化性。")
+    parser.add_argument('--lambda_ortho', type=float, default=0.8, help="【阶段三】正交（无关）分量的合并系数，保护泛化性。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的数据。")
