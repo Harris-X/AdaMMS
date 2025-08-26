@@ -587,23 +587,48 @@ class SAMSDREAMMerger:
                 # 非预期形状
                 continue
 
-            # --- 改进的正交分量合并 ---
-            # 计算 W_A 和 tau_ortho 的平坦化版本
-            W_A_flat = W_A.to(self.device).flatten()
-            tau_ortho_flat = tau_ortho.flatten()
+            # --- 改进的正交分量合并 (V2: 基于功能性安全) ---
+            W_A_device = W_A.to(self.device)
             
-            # 计算安全因子 S
-            # 使用 torch.nn.functional.cosine_similarity
-            cos_sim = torch.nn.functional.cosine_similarity(W_A_flat, tau_ortho_flat, dim=0, eps=self.EPS)
+            # 获取用于计算功能性差异的激活
+            # 对于权重，我们关心它对输入的作用，得到输出
+            # 对于偏置，它直接作用于输出
+            if W_A.ndim == 2 and key.endswith(".weight"):
+                # 使用输入激活来评估功能性差异
+                d_i = activations_A[module_name]['input'].to(self.device).float()
+                Y_A = W_A_device @ d_i
+                delta_Y = tau_ortho @ d_i
+            elif W_A.ndim == 1 and key.endswith(".bias"):
+                # 使用输出激活来评估功能性差异
+                Y_A = activations_A[module_name]['output'].to(self.device).float()
+                delta_Y = tau_ortho # bias 的增量直接加在输出上
+            else:
+                # 对于未知类型，使用保守的参数空间相似度
+                cos_sim = torch.nn.functional.cosine_similarity(W_A_device.flatten(), tau_ortho.flatten(), dim=0, eps=self.EPS)
+                safety_factor = (cos_sim.abs() ** beta_safety).clamp(0.0, 1.0)
+                adaptive_lambda_ortho = self.args.lambda_ortho * safety_factor
+                W_star = W_A_device + self.args.lambda_proj * tau_proj + adaptive_lambda_ortho * tau_ortho
+                final_merged_weights[key] = W_star.cpu().to(weights_A[key].dtype)
+                continue
+
+            # 计算相对扰动
+            norm_Y_A = torch.linalg.norm(Y_A)
+            norm_delta_Y = torch.linalg.norm(delta_Y)
             
-            # 安全因子 S: 相似度越高，S 越接近1，合并得越多。相似度越低，S 越接近0，合并得越少。
-            safety_factor = (cos_sim.abs() ** beta_safety).clamp(0.0, 1.0)
+            if norm_Y_A > self.EPS:
+                # 扰动越大，安全因子越小
+                relative_disturbance = (norm_delta_Y / norm_Y_A).clamp(0.0, 1.0)
+                # 使用 beta 次方来调整敏感度
+                safety_factor = (1 - relative_disturbance) ** beta_safety
+            else:
+                # 如果原始输出几乎为零，则不进行正交合并
+                safety_factor = 0.0
             
             # 自适应的正交合并系数
             adaptive_lambda_ortho = self.args.lambda_ortho * safety_factor
 
             # 最终合并公式
-            W_star = W_A.to(self.device) + self.args.lambda_proj * tau_proj + adaptive_lambda_ortho * tau_ortho
+            W_star = W_A_device + self.args.lambda_proj * tau_proj + adaptive_lambda_ortho * tau_ortho
             final_merged_weights[key] = W_star.cpu().to(weights_A[key].dtype)
 
         # Part 2: 其余参数 (含 norm) 的保守加权平均
