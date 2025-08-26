@@ -304,36 +304,55 @@ class SAMSDREAMMerger:
         
         activation_stats = defaultdict(lambda: {
             "input_sum": None, "input_tokens": 0,
-            "output_sum": None, "output_tokens": 0
+            "output_sum": None, "output_tokens": 0,
+            "input_samples": [],   # 新增：少量输入方向样本
+            "output_samples": []   # 新增：少量输出方向样本
         })
     
         def get_hook_with_kwargs(name, req_act):
             def hook_fn(module, args, kwargs, output):
+                max_dirs = getattr(self.args, "probe_directions", 8)
+
                 if "output" in req_act:
                     out_tensor = output[0] if isinstance(output, tuple) else output
                     if isinstance(out_tensor, torch.Tensor):
                         t_float = out_tensor.detach().cpu().float()
                         t_reshaped = t_float.reshape(-1, t_float.shape[-1])
                         current_sum = torch.sum(t_reshaped, dim=0)
-                        
+                        # 累加平均
                         if activation_stats[name]["output_sum"] is None:
                             activation_stats[name]["output_sum"] = current_sum
                         else:
                             activation_stats[name]["output_sum"] += current_sum
                         activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
-                
+                        # 采样一个方向（该批的均值作为一个方向）
+                        if len(activation_stats[name]["output_samples"]) < max_dirs:
+                            activation_stats[name]["output_samples"].append(t_reshaped.mean(dim=0))
+                        else:
+                            # 水塘抽样，保持多样性
+                            j = random.randint(0, activation_stats[name]["output_tokens"])
+                            if j < max_dirs:
+                                activation_stats[name]["output_samples"][j] = t_reshaped.mean(dim=0)
+
                 if "input" in req_act:
                     in_tensor = kwargs.get("hidden_states", args[0] if args and isinstance(args[0], torch.Tensor) else None)
                     if isinstance(in_tensor, torch.Tensor):
                         t_float = in_tensor.detach().cpu().float()
                         t_reshaped = t_float.reshape(-1, t_float.shape[-1])
                         current_sum = torch.sum(t_reshaped, dim=0)
-
+                        # 累加平均
                         if activation_stats[name]["input_sum"] is None:
                             activation_stats[name]["input_sum"] = current_sum
                         else:
                             activation_stats[name]["input_sum"] += current_sum
                         activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
+                        # 采样一个方向（该批的均值作为一个方向）
+                        if len(activation_stats[name]["input_samples"]) < max_dirs:
+                            activation_stats[name]["input_samples"].append(t_reshaped.mean(dim=0))
+                        else:
+                            j = random.randint(0, activation_stats[name]["input_tokens"])
+                            if j < max_dirs:
+                                activation_stats[name]["input_samples"][j] = t_reshaped.mean(dim=0)
             return hook_fn
     
         hooks = [
@@ -381,6 +400,11 @@ class SAMSDREAMMerger:
                 averaged_activations[name]["input"] = stats["input_sum"] / stats["input_tokens"]
             if stats["output_sum"] is not None and stats["output_tokens"] > 0:
                 averaged_activations[name]["output"] = stats["output_sum"] / stats["output_tokens"]
+            # 保存样本方向（若存在）
+            if len(stats["input_samples"]) > 0:
+                averaged_activations[name]["input_samples"] = torch.stack(stats["input_samples"], dim=0)
+            if len(stats["output_samples"]) > 0:
+                averaged_activations[name]["output_samples"] = torch.stack(stats["output_samples"], dim=0)
 
         torch.save(averaged_activations, cache_path)
         del model, processor, hooks, activation_stats, averaged_activations
@@ -535,7 +559,9 @@ class SAMSDREAMMerger:
         final_merged_weights = weights_A.copy()
         
         # 新增：安全合并的超参数
-        beta_safety = getattr(self.args, "beta_safety", 2.0) # 控制安全因子的敏感度
+        beta_safety = getattr(self.args, "beta_safety", 2.0)
+        rho_max = getattr(self.args, "rho_ortho_max_ratio", 0.5)  # 正交/投影 规模上限
+        delta_mode = getattr(self.args, "delta_mode", "delta")    # 'delta' 使用 W_B-W_C, 'direct' 使用 W_B
 
         pbar = tqdm(disjoint_masks.items(), desc="【SAM-S-DREAM】执行重投影融合")
         processed_keys = set()
@@ -548,86 +574,93 @@ class SAMSDREAMMerger:
             M_prime_B = M_prime_B.to(self.device)
 
             module_name = ".".join(key.replace("model.language_model.", "model.").split('.')[1:-1])
-            tau_B = (W_B - W_C).to(self.device)
+            tau_B = (W_B - W_C).to(self.device) if delta_mode == "delta" else W_B.to(self.device)
             tau_B_update = tau_B * M_prime_B.to(self.device)
 
             if W_A.ndim == 2 and key.endswith(".weight"):
-                # 2D：沿输入激活投影
-                d_i = activations_A[module_name]['input'].to(self.device).float()
-                d_i_norm_sq = torch.sum(d_i * d_i)
-                if d_i_norm_sq > self.EPS:
-                    proj_scalar = (tau_B_update @ d_i) / d_i_norm_sq
-                    tau_proj = torch.outer(proj_scalar, d_i)
+                # --- 多方向投影：基于输入子空间 D_in ---
+                D_in = None
+                if module_name in activations_A and "input_samples" in activations_A[module_name]:
+                    D_in = activations_A[module_name]["input_samples"].to(self.device).float()  # [m, in_dim]
+                elif module_name in activations_A and "input" in activations_A[module_name]:
+                    D_in = activations_A[module_name]["input"].unsqueeze(0).to(self.device).float()  # [1, in_dim]
+
+                if D_in is not None:
+                    # 构造投影矩阵 P = D^T (D D^T)^+ D
+                    G = D_in @ D_in.T + self.EPS * torch.eye(D_in.shape[0], device=self.device)
+                    P_cols = D_in.T @ torch.linalg.pinv(G) @ D_in      # [in_dim, in_dim]
+                    tau_proj = tau_B_update @ P_cols                    # 每行向量投影到 span(D_in)
                     tau_ortho = tau_B_update - tau_proj
                 else:
-                    tau_proj = torch.zeros_like(tau_B_update)
-                    tau_ortho = tau_B_update
-
-            elif W_A.ndim == 1 and key.endswith(".bias"):
-                # 1D bias：沿输出差分方向投影（g_bias = Y_B - Y_C）
-                out_B = activations_B.get(module_name, {}).get('output', None)
-                out_C = activations_C.get(module_name, {}).get('output', None)
-                if out_B is None or out_C is None:
-                    # 回退：若方向缺失，使用简单加权更新已掩码的分量
-                    tau_proj = torch.zeros_like(tau_B_update)
-                    tau_ortho = tau_B_update
-                else:
-                    g_dir = (out_B - out_C).to(self.device).float()
-                    g_norm_sq = torch.sum(g_dir * g_dir)
-                    if g_norm_sq > self.EPS:
-                        proj_scalar = torch.sum(tau_B_update * g_dir) / g_norm_sq
-                        tau_proj = proj_scalar * g_dir
-                        # 仅在被掩码的位置更新；未掩码位置置零
-                        tau_proj = tau_proj * M_prime_B
+                    # 回退到单方向
+                    d_i = activations_A[module_name]['input'].to(self.device).float()
+                    d_i_norm_sq = torch.sum(d_i * d_i)
+                    if d_i_norm_sq > self.EPS:
+                        proj_scalar = (tau_B_update @ d_i) / d_i_norm_sq
+                        tau_proj = torch.outer(proj_scalar, d_i)
                         tau_ortho = tau_B_update - tau_proj
                     else:
                         tau_proj = torch.zeros_like(tau_B_update)
                         tau_ortho = tau_B_update
-            else:
-                # 非预期形状
-                continue
 
-            # --- 改进的正交分量合并 (V2: 基于功能性安全) ---
-            W_A_device = W_A.to(self.device)
-            
-            # 获取用于计算功能性差异的激活
-            # 对于权重，我们关心它对输入的作用，得到输出
-            # 对于偏置，它直接作用于输出
-            if W_A.ndim == 2 and key.endswith(".weight"):
-                # 使用输入激活来评估功能性差异
-                d_i = activations_A[module_name]['input'].to(self.device).float()
-                Y_A = W_A_device @ d_i
-                delta_Y = tau_ortho @ d_i
             elif W_A.ndim == 1 and key.endswith(".bias"):
-                # 使用输出激活来评估功能性差异
-                Y_A = activations_A[module_name]['output'].to(self.device).float()
-                delta_Y = tau_ortho # bias 的增量直接加在输出上
+                # --- 多方向投影：基于输出子空间 D_out ---
+                D_out = None
+                if module_name in activations_B and "output_samples" in activations_B[module_name] and \
+                   module_name in activations_C and "output_samples" in activations_C[module_name]:
+                    # 使用 B-C 的输出方向作为子空间（保留B相对C的变化子空间）
+                    D_out = (activations_B[module_name]["output_samples"] - 
+                             activations_C[module_name]["output_samples"]).to(self.device).float()  # [m, out_dim]
+                elif module_name in activations_B and "output" in activations_B[module_name] and \
+                     module_name in activations_C and "output" in activations_C[module_name]:
+                    D_out = (activations_B[module_name]["output"] - 
+                             activations_C[module_name]["output"]).unsqueeze(0).to(self.device).float()  # [1, out_dim]
+                
+                if D_out is not None:
+                    G = D_out @ D_out.T + self.EPS * torch.eye(D_out.shape[0], device=self.device)
+                    P_rows = D_out.T @ torch.linalg.pinv(G) @ D_out      # [out_dim, out_dim]
+                    tau_proj = P_rows @ tau_B_update                     # 将向量投影到 span(D_out)
+                    tau_ortho = tau_B_update - tau_proj
+                else:
+                    tau_proj = torch.zeros_like(tau_B_update)
+                    tau_ortho = tau_B_update
             else:
-                # 对于未知类型，使用保守的参数空间相似度
-                cos_sim = torch.nn.functional.cosine_similarity(W_A_device.flatten(), tau_ortho.flatten(), dim=0, eps=self.EPS)
-                safety_factor = (cos_sim.abs() ** beta_safety).clamp(0.0, 1.0)
-                adaptive_lambda_ortho = self.args.lambda_ortho * safety_factor
-                W_star = W_A_device + self.args.lambda_proj * tau_proj + adaptive_lambda_ortho * tau_ortho
-                final_merged_weights[key] = W_star.cpu().to(weights_A[key].dtype)
                 continue
 
-            # 计算相对扰动
-            norm_Y_A = torch.linalg.norm(Y_A)
-            norm_delta_Y = torch.linalg.norm(delta_Y)
-            
-            if norm_Y_A > self.EPS:
-                # 扰动越大，安全因子越小
-                relative_disturbance = (norm_delta_Y / norm_Y_A).clamp(0.0, 1.0)
-                # 使用 beta 次方来调整敏感度
-                safety_factor = (1 - relative_disturbance) ** beta_safety
+            # --- 信任域：限制正交增量规模 ---
+            proj_norm = torch.linalg.norm(tau_proj)
+            ortho_norm = torch.linalg.norm(tau_ortho)
+            if proj_norm > self.EPS and ortho_norm > self.EPS:
+                scale_cap = (rho_max * proj_norm / (ortho_norm + self.EPS)).clamp(max=1.0)
+                tau_ortho = tau_ortho * scale_cap
+
+            # --- 功能性安全因子（多样本） ---
+            W_A_device = W_A.to(self.device)
+            if W_A.ndim == 2 and key.endswith(".weight") and D_in is not None:
+                # 基函数：输出扰动矩阵
+                Y_A_mat = W_A_device @ D_in.T                   # [out, m]
+                dY_mat  = tau_ortho @ D_in.T                   # [out, m]
+                den = torch.linalg.norm(Y_A_mat)
+                rel = (torch.linalg.norm(dY_mat) / (den + self.EPS)).clamp(0.0, 1.0)
+                safety_factor = (1 - rel) ** beta_safety
+            elif W_A.ndim == 1 and key.endswith(".bias"):
+                # 偏置：对每个样本都加同一向量，等价于 sqrt(m) 放大
+                m = D_out.shape[0] if (D_out is not None) else 1
+                dY_norm = (torch.linalg.norm(tau_ortho) * (m ** 0.5))
+                # 近似基准：用 A 的输出均值向量
+                if module_name in activations_A and "output" in activations_A[module_name]:
+                    Y_A = activations_A[module_name]["output"].to(self.device).float()
+                    den = (torch.linalg.norm(Y_A) * (m ** 0.5))
+                else:
+                    den = torch.tensor(1.0, device=self.device)
+                rel = (dY_norm / (den + self.EPS)).clamp(0.0, 1.0)
+                safety_factor = (1 - rel) ** beta_safety
             else:
-                # 如果原始输出几乎为零，则不进行正交合并
+                # 回退：不使用参数余弦，直接保守缩放
                 safety_factor = 0.0
-            
-            # 自适应的正交合并系数
+
             adaptive_lambda_ortho = self.args.lambda_ortho * safety_factor
 
-            # 最终合并公式
             W_star = W_A_device + self.args.lambda_proj * tau_proj + adaptive_lambda_ortho * tau_ortho
             final_merged_weights[key] = W_star.cpu().to(weights_A[key].dtype)
 
@@ -687,7 +720,7 @@ class SAMSDREAMMerger:
 
     def run_pipeline(self):
         """按顺序执行所有阶段。"""
-        # self.stage1_cache_all_activations()
+        self.stage1_cache_all_activations()
         self.stage2_regularized_disjoint_mask_generation()
         self.stage3_disentangled_reprojection_fusion()
 
@@ -706,7 +739,7 @@ if __name__ == "__main__":
     parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 数据集配置 (修改为元探测数据集)
-    parser.add_argument('--n_mmbench', type=int, default=10, help="用于元探测集的MMBench样本数。")
+    parser.add_argument('--n_mmbench', type=int, default=40, help="用于元探测集的MMBench样本数。")
     parser.add_argument('--n_vcr', type=int, default=0, help="用于元探测集的VCR样本数。")
     parser.add_argument('--n_docvqa', type=int, default=10, help="用于元探测集的DocVQA样本数。")
     parser.add_argument('--n_vqa', type=int, default=50, help="用于元探测集的VQA v2样本数。")
@@ -719,8 +752,11 @@ if __name__ == "__main__":
     parser.add_argument('--alpha', type=float, default=0.1, help="【阶段二】夏普斯惩罚系数，控制对高曲率区域的惩罚力度。")
     parser.add_argument('--lambda_proj', type=float, default=1.0, help="【阶段三】投影（相关）分量的合并系数。")
     parser.add_argument('--lambda_ortho', type=float, default=0.8, help="【阶段三】正交（无关）分量的基础合并系数。")
-    parser.add_argument('--beta_safety', type=float, default=2.0, help="【阶段三】正交分量安全合并的敏感度系数。") # <--- 新增
+    parser.add_argument('--beta_safety', type=float, default=2.0, help="【阶段三】正交分量安全合并的敏感度系数。")
     parser.add_argument('--lambda_norm', type=float, default=0.0, help="norm 参数的加权平均系数（不走梯度合并）。")
+    parser.add_argument('--probe_directions', type=int, default=8, help="每层缓存的输入/输出方向样本数，用于多方向投影。")  # 新增
+    parser.add_argument('--rho_ortho_max_ratio', type=float, default=0.5, help="正交增量相对投影增量的最大规模比。")        # 新增
+    parser.add_argument('--delta_mode', type=str, default='delta', choices=['delta','direct'], help="delta=使用W_B-W_C；direct=使用W_B。")  # 新增
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的数据。")
