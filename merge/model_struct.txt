@@ -1,0 +1,123 @@
+正在为 Qwen2-VL-7B-Instruct 缓存激活...
+Loading checkpoint shards: 100%|██████████████████████████████████████████████████████████████████████████| 5/5 [00:00<00:00, 58.63it/s]
+Qwen2VLForConditionalGeneration(
+  (model): Qwen2VLModel(
+    (visual): Qwen2VisionTransformerPretrainedModel(
+      (patch_embed): PatchEmbed(
+        (proj): Conv3d(3, 1280, kernel_size=(2, 14, 14), stride=(2, 14, 14), bias=False)
+      )
+      (rotary_pos_emb): VisionRotaryEmbedding()
+      (blocks): ModuleList(
+        (0-31): 32 x Qwen2VLVisionBlock(
+          (norm1): LayerNorm((1280,), eps=1e-06, elementwise_affine=True)
+          (norm2): LayerNorm((1280,), eps=1e-06, elementwise_affine=True)
+          (attn): VisionSdpaAttention(
+            (qkv): Linear(in_features=1280, out_features=3840, bias=True)
+            (proj): Linear(in_features=1280, out_features=1280, bias=True)
+          )
+          (mlp): VisionMlp(
+            (fc1): Linear(in_features=1280, out_features=5120, bias=True)
+            (act): QuickGELUActivation()
+            (fc2): Linear(in_features=5120, out_features=1280, bias=True)
+          )
+        )
+      )
+      (merger): PatchMerger(
+        (ln_q): LayerNorm((1280,), eps=1e-06, elementwise_affine=True)
+        (mlp): Sequential(
+          (0): Linear(in_features=5120, out_features=5120, bias=True)
+          (1): GELU(approximate='none')
+          (2): Linear(in_features=5120, out_features=3584, bias=True)
+        )
+      )
+    )
+    (language_model): Qwen2VLTextModel(
+      (embed_tokens): Embedding(152064, 3584)
+      (layers): ModuleList(
+        (0-27): 28 x Qwen2VLDecoderLayer(
+          (self_attn): Qwen2VLSdpaAttention(
+            (q_proj): Linear(in_features=3584, out_features=3584, bias=True)
+            (k_proj): Linear(in_features=3584, out_features=512, bias=True)
+            (v_proj): Linear(in_features=3584, out_features=512, bias=True)
+            (o_proj): Linear(in_features=3584, out_features=3584, bias=False)
+            (rotary_emb): Qwen2VLRotaryEmbedding()
+          )
+          (mlp): Qwen2MLP(
+            (gate_proj): Linear(in_features=3584, out_features=18944, bias=False)
+            (up_proj): Linear(in_features=3584, out_features=18944, bias=False)
+            (down_proj): Linear(in_features=18944, out_features=3584, bias=False)
+            (act_fn): SiLU()
+          )
+          (input_layernorm): Qwen2RMSNorm((3584,), eps=1e-06)
+          (post_attention_layernorm): Qwen2RMSNorm((3584,), eps=1e-06)
+        )
+      )
+      (norm): Qwen2RMSNorm((3584,), eps=1e-06)
+      (rotary_emb): Qwen2VLRotaryEmbedding()
+    )
+  )
+  (lm_head): Linear(in_features=3584, out_features=152064, bias=False)
+)
+
+Loading checkpoint shards: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 4/4 [00:02<00:00,  1.92it/s]
+LlavaOnevisionForConditionalGeneration(
+  (model): LlavaOnevisionModel(
+    (vision_tower): SiglipVisionModel(
+      (vision_model): SiglipVisionTransformer(
+        (embeddings): SiglipVisionEmbeddings(
+          (patch_embedding): Conv2d(3, 1152, kernel_size=(14, 14), stride=(14, 14), padding=valid)
+          (position_embedding): Embedding(729, 1152)
+        )
+        (encoder): SiglipEncoder(
+          (layers): ModuleList(
+            (0-25): 26 x SiglipEncoderLayer(
+              (layer_norm1): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+              (self_attn): SiglipAttention(
+                (k_proj): Linear(in_features=1152, out_features=1152, bias=True)
+                (v_proj): Linear(in_features=1152, out_features=1152, bias=True)
+                (q_proj): Linear(in_features=1152, out_features=1152, bias=True)
+                (out_proj): Linear(in_features=1152, out_features=1152, bias=True)
+              )
+              (layer_norm2): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+              (mlp): SiglipMLP(
+                (activation_fn): PytorchGELUTanh()
+                (fc1): Linear(in_features=1152, out_features=4304, bias=True)
+                (fc2): Linear(in_features=4304, out_features=1152, bias=True)
+              )
+            )
+          )
+        )
+        (post_layernorm): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+      )
+    )
+    (multi_modal_projector): LlavaOnevisionMultiModalProjector(
+      (linear_1): Linear(in_features=1152, out_features=3584, bias=True)
+      (act): GELUActivation()
+      (linear_2): Linear(in_features=3584, out_features=3584, bias=True)
+    )
+    (language_model): Qwen2Model(
+      (embed_tokens): Embedding(152128, 3584)
+      (layers): ModuleList(
+        (0-27): 28 x Qwen2DecoderLayer(
+          (self_attn): Qwen2Attention(
+            (q_proj): Linear(in_features=3584, out_features=3584, bias=True)
+            (k_proj): Linear(in_features=3584, out_features=512, bias=True)
+            (v_proj): Linear(in_features=3584, out_features=512, bias=True)
+            (o_proj): Linear(in_features=3584, out_features=3584, bias=False)
+          )
+          (mlp): Qwen2MLP(
+            (gate_proj): Linear(in_features=3584, out_features=18944, bias=False)
+            (up_proj): Linear(in_features=3584, out_features=18944, bias=False)
+            (down_proj): Linear(in_features=18944, out_features=3584, bias=False)
+            (act_fn): SiLU()
+          )
+          (input_layernorm): Qwen2RMSNorm((3584,), eps=1e-06)
+          (post_attention_layernorm): Qwen2RMSNorm((3584,), eps=1e-06)
+        )
+      )
+      (norm): Qwen2RMSNorm((3584,), eps=1e-06)
+      (rotary_emb): Qwen2RotaryEmbedding()
+    )
+  )
+  (lm_head): Linear(in_features=3584, out_features=152128, bias=False)
+)

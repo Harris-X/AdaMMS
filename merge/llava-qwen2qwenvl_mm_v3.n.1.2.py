@@ -428,7 +428,7 @@ class SAMSDREAMMerger:
                 W_A, W_B, W_C = weights_A[key].float(), weights_B[key].float(), weights_C[key].float()
                 tau_A, tau_B = W_A - W_C, W_B - W_C
                 
-                g_approx_A = torch.outer(activations['A'][module_name]['output'] - activations['C'][module_name]['output'], activations['A'][module_name]['input'])
+                g_approx_A = torch.outer(activations['A'][module_name]['output'], activations['A'][module_name]['input'])
                 g_approx_B = torch.outer(activations['B'][module_name]['output'] - activations['C'][module_name]['output'], activations['B'][module_name]['input'])
                 
                 # 步骤 2: 计算夏普斯感知显著性分数 S_SAS
@@ -564,7 +564,7 @@ class SAMSDREAMMerger:
 
     def run_pipeline(self):
         """按顺序执行所有阶段。"""
-        self.stage1_cache_all_activations()
+        # self.stage1_cache_all_activations()
         self.stage2_regularized_disjoint_mask_generation()
         self.stage3_disentangled_reprojection_fusion()
 
@@ -579,7 +579,7 @@ if __name__ == "__main__":
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--mode', type=str, default="sams-dream-0.1", help="为本次合并配置命名。")
+    parser.add_argument('--mode', type=str, default="sams-dream-c-0.3", help="为本次合并配置命名。")
     parser.add_argument('--cuda_device', type=int, default=5, help="使用的 CUDA 设备编号。")
 
     # 数据集配置 (修改为元探测数据集)

@@ -454,7 +454,7 @@ if __name__ == "__main__":
 
     # R-AGI WPM 合并超参数
     parser.add_argument('--top_k_ratio', type=float, default=0.2, help="用于选举关键神经元的Top-K比率。")
-    parser.add_argument('--gamma', type=float, default=0.5, help="保留正则超参数。")
+    parser.add_argument('--gamma', type=float, default=0.0, help="保留正则超参数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或掩码。")

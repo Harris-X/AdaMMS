@@ -242,9 +242,9 @@ class CADMerger:
         print("\n--- [阶段二: CAD-M 正则化重要性评分] ---")
         # 缓存文件名现在代表将要保存的复合数据
         saliency_cache_path = os.path.join(self.cache_dir, f"cadm_saliency_data_r{self.args.top_k_ratio}_alpha{self.args.alpha}.pt")
-        if os.path.exists(saliency_cache_path) and not self.args.force_recompute:
-            print("CAD-M 显著性数据缓存文件已存在, 跳过。")
-            return
+        # if os.path.exists(saliency_cache_path) and not self.args.force_recompute:
+        #     print("CAD-M 显著性数据缓存文件已存在, 跳过。")
+        #     return
 
         print("加载所有权重和缓存的激活...")
         weights_A = load_weights(self.args.base_model_path)
@@ -285,6 +285,10 @@ class CADMerger:
                 # 步骤 3 & 4: 归一化与谐波平均
                 s_final_A = (2 * self._min_max_normalize(s_spec_A) * self._min_max_normalize(s_int_A)) / (self._min_max_normalize(s_spec_A) + self._min_max_normalize(s_int_A) + self.EPS)
                 s_final_B = (2 * self._min_max_normalize(s_spec_B) * self._min_max_normalize(s_int_B)) / (self._min_max_normalize(s_spec_B) + self._min_max_normalize(s_int_B) + self.EPS)
+
+                # s_final_A = s_spec_A
+                # s_final_B = s_spec_B
+
 
                 # 步骤 5: 选举重要性掩码
                 k = int(s_final_A.numel() * self.args.top_k_ratio)
@@ -328,7 +332,7 @@ class CADMerger:
             M_B = data['mask_B'].to(self.device)
             tau_A = data['tau_A'].to(self.device)
             tau_B = data['tau_B'].to(self.device)
-            s_final_B_norm = data['s_final_B_norm'].to(self.device)
+            # s_final_B_norm = data['s_final_B_norm'].to(self.device)
 
             # 步骤 2: 精细化参数分类
             sign_tau_A = torch.sign(tau_A)
@@ -341,7 +345,8 @@ class CADMerger:
             # 协同部分的更新
             delta_W_syn = tau_B * m_syn
             # 贡献者专属部分的更新（应用连续阻尼）
-            delta_W_don = tau_B * m_don * s_final_B_norm
+            # delta_W_don = tau_B * m_don * s_final_B_norm
+            delta_W_don = tau_B * m_don
             # 合并增量
             delta_W = delta_W_syn + delta_W_don
 
@@ -402,7 +407,7 @@ if __name__ == "__main__":
     # CAD-M 合并超参数
     parser.add_argument('--top_k_ratio', type=float, default=0.2, help="【阶段二】用于选举关键神经元的Top-K比率。")
     parser.add_argument('--alpha', type=float, default=1.0, help="【阶段二】平衡泰勒展开一阶和二阶项的超参数。")
-    parser.add_argument('--lambda_', type=float, default=0.5, dest='lambda_', help="【阶段三】知识增量的总体吸收率，唯一核心可调超参数。")
+    parser.add_argument('--lambda_', type=float, default=1.0, dest='lambda_', help="【阶段三】知识增量的总体吸收率，唯一核心可调超参数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的数据。")

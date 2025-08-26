@@ -617,13 +617,13 @@ if __name__ == "__main__":
     parser.add_argument('--cuda_device', type=int, default=6, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
-    parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
+    parser.add_argument('--probe_samples', type=int, default=1000, help="用于探测的样本数量。")
 
     # 合并超参数
-    parser.add_argument('--lambda_s', type=float, default=1.0, help="协同分量的基础系数。")
-    parser.add_argument('--lambda_c', type=float, default=1.0, help="冲突分量的基础系数（在公式中为减去）。")
-    parser.add_argument('--lambda_o', type=float, default=1.0, help="正交分量的系数。")
-    parser.add_argument('--alpha', type=float, default=0.8, help="自适应赋权机制的敏感度系数。")
+    parser.add_argument('--lambda_s', type=float, default=1.2, help="协同分量的基础系数。")
+    parser.add_argument('--lambda_c', type=float, default=0.8, help="冲突分量的基础系数（在公式中为减去）。")
+    parser.add_argument('--lambda_o', type=float, default=1.2, help="正交分量的系数。")
+    parser.add_argument('--alpha', type=float, default=0.7, help="自适应赋权机制的敏感度系数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或梯度。")

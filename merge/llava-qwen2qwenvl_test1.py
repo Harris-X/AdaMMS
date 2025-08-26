@@ -88,6 +88,12 @@ def need_merge_llava(name:str) -> bool:
     if name.startswith("model.layers."):
         if name.endswith(".self_attn.rotary_emb.inv_freq"):
             return False
+        if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.k_proj.weight"):
+            return False
+        if name.endswith(".self_attn.q_proj.bias") or name.endswith(".self_attn.k_proj.bias"):
+            return False
+        # if name.endswith(".self_attn.o_proj.weight"):
+        #     return False
         return True
     return False
 
@@ -192,7 +198,7 @@ def convert(args):
     # # merge lm_head TODO 部分融合 minicpm([151666, 3584])   qwen([152064, 3584])
     
     llava['lm_head.weight'] *= 1-alpha
-    llava['lm_head.weight'] += alpha * cogvlm_diff['lm_head.weight'] # 0
+    llava['lm_head.weight'] += alpha * cogvlm_diff['lm_head.weight']
 
     # # merge model.embed_tokens.weight 
     llava['model.embed_tokens.weight'] *= 1-alpha
@@ -212,11 +218,11 @@ def convert(args):
         
         # ATTENTION
         
-        llava[f'model.layers.{i}.self_attn.q_proj.weight'] += cogvlm_diff[f'model.layers.{i}.self_attn.q_proj.weight']
-        llava[f'model.layers.{i}.self_attn.k_proj.weight'] += cogvlm_diff[f'model.layers.{i}.self_attn.k_proj.weight']
+        # llava[f'model.layers.{i}.self_attn.q_proj.weight'] += cogvlm_diff[f'model.layers.{i}.self_attn.q_proj.weight']
+        # llava[f'model.layers.{i}.self_attn.k_proj.weight'] += cogvlm_diff[f'model.layers.{i}.self_attn.k_proj.weight']
         llava[f'model.layers.{i}.self_attn.v_proj.weight'] += cogvlm_diff[f'model.layers.{i}.self_attn.v_proj.weight'] 
-        llava[f'model.layers.{i}.self_attn.q_proj.bias'] += cogvlm_diff[f'model.layers.{i}.self_attn.q_proj.bias']
-        llava[f'model.layers.{i}.self_attn.k_proj.bias'] += cogvlm_diff[f'model.layers.{i}.self_attn.k_proj.bias']
+        # llava[f'model.layers.{i}.self_attn.q_proj.bias'] += cogvlm_diff[f'model.layers.{i}.self_attn.q_proj.bias']
+        # llava[f'model.layers.{i}.self_attn.k_proj.bias'] += cogvlm_diff[f'model.layers.{i}.self_attn.k_proj.bias']
         llava[f'model.layers.{i}.self_attn.v_proj.bias'] += cogvlm_diff[f'model.layers.{i}.self_attn.v_proj.bias']       
 
         llava[f'model.layers.{i}.self_attn.o_proj.weight'] += cogvlm_diff[f'model.layers.{i}.self_attn.o_proj.weight']
@@ -252,10 +258,10 @@ def convert(args):
 if __name__ == "__main__":
    
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output', type=str, default="downloaded_models/checkpoints/qwens-alpha-0.2-interpolation-noLN", help="Output checkpoint path")
-    parser.add_argument('--alpha', type=float, default=0.2)
+    parser.add_argument('--output', type=str, default=None, help="Output checkpoint path")
+    parser.add_argument('--alpha', type=float, default=0.1)
     parser.add_argument('--interpolation',default=True, action='store_true')
-    parser.add_argument('--noLN', default=True, action='store_true')    
+    parser.add_argument('--noLN', action='store_true')    
 
     # other merging strategies
     parser.add_argument('--strategy', type=str, default=None) 

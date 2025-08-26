@@ -57,35 +57,54 @@ def normalize_donor_keys(weights: dict) -> dict:
             normalized_weights[key] = value
     return normalized_weights
 
-def need_merge(name: str) -> bool:
+# =======================================================================================
+# MODIFICATION START: New function to determine merge strategy
+# =======================================================================================
+def get_merge_strategy(name: str) -> str:
     """
-    根据层名判断是否需要合并。
-    修正：使其能处理带任意前缀的层名。
+    根据层名返回合并策略：'gradient', 'lerp', or 'none'。
+    'gradient': 用于 MLP 层，使用梯度引导方法。
+    'lerp': 用于 Self-Attention 层，使用线性插值。
+    'none': 用于其他层（如 LayerNorm），不进行合并。
     """
-    # 找到 "layers" 在名字中的位置
     layers_idx = name.rfind("layers.")
     if layers_idx == -1:
-        return False
+        return "none"
 
-    # 从 "layers." 开始截取，以进行统一判断
     suffix = name[layers_idx:]
     
-    if suffix.endswith(".self_attn.rotary_emb.inv_freq"):
-        return False
-    
-    # 排除归一化层
-    if "layernorm" in suffix:
-        return False
-    
-    # 注意：您的原始 need_merge 函数排除了 QKV O 投影，这里遵循该设定。
-    if suffix.endswith((".self_attn.q_proj.weight", ".self_attn.q_proj.bias",
-                      ".self_attn.k_proj.weight", ".self_attn.k_proj.bias",
-                      ".self_attn.v_proj.weight", ".self_attn.v_proj.bias",
-                      ".self_attn.o_proj.weight", ".self_attn.o_proj.bias")): #
-        return False
+    # 排除不需要合并的特定层
+    if "layernorm" in suffix or suffix.endswith(".rotary_emb.inv_freq"):
+        return "none"
         
-    # 只要是 layers 内部的其他参数，都进行合并
-    return True
+    # 为 MLP 层指定 'gradient' 策略
+    if ".mlp." in suffix:
+        return "gradient"
+        
+    # 为 Self-Attention 层（包括QKV和O投影）指定 'lerp' 策略
+    if ".self_attn." in suffix:
+        return "lerp"
+
+    return "none"
+# =======================================================================================
+# MODIFICATION END
+# =======================================================================================
+
+
+# =======================================================================================
+# MODIFICATION START: `need_merge` now only targets layers needing gradient approximation
+# =======================================================================================
+def need_merge(name: str) -> bool:
+    """
+    修正: 此函数现在仅用于判断是否需要为该层“计算近似梯度”。
+    根据混合策略，我们只为MLP层计算梯度。
+    """
+    # 仅当策略为 'gradient' 时，我们才需要计算梯度，因此也才需要hook模块
+    return get_merge_strategy(name) == 'gradient'
+# =======================================================================================
+# MODIFICATION END
+# =======================================================================================
+
 
 def create_soft_link(source_path, link_path):
     # Check if source path exists
@@ -198,8 +217,14 @@ class LowMemoryGradientMerger:
         target_module_names = self._get_target_modules(model_to_hook)
         
         if not target_module_names:
-            print(f"警告: 在 {os.path.basename(model_path)} 中没有找到符合 `need_merge` 条件的模块。")
-            return # 如果找不到目标，直接返回
+            print(f"警告: 在 {os.path.basename(model_path)} 中没有找到符合 `need_merge` 条件的模块（即MLP模块）。")
+            # 即使没有找到需要hook的模块，也创建一个空的缓存文件以表示此阶段已完成
+            torch.save({}, cache_path)
+            print(f"创建空的激活缓存文件: {cache_path}")
+            del model, tokenizer
+            gc.collect()
+            torch.cuda.empty_cache()
+            return
             
         print(f"在 {os.path.basename(model_path)} 中找到 {len(target_module_names)} 个目标模块。")
 
@@ -318,8 +343,9 @@ class LowMemoryGradientMerger:
         # 以模型A的参数作为遍历蓝本
         base_weights = load_weights(self.args.base_model_path, "model.safetensors.index.json")
 
-        for key in tqdm(base_weights.keys(), desc="计算近似梯度"):
+        for key in tqdm(base_weights.keys(), desc="计算近似梯度 (仅MLP)"):
             
+            # 由于 need_merge 现在只识别MLP层，这个循环只会为MLP层计算梯度
             if not need_merge(key):
                 continue
                 
@@ -333,8 +359,10 @@ class LowMemoryGradientMerger:
             relative_key = key[layers_idx:]
             module_name = ".".join(relative_key.split('.')[:-1])
 
-            if module_name not in activations_A or module_name not in activations_C:
-                print(f"警告: 模块 {module_name} (来自键 {key}) 的激活未找到，跳过。")
+            if module_name not in activations_A or "input" not in activations_A[module_name] or \
+               module_name not in activations_C or "output" not in activations_C[module_name] or \
+               "output" not in activations_A[module_name]:
+                print(f"警告: 模块 {module_name} (来自键 {key}) 的激活不完整或未找到，跳过梯度计算。")
                 continue
 
             # 加载激活到设备
@@ -376,13 +404,26 @@ class LowMemoryGradientMerger:
 
         merged_weights = {}
 
-        for key in tqdm(base_weights.keys(), desc="逐层合并权重"):
+        # =======================================================================================
+        # MODIFICATION START: Hybrid merging loop
+        # =======================================================================================
+        for key in tqdm(base_weights.keys(), desc="逐层混合合并权重"):
             # 默认直接使用基础模型的权重
             merged_weights[key] = base_weights[key] 
 
-            # 检查是否满足合并条件,额外需要注意此处的检查代码
-            # 使用原始的、未经标准化的 donor_weights_raw 进行检查，以匹配前缀
-            if need_merge(key) and key in donor_weights and key in original_weights and base_weights[key].shape == donor_weights[key].shape:
+            strategy = get_merge_strategy(key)
+            
+            if strategy == "none":
+                continue
+
+            # 检查权重是否存在
+            if key not in donor_weights or key not in original_weights or base_weights[key].shape != donor_weights[key].shape:
+                continue
+            
+            w_star = None
+
+            # --- 策略一: 梯度引导合并 (用于 MLP) ---
+            if strategy == "gradient":
                 grad_path = os.path.join(self.grad_dir, f"{key.replace('/', '_')}.pt")
                 if not os.path.exists(grad_path):
                     print(f"警告: 参数 {key} 的近似梯度未找到，将使用基础模型权重。")
@@ -395,29 +436,37 @@ class LowMemoryGradientMerger:
                 g_approx = torch.load(grad_path, map_location=self.device).float()
 
                 # 计算任务向量 τ_B
-                tau_B = W_B - W_C #
+                tau_B = W_B - W_C
 
-                # --- 梯度引导的向量分解 (方法论来自核心文档) ---
+                # 梯度引导的向量分解
                 g_norm_sq = torch.sum(g_approx * g_approx)
                 if g_norm_sq < 1e-9:
                     print(f"警告: 参数 {key} 的梯度范数过小，跳过分解。")
                     tau_B_synergy, tau_B_conflict, tau_B_ortho = torch.zeros_like(tau_B), torch.zeros_like(tau_B), tau_B
                 else:
                     proj_scalar = torch.sum(g_approx * tau_B) / g_norm_sq
-                    # 协同分量 (与 -g_approx 方向一致)
-                    tau_B_synergy = torch.clamp_min(-proj_scalar, 0) * g_approx #
-                    # 冲突分量 (与 +g_approx 方向一致)
-                    tau_B_conflict = torch.clamp_min(proj_scalar, 0) * g_approx #
-                    # 正交分量
-                    tau_B_ortho = tau_B - tau_B_conflict - tau_B_synergy #
+                    tau_B_synergy = torch.clamp_min(-proj_scalar, 0) * g_approx
+                    tau_B_conflict = torch.clamp_min(proj_scalar, 0) * g_approx
+                    tau_B_ortho = tau_B - (tau_B_synergy + tau_B_conflict)
 
-                # --- 最终合并公式 ---
-                # W* = W_A + λ_s * τ_B_synergy - λ_c * τ_B_conflict + λ_o * τ_B_ortho
+                # 最终合并公式
                 w_star = W_A + (self.args.lambda_s * tau_B_synergy) - \
                                (self.args.lambda_c * tau_B_conflict) + \
                                (self.args.lambda_o * tau_B_ortho)
+
+            # --- 策略二: 线性插值 (用于 Self-Attention) ---
+            elif strategy == "lerp":
+                W_A = base_weights[key].float().to(self.device)
+                W_B = donor_weights[key].float().to(self.device)
                 
+                alpha = self.args.lerp_alpha
+                w_star = (1 - alpha) * W_A + alpha * W_B
+
+            if w_star is not None:
                 merged_weights[key] = w_star.to(base_weights[key].dtype).cpu()
+        # =======================================================================================
+        # MODIFICATION END
+        # =======================================================================================
 
         # --- 保存模型 ---
         print("\n正在保存合并后的模型...")
@@ -452,8 +501,8 @@ if __name__ == "__main__":
     parser.add_argument('--base_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--mode', type=str, default="default", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=1, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--mode', type=str, default="hybrid-merge", help="为本次合并配置命名。")
+    parser.add_argument('--cuda_device', type=int, default=3, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_dataset', type=str, default="wikitext", help="用于探测激活的数据集 ('wikipedia' 或 'c4')。")
@@ -461,9 +510,16 @@ if __name__ == "__main__":
     parser.add_argument('--probe_batch_size', type=int, default=1, help="探测时的批处理大小，如果显存不足请减小。")
 
     # 合并超参数
-    parser.add_argument('--lambda_s', type=float, default=1.4, help="协同分量的系数。")
-    parser.add_argument('--lambda_c', type=float, default=0.7, help="冲突分量的系数。")
-    parser.add_argument('--lambda_o', type=float, default=1.0, help="正交分量的系数。")
+    parser.add_argument('--lambda_s', type=float, default=1.4, help="协同分量的系数 (用于MLP)。")
+    parser.add_argument('--lambda_c', type=float, default=0.7, help="冲突分量的系数 (用于MLP)。")
+    parser.add_argument('--lambda_o', type=float, default=1.0, help="正交分量的系数 (用于MLP)。")
+    # =======================================================================================
+    # MODIFICATION START: Add new hyperparameter for LERP
+    # =======================================================================================
+    parser.add_argument('--lerp_alpha', type=float, default=0.1, help="线性插值 (LERP) 的系数 (用于Self-Attention)。")
+    # =======================================================================================
+    # MODIFICATION END
+    # =======================================================================================
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或梯度。")

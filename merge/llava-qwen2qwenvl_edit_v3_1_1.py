@@ -97,7 +97,8 @@ def need_merge(name:str) -> bool:
         if name.endswith((".self_attn.q_proj.weight", ".self_attn.q_proj.bias",
                            ".self_attn.k_proj.weight", ".self_attn.k_proj.bias",
                            ".self_attn.v_proj.weight", ".self_attn.v_proj.bias"
-                           )): #  ".self_attn.o_proj.weight", ".self_attn.o_proj.bias"
+                           ".self_attn.o_proj.weight", ".self_attn.o_proj.bias"
+                           )): #  
             return False
             
         # 其他层（包括 MLP, v_proj.weight, v_proj.bias, layernorms）都进行合并
@@ -451,7 +452,7 @@ if __name__ == "__main__":
 
     # Probe Dataset Config
     parser.add_argument('--probe_dataset', type=str, default="wikipedia", help="Dataset for probing activations ('wikipedia' or 'c4').")
-    parser.add_argument('--probe_samples', type=int, default=128, help="Number of samples for probing.")
+    parser.add_argument('--probe_samples', type=int, default=200, help="Number of samples for probing.")
     # 修复点：降低默认批处理大小
     parser.add_argument('--probe_batch_size', type=int, default=1, help="Batch size for probing. Reduce if OOM.")
 
@@ -460,8 +461,8 @@ if __name__ == "__main__":
     parser.add_argument('--high_div_percentile', type=float, default=66, help="Percentile to define high divergence threshold.")
     
     # λ coefficients for each divergence zone
-    parser.add_argument('--lambda_s_low', type=float, default=2, help="Synergy coeff for low divergence.")
-    parser.add_argument('--lambda_c_low', type=float, default=1.0, help="Conflict coeff for low divergence.")
+    parser.add_argument('--lambda_s_low', type=float, default=2.0, help="Synergy coeff for low divergence.")
+    parser.add_argument('--lambda_c_low', type=float, default=0.0, help="Conflict coeff for low divergence.")
     parser.add_argument('--lambda_s_mid', type=float, default=2, help="Synergy coeff for medium divergence.")
     parser.add_argument('--lambda_c_mid', type=float, default=0.0, help="Conflict coeff for medium divergence.")
     parser.add_argument('--lambda_o', type=float, default=1.0, help="Orthogonal knowledge coefficient (usually 1.0).")

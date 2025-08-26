@@ -89,8 +89,8 @@ def need_merge(name:str) -> bool:
     if name.startswith("model.layers."):
         if name.endswith(".self_attn.rotary_emb.inv_freq"):
             return False
-        # if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight") or name.endswith(".self_attn.o_proj.weight"):
-        #     return False # 修改了此处
+        if name.endswith(".self_attn.q_proj.weight") or name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight") or name.endswith(".self_attn.o_proj.weight"):
+            return False # 修改了此处
         return True 
     return False
 
@@ -429,7 +429,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Adaptively merge models based on activation divergence.")
     
     # 修复点：添加 cuda_device 参数
-    parser.add_argument('--cuda_device', type=int, default=7, help="CUDA device to use (e.g., 0, 1, 2).")
+    parser.add_argument('--cuda_device', type=int, default=2, help="CUDA device to use (e.g., 0, 1, 2).")
     # ... (参数定义与上一版本相同) ...
     # Model Paths
     parser.add_argument('--base_model_path', type=str, default=CKPT_PATH["qwen2_vl"])

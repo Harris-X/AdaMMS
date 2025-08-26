@@ -94,8 +94,8 @@ def need_merge(name:str) -> bool:
         
         # 精确控制 Attention 块的合并范围
         # 只排除 O 投影，允许合并 Q, K, V
-        if name.endswith((".self_attn.o_proj.weight", ".self_attn.o_proj.bias")):
-            return False
+        # if name.endswith((".self_attn.o_proj.weight", ".self_attn.o_proj.bias")):
+        #     return False
             
         # 其他层（包括 MLP, Q/K/V 投影, layernorms）都进行合并
         return True 
@@ -367,15 +367,6 @@ def convert(args, device):
     for key in tqdm(base_weights.keys(), desc="Applying Adaptive Merging"):
         # 使用标准化后的 donor_weights 进行检查
         if key in donor_weights and key in original_weights and need_merge(key) and base_weights[key].shape == donor_weights[key].shape:
-            # 修复点：正确地将参数key映射到其所属的模块（self_attn 或 mlp）
-            parts = key.split('.')
-            module_path = ""
-            if 'self_attn' in parts:
-                # 例如: model.layers.0.self_attn.q_proj.weight -> model.layers.0.self_attn
-                module_path = ".".join(parts[:parts.index('self_attn')+1])
-            elif 'mlp' in parts:
-                # 例如: model.layers.0.mlp.gate_proj.weight -> model.layers.0.mlp
-                module_path = ".".join(parts[:parts.index('mlp')+1])
 
             module_path = key.rsplit('.', 1)[0]
             divergence = divergence_scores.get(module_path, (t_low + t_high) / 2)

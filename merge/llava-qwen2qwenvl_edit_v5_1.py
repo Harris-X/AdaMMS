@@ -694,7 +694,7 @@ if __name__ == "__main__":
     parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
-    parser.add_argument('--probe_samples', type=int, default=200, help="用于探测的样本数量。")
+    parser.add_argument('--probe_samples', type=int, default=1500, help="用于探测的样本数量。")
     parser.add_argument('--probe_batch_size', type=int, default=1, help="探测时的批处理大小。")
 
     # 对称合并超参数

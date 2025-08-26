@@ -535,8 +535,8 @@ if __name__ == "__main__":
     parser.add_argument('--probe_batch_size', type=int, default=2, help="处理引导数据时的批处理大小。")
 
     # A-Meta-DREAM 合并超参数
-    parser.add_argument('--top_k_ratio', type=float, default=0.1, help="【阶段二】用于选举关键神经元的Top-K比率。")
-    parser.add_argument('--alpha', type=float, default=0.3, help="【阶段二】夏普斯惩罚系数，控制对高曲率区域的惩罚力度。")
+    parser.add_argument('--top_k_ratio', type=float, default=0.2, help="【阶段二】用于选举关键神经元的Top-K比率。")
+    parser.add_argument('--alpha', type=float, default=0.4, help="【阶段二】夏普斯惩罚系数，控制对高曲率区域的惩罚力度。")
     # 注意：lambda_proj 和 lambda_ortho 已被移除，因为它们现在是自动计算的。
     
     # 功能性参数

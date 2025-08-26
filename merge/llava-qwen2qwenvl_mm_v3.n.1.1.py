@@ -76,36 +76,22 @@ def normalize_llm_keys(weights_to_norm: dict, reference_keys: list) -> dict:
 
 def need_merge(name: str) -> bool:
     """
-    根据层名判断是否需要合并，同时处理 'model.' 和 'language_model.' 两种前缀。
-    合并策略：
-    - 合并最终的 layernorm。
-    - 合并所有 transformer 层 (除了旋转位置编码)。
-    - 不合并词嵌入和 lm_head。
+    SAM-S-DREAM的复杂合并目标：
+    - 仅处理 transformer layers 内部的线性权重与 bias
+    - 显式排除所有 norm 与 rotary_emb
     """
-    # 检查是否是最终的 norm 层 (例如 'model.norm.weight')
-    # if name.endswith('.norm.weight'):
-    #     if name.startswith('model.') or name.startswith('language_model.'):
-    #         return False
-
-    # 明确排除 lm_head 和 embed_tokens
-    if 'lm_head.weight' in name or 'embed_tokens.weight' in name:
+    is_in_layers = name.startswith("model.layers.") or name.startswith("language_model.layers.")
+    if not is_in_layers:
         return False
 
-    # 检查是否在 transformer layers 中或是否为最终的 norm 层
-    is_in_layers = name.startswith("model.layers.") or name.startswith("language_model.layers.")
-    is_final_norm = name.endswith('.norm.weight') and (name.startswith('model.') or name.startswith('language_model.'))
+    # 显式排除 norm 和 rotary
+    if 'layernorm' in name or 'norm' in name or 'rotary_emb' in name:
+        return False
 
-    if is_in_layers:
-        # 排除旋转位置编码的频率倒数
-        if name.endswith(".self_attn.rotary_emb.inv_freq"):
-            return False
-        # 合并层内的其他所有参数 (包括 .weight 和 .bias)
+    # 线性层的 .weight/.bias 进入复杂合并
+    if name.endswith('.weight') or name.endswith('.bias'):
         return True
-    
-    if is_final_norm:
-        return True
-        
-    # 其他所有情况（如视觉部分）均不合并
+
     return False
 
 # --- 核心实现类 ---
@@ -131,14 +117,17 @@ class SAMSDREAMMerger:
         else: llm_module = model
 
         for name, module in llm_module.named_modules():
+            # 确保我们处理的是完整的模块名
             base_prefix = ""
             if hasattr(model, 'language_model'): base_prefix = "language_model."
             elif hasattr(model, 'model'): base_prefix = "model."
             
-            full_module_name = f"{base_prefix}{name}"
-            
-            if any(need_merge(f"{full_module_name}.{param_name}") for param_name, _ in module.named_parameters()):
-                module_map[name] = module
+            full_module_name_prefix = f"{base_prefix}{name}"
+
+            # 仅为需要复杂合并的模块挂钩
+            if any(need_merge(f"{full_module_name_prefix}.{param_name}") for param_name, _ in module.named_parameters()):
+                 module_map[name] = module
+
         return module_map
     
     # ########################################################################## #
@@ -219,7 +208,7 @@ class SAMSDREAMMerger:
         # ======================================================================
         # 类别 2: 认知与推理 (Cognition and Reasoning)
         # ======================================================================
-        
+
         # 推荐数据集: VCR (Visual Commonsense Reasoning) (替代 GQA, MMMU)
         if hasattr(self.args, 'n_vcr') and self.args.n_vcr > 0:
             print(f"从 VCR 加载 {self.args.n_vcr} 个样本...")
@@ -445,28 +434,50 @@ class SAMSDREAMMerger:
         disjoint_masks = {}
         pbar = tqdm(weights_A.keys(), desc="【SAM-S-DREAM】分析神经元")
         for key in pbar:
-            if not need_merge(key): continue
-            if not (key in weights_B and key in weights_C): continue
+            if not need_merge(key): 
+                continue
+            if not (key in weights_B and key in weights_C): 
+                continue
 
             module_name = ".".join(key.replace("model.language_model.", "model.").split('.')[1:-1])
-            
+            if module_name not in activations['A'] or 'output' not in activations['A'][module_name]:
+                pbar.set_description(f"警告: 模块 {module_name} 激活缺失，跳过 {key}")
+                continue
+
             try:
                 W_A, W_B, W_C = weights_A[key].float(), weights_B[key].float(), weights_C[key].float()
-                tau_A, tau_B = W_A - W_C, W_B - W_C
+                # 1) 构造近似“梯度方向”
+                if W_A.ndim == 2 and key.endswith(".weight"):
+                    # 2D: outer(output_A, input_A) / outer((output_B-output_C), input_A)
+                    if 'input' not in activations['A'][module_name]:
+                        pbar.set_description(f"警告: {module_name} 无 input 激活，跳过 {key}")
+                        continue
+                    out_A = activations['A'][module_name]['output']
+                    in_A  = activations['A'][module_name]['input']
+                    out_B = activations['B'][module_name].get('output', None)
+                    out_C = activations['C'][module_name].get('output', None)
+                    if out_B is None or out_C is None:
+                        pbar.set_description(f"警告: {module_name} 无 B/C 输出，跳过 {key}")
+                        continue
 
-                # 检查是否为 norm 层，norm 层只有 input 激活
-                is_norm_layer = "norm" in module_name
+                    g_approx_A = torch.outer(out_A, in_A)
+                    g_approx_B = torch.outer(out_B - out_C, in_A)
 
-                if is_norm_layer:
-                    # 对于 norm 层，梯度近似只与输入激活有关
-                    g_approx_A = activations['A'][module_name]['input']
-                    g_approx_B = activations['A'][module_name]['input'] # B和C的输出差异不适用
+                elif W_A.ndim == 1 and key.endswith(".bias"):
+                    # 1D bias: 用输出差向量作为方向
+                    out_A = activations['A'][module_name]['output']
+                    out_B = activations['B'][module_name].get('output', None)
+                    out_C = activations['C'][module_name].get('output', None)
+                    if out_B is None or out_C is None:
+                        pbar.set_description(f"警告: {module_name} 无 B/C 输出，跳过 {key}")
+                        continue
+                    g_approx_A = out_A        # A 的输出强度作为显著性参考
+                    g_approx_B = (out_B - out_C)  # B 相对 C 的输出变化决定注入方向
                 else:
-                    # 对于其他层（如MLP, Attn），使用内外积计算梯度
-                    g_approx_A = torch.outer(activations['A'][module_name]['output'], activations['A'][module_name]['input'])
-                    g_approx_B = torch.outer(activations['B'][module_name]['output'] - activations['C'][module_name]['output'], activations['A'][module_name]['input'])
-                
-                # 步骤 2: 计算夏普斯感知显著性分数 S_SAS
+                    # 非预期形状，跳过
+                    continue
+
+                # 2) 夏普斯感知的显著性评分与掩码
                 saliency_A = (W_A * g_approx_A).abs()
                 sharpness_penalty_A = 1 + self.args.alpha * (g_approx_A**2)
                 s_sas_A = saliency_A / sharpness_penalty_A
@@ -475,43 +486,24 @@ class SAMSDREAMMerger:
                 sharpness_penalty_B = 1 + self.args.alpha * (g_approx_B**2)
                 s_sas_B = saliency_B / sharpness_penalty_B
 
-                # 步骤 3: 选举与冲突消解
-                k = int(s_sas_A.numel() * self.args.top_k_ratio)
-                if k == 0: continue
-                
-                mask_A = s_sas_A >= torch.topk(s_sas_A.flatten(), k=k, sorted=False)[0].min()
-                mask_B = s_sas_B >= torch.topk(s_sas_B.flatten(), k=k, sorted=False)[0].min()
-                
-                tau_A, tau_B = W_A - W_C, W_B - W_C
-                
-                # 识别冲突集 $\mathcal{T}_{conflict, i}$，即在 $\mathcal{T}_{A,i}$ 和 $\mathcal{T}_{B,i}$ 中都存在，但任务向量符号相反的神经元。
+                k = max(1, int(s_sas_A.numel() * self.args.top_k_ratio))
+                if k <= 0: 
+                    continue
+
+                # 维度自适应 top-k
+                th_A = torch.topk(s_sas_A.flatten(), k=k, sorted=False).values.min()
+                th_B = torch.topk(s_sas_B.flatten(), k=k, sorted=False).values.min()
+                mask_A = (s_sas_A >= th_A)
+                mask_B = (s_sas_B >= th_B)
+
+                tau_A = W_A - W_C
+                tau_B = W_B - W_C
+
+                # 冲突：同一位置两侧入选但方向相反
                 conflict_mask = mask_A & mask_B & (torch.sign(tau_A) != torch.sign(tau_B))
-                
-                # 生成最终用于模型B的非冲突掩码 $m_{B,i}$，其对应的神经元集合为 $\mathcal{T}_{B,i} - \mathcal{T}_{conflict, i}$。
                 disjoint_mask_B = mask_B & (~conflict_mask)
-                
+
                 disjoint_masks[key] = disjoint_mask_B.cpu()
-
-                # s_spec_A = (-g_approx_A * tau_A + (self.args.alpha / 2) * (g_approx_A**2) * (tau_A**2)).abs()
-                # s_spec_B = (-g_approx_B * tau_B + (self.args.alpha / 2) * (g_approx_B**2) * (tau_B**2)).abs()
-                # s_int_A, s_int_B = tau_A.abs(), tau_B.abs()
-
-                # s_final_A = (2*self._min_max_normalize(s_spec_A)*self._min_max_normalize(s_int_A))/(self._min_max_normalize(s_spec_A)+self._min_max_normalize(s_int_A)+self.EPS)
-                # s_final_B = (2*self._min_max_normalize(s_spec_B)*self._min_max_normalize(s_int_B))/(self._min_max_normalize(s_spec_B)+self._min_max_normalize(s_int_B)+self.EPS)
-
-                # k = int(s_final_A.numel() * self.args.top_k_ratio)
-                # if k == 0: continue
-                
-                # mask_A = s_final_A >= torch.topk(s_final_A.flatten(), k=k, sorted=False)[0].min()
-                # mask_B = s_final_B >= torch.topk(s_final_B.flatten(), k=k, sorted=False)[0].min()
-                
-                # # 识别冲突集 $\mathcal{T}_{conflict, i}$，即在 $\mathcal{T}_{A,i}$ 和 $\mathcal{T}_{B,i}$ 中都存在，但任务向量符号相反的神经元。
-                # conflict_mask = mask_A & mask_B & (torch.sign(tau_A) != torch.sign(tau_B))
-                
-                # # 生成最终用于模型B的非冲突掩码 $m_{B,i}$，其对应的神经元集合为 $\mathcal{T}_{B,i} - \mathcal{T}_{conflict, i}$。
-                # disjoint_mask_B = mask_B & (~conflict_mask)
-                
-                # disjoint_masks[key] = disjoint_mask_B.cpu()
 
             except KeyError:
                 pbar.set_description(f"警告: 模块 {module_name} 激活数据不完整，跳过 {key}")
@@ -521,7 +513,7 @@ class SAMSDREAMMerger:
         print(f"I-DREAM 非冲突掩码计算完成并缓存至: {mask_cache_path}")
         
     def stage3_disentangled_reprojection_fusion(self):
-        """阶段三：【SAM-S-DREAM】执行解耦重投影融合 (与I-DREAM相同)。"""
+        """阶段三：【SAM-S-DREAM】执行解耦重投影融合。"""
         print("\n--- [阶段三: SAM-S-DREAM 解耦重投影融合] ---")
         
         print("加载所有权重、掩码和激活...")
@@ -536,41 +528,92 @@ class SAMSDREAMMerger:
         disjoint_masks = torch.load(mask_cache_path)
         
         activations_A = torch.load(os.path.join(self.cache_dir, "activations_A.pt"))
+        # 新增：bias 投影需要 B/C 的输出方向
+        activations_B = torch.load(os.path.join(self.cache_dir, "activations_B.pt"))
+        activations_C = torch.load(os.path.join(self.cache_dir, "activations_C.pt"))
 
         final_merged_weights = weights_A.copy()
+        
         pbar = tqdm(disjoint_masks.items(), desc="【SAM-S-DREAM】执行重投影融合")
+        processed_keys = set()
         for key, M_prime_B in pbar:
-            if not (key in weights_B and key in weights_C): continue
-                
+            if not (key in weights_B and key in weights_C): 
+                continue
+            
+            processed_keys.add(key)
             W_A, W_B, W_C = weights_A[key].float(), weights_B[key].float(), weights_C[key].float()
             M_prime_B = M_prime_B.to(self.device)
 
             module_name = ".".join(key.replace("model.language_model.", "model.").split('.')[1:-1])
-            
-            # 准备高质量的更新向量
-            tau_B = W_B - W_C
-            tau_B_update = tau_B.to(self.device) * M_prime_B
-            
-            # 执行知识解耦 (投影分解)
-            d_i = activations_A[module_name]['input'].to(self.device).float()
-            d_i_norm_sq = torch.sum(d_i * d_i)
+            tau_B = (W_B - W_C).to(self.device)
+            tau_B_update = tau_B * M_prime_B.to(self.device)
 
-            if d_i_norm_sq > self.EPS:
-                # 统一处理 norm (1D) 和其他层 (2D) 的情况
-                if tau_B_update.ndim > 1 and d_i.ndim == 1: # 全连接层
+            if W_A.ndim == 2 and key.endswith(".weight"):
+                # 2D：沿输入激活投影
+                d_i = activations_A[module_name]['input'].to(self.device).float()
+                d_i_norm_sq = torch.sum(d_i * d_i)
+                if d_i_norm_sq > self.EPS:
                     proj_scalar = (tau_B_update @ d_i) / d_i_norm_sq
                     tau_proj = torch.outer(proj_scalar, d_i)
-                else: # Norm层 或其他情况
-                    proj_scalar = torch.sum(tau_B_update * d_i) / d_i_norm_sq
-                    tau_proj = proj_scalar * d_i
-                tau_ortho = tau_B_update - tau_proj
+                    tau_ortho = tau_B_update - tau_proj
+                else:
+                    tau_proj = torch.zeros_like(tau_B_update)
+                    tau_ortho = tau_B_update
+
+            elif W_A.ndim == 1 and key.endswith(".bias"):
+                # 1D bias：沿输出差分方向投影（g_bias = Y_B - Y_C）
+                out_B = activations_B.get(module_name, {}).get('output', None)
+                out_C = activations_C.get(module_name, {}).get('output', None)
+                if out_B is None or out_C is None:
+                    # 回退：若方向缺失，使用简单加权更新已掩码的分量
+                    tau_proj = torch.zeros_like(tau_B_update)
+                    tau_ortho = tau_B_update
+                else:
+                    g_dir = (out_B - out_C).to(self.device).float()
+                    g_norm_sq = torch.sum(g_dir * g_dir)
+                    if g_norm_sq > self.EPS:
+                        proj_scalar = torch.sum(tau_B_update * g_dir) / g_norm_sq
+                        tau_proj = proj_scalar * g_dir
+                        # 仅在被掩码的位置更新；未掩码位置置零
+                        tau_proj = tau_proj * M_prime_B
+                        tau_ortho = tau_B_update - tau_proj
+                    else:
+                        tau_proj = torch.zeros_like(tau_B_update)
+                        tau_ortho = tau_B_update
             else:
-                tau_proj = torch.zeros_like(tau_B_update)
-                tau_ortho = tau_B_update
-            
-            # 最终增广合并
+                # 非预期形状
+                continue
+
             W_star = W_A.to(self.device) + self.args.lambda_proj * tau_proj + self.args.lambda_ortho * tau_ortho
             final_merged_weights[key] = W_star.cpu().to(weights_A[key].dtype)
+
+        # Part 2: 其余参数 (含 norm) 的保守加权平均
+        print("\n正在使用简单加权平均处理其余参数 (norm, 其他未入选的参数)...")
+        lam_default = self.args.lambda_proj
+        lam_norm = getattr(self.args, "lambda_norm", 0.0)  # 新增: norm 的保守合并系数
+
+        other_keys_pbar = tqdm(weights_A.keys(), desc="简单平均合并")
+        for key in other_keys_pbar:
+            # print(f"keys: {key}")
+            if key in processed_keys:
+                # print(f"跳过已处理的键: {key}")
+                continue
+            if key not in weights_B:
+                continue
+            if "lm_head" in key or "model.embed_tokens.weight" in key:
+                # print(f"特殊键: {key}")
+                continue
+
+            W_A = weights_A[key].float()
+            W_B = weights_B[key].float()
+
+            lam = lam_default
+            key_l = key.lower()
+            if ('norm' in key_l) : # or ('layernorm' in key_l)
+                # print(f"norm层: {key}")
+                lam = lam_norm  # norm 更保守
+
+            final_merged_weights[key] = ((1 - lam) * W_A + lam * W_B).to(W_A.dtype)
         
         self._save_model(final_merged_weights)
 
@@ -600,7 +643,7 @@ class SAMSDREAMMerger:
 
     def run_pipeline(self):
         """按顺序执行所有阶段。"""
-        self.stage1_cache_all_activations()
+        # self.stage1_cache_all_activations()
         self.stage2_regularized_disjoint_mask_generation()
         self.stage3_disentangled_reprojection_fusion()
 
@@ -615,11 +658,11 @@ if __name__ == "__main__":
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--mode', type=str, default="sams-dream-0.3-0.8-norm", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=7, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--mode', type=str, default="sams-dream-0.2-0.9-norm", help="为本次合并配置命名。")
+    parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 数据集配置 (修改为元探测数据集)
-    parser.add_argument('--n_mmbench', type=int, default=40, help="用于元探测集的MMBench样本数。")
+    parser.add_argument('--n_mmbench', type=int, default=10, help="用于元探测集的MMBench样本数。")
     parser.add_argument('--n_vcr', type=int, default=0, help="用于元探测集的VCR样本数。")
     parser.add_argument('--n_docvqa', type=int, default=10, help="用于元探测集的DocVQA样本数。")
     parser.add_argument('--n_vqa', type=int, default=50, help="用于元探测集的VQA v2样本数。")
@@ -629,9 +672,10 @@ if __name__ == "__main__":
 
     # I-DREAM 合并超参数
     parser.add_argument('--top_k_ratio', type=float, default=0.1, help="【阶段二】用于选举关键神经元的Top-K比率。")
-    parser.add_argument('--alpha', type=float, default=0.3, help="【阶段二】夏普斯惩罚系数，控制对高曲率区域的惩罚力度。")
+    parser.add_argument('--alpha', type=float, default=0.1, help="【阶段二】夏普斯惩罚系数，控制对高曲率区域的惩罚力度。")
     parser.add_argument('--lambda_proj', type=float, default=1.0, help="【阶段三】投影（相关）分量的合并系数。")
     parser.add_argument('--lambda_ortho', type=float, default=0.8, help="【阶段三】正交（无关）分量的合并系数，保护泛化性。")
+    parser.add_argument('--lambda_norm', type=float, default=0.0, help="norm 参数的加权平均系数（不走梯度合并）。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的数据。")

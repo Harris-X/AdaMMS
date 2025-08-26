@@ -54,7 +54,7 @@ def normalize_donor_keys(weights_b: dict, weights_c: dict) -> dict:
     将模型B (Llava) 的 LLM 部分的键名与模型C对齐。
     例如: "model.language_model.layers.0..." -> "model.layers.0..."
     """
-    prefix_b = "model.language_model."
+    prefix_b = "language_model.model."
     prefix_c = "model."
     
     normalized_weights = {}
@@ -72,24 +72,55 @@ def normalize_donor_keys(weights_b: dict, weights_c: dict) -> dict:
     print(f"成功将 {len(normalized_weights)} 个 Donor LLM 权重键名标准化。")
     return normalized_weights
 
+# def need_merge(name: str) -> bool:
+#     """
+#     根据层名判断是否需要合并。我们只合并 LLM 核心层。
+#     """
+#     # MODIFIED: 简化逻辑，只关心 language_model.layers 部分
+#     if "language_model.layers" not in name:
+#         return False
+    
+#     # 排除所有 layernorm 和 embedding
+#     if "layernorm" in name or "embed" in name:
+#         return False
+        
+#     # 排除 rotary embedding 的频率缓存
+#     if name.endswith(".inv_freq"):
+#         return False
+        
+#     # 其他在 layers 内部的参数都参与合并 (q,k,v,o, mlp)
+#     return True
+
 def need_merge(name: str) -> bool:
     """
-    根据层名判断是否需要合并。我们只合并 LLM 核心层。
+    根据层名判断是否需要合并。
+    修正：使其能处理带任意前缀的层名。
     """
-    # MODIFIED: 简化逻辑，只关心 language_model.layers 部分
-    if "language_model.layers" not in name:
+    # 找到 "layers" 在名字中的位置
+    layers_idx = name.rfind("layers.")
+    if layers_idx == -1:
+        return False
+
+    # 从 "layers." 开始截取，以进行统一判断
+    suffix = name[layers_idx:]
+    
+    if suffix.endswith(".self_attn.rotary_emb.inv_freq"):
         return False
     
-    # 排除所有 layernorm 和 embedding
-    if "layernorm" in name or "embed" in name:
+    # 排除归一化层
+    if "layernorm" in suffix:
         return False
+    
+    # # 注意：您的原始 need_merge 函数排除了 QKV O 投影，这里遵循该设定。
+    # if suffix.endswith((".self_attn.q_proj.weight", ".self_attn.q_proj.bias",
+    #                   ".self_attn.k_proj.weight", ".self_attn.k_proj.bias",
+    #                   ".self_attn.v_proj.weight", ".self_attn.v_proj.bias",
+    #                   ".self_attn.o_proj.weight", ".self_attn.o_proj.bias")): #
+    #     return False
         
-    # 排除 rotary embedding 的频率缓存
-    if name.endswith(".inv_freq"):
-        return False
-        
-    # 其他在 layers 内部的参数都参与合并 (q,k,v,o, mlp)
+    # 只要是 layers 内部的其他参数，都进行合并
     return True
+
 
 # NEW: 为多模态探针数据创建一个自定义的数据集类
 class VQAv2ProbeDataset(Dataset):
@@ -243,7 +274,23 @@ class LowMemoryGradientMerger:
 
         # --- 注册钩子 ---
         # 我们的目标是 'language_model.layers'
-        model_to_hook = model.model # 对于 Qwen2-VL 和 Qwen2-Instruct 都是 .model
+        # model_to_hook = model.model # 对于 Qwen2-VL 和 Qwen2-Instruct 都是 .model
+        # 修正：智能地定位到包含 "layers" 的语言模型部分
+        model_to_hook = None
+        if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
+             # 适用于 Qwen2-VL-7B-Instruct 结构
+            model_to_hook = model.language_model.model
+        elif hasattr(model, "language_model"):
+            # 适用于 llava-onevision-qwen2-7b-si-hf 结构
+            model_to_hook = model.language_model
+        elif hasattr(model, "model"):
+            # 适用于 Qwen2-7B-Instruct 结构
+            model_to_hook = model.model
+        else:
+            # 备用方案
+            model_to_hook = model
+
+
         target_module_names = self._get_target_modules(model_to_hook)
         
         if not target_module_names:
@@ -301,16 +348,20 @@ class LowMemoryGradientMerger:
             averaged_activations[name] = {}
             if data["outputs"]:
                 try:
-                    # 在拼接前确保所有张量都在CPU上且为float32
-                    tensors = [t.float() for t in data["outputs"]]
-                    averaged_activations[name]["output"] = torch.mean(torch.cat(tensors, dim=0), dim=0)
+                    # 正确的修改：将所有激活扁平化后再求平均
+                    # 1. 将每个批次的激活张量 [batch, seq, dim] 扁平化为 [batch*seq, dim]
+                    # 2. 将所有扁平化后的张量拼接起来
+                    # 3. 在拼接后的大张量上求平均
+                    all_tokens = torch.cat([t.float().view(-1, t.shape[-1]) for t in data["outputs"]], dim=0)
+                    averaged_activations[name]["output"] = torch.mean(all_tokens, dim=0)
                 except Exception as e:
                     print(f"处理 {name} 的输出激活时出错: {e}")
                     continue
             if data["inputs"]:
                 try:
-                    tensors = [t.float() for t in data["inputs"]]
-                    averaged_activations[name]["input"] = torch.mean(torch.cat(tensors, dim=0), dim=0)
+                    # 对输入也采用同样的处理方式
+                    all_tokens = torch.cat([t.float().view(-1, t.shape[-1]) for t in data["inputs"]], dim=0)
+                    averaged_activations[name]["input"] = torch.mean(all_tokens, dim=0)
                 except Exception as e:
                     print(f"处理 {name} 的输入激活时出错: {e}")
                     continue
@@ -524,7 +575,7 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="qwen-vl-merge", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=7, help="使用的 CUDA 设备编号。")
 
     # 探针数据集配置
     parser.add_argument('--probe_samples', type=int, default=100, help="用于探测的样本数量。")

@@ -251,8 +251,8 @@ class VDTMMerger:
 
     # 阶段二：基于泰勒近似的重要性定位 (逻辑不变, 仅修改了缓存保存方式)
     def stage2_importance_analysis(self):
-        """阶段二：【TAG-M】计算重要性分数并缓存A和B的重要性掩码。"""
-        print("\n--- [阶段二: TAG-M 重要性分析] ---")
+        """阶段二：【VDT-M】计算重要性分数并缓存A和B的重要性掩码。"""
+        print("\n--- [阶段二: VDT-M 重要性分析] ---")
         mask_cache_path = os.path.join(self.cache_dir, f"tagm_importance_masks_r{self.args.top_k_ratio}_alpha{self.args.alpha}.pt")
         if os.path.exists(mask_cache_path) and not self.args.force_recompute:
             print("TAG-M 重要性掩码缓存文件已存在, 跳过。")
@@ -276,7 +276,7 @@ class VDTMMerger:
         masks_A = {}
         masks_B = {}
         
-        pbar = tqdm(weights_A.keys(), desc="【TAG-M】分析神经元")
+        pbar = tqdm(weights_A.keys(), desc="【VDT-M】分析神经元")
         for key in pbar:
             if not need_merge(key): continue
             if not (key in weights_B and key in weights_C): continue
@@ -311,7 +311,7 @@ class VDTMMerger:
 
         # 【修改】将两个掩码字典保存在一个文件中
         torch.save({'mask_A': masks_A, 'mask_B': masks_B}, mask_cache_path)
-        print(f"TAG-M 重要性掩码计算完成并缓存至: {mask_cache_path}")
+        print(f"VDT-M 重要性掩码计算完成并缓存至: {mask_cache_path}")
         
     # ########################################################################## #
     # #                           核心代码修改区域                             # #
@@ -419,9 +419,9 @@ if __name__ == "__main__":
 
     # VDT-M 合并超参数
     parser.add_argument('--top_k_ratio', type=float, default=0.1, help="【阶段二】用于选举关键神经元的Top-K比率。")
-    parser.add_argument('--alpha', type=float, default=1.0, help="【阶段二】平衡泰勒展开一阶和二阶项的信任域参数。")
-    parser.add_argument('--lambda_syn', type=float, default=0.5, help="【阶段三】协同(Synergy)知识分量的融合系数。")
-    parser.add_argument('--lambda_don', type=float, default=1.0, help="【阶段三】贡献者专属(Donor-Specific)知识分量的融合系数。")
+    parser.add_argument('--alpha', type=float, default=0.8, help="【阶段二】平衡泰勒展开一阶和二阶项的信任域参数。")
+    parser.add_argument('--lambda_syn', type=float, default=0.9, help="【阶段三】协同(Synergy)知识分量的融合系数。")
+    parser.add_argument('--lambda_don', type=float, default=0.4, help="【阶段三】贡献者专属(Donor-Specific)知识分量的融合系数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或掩码。")

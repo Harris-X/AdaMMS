@@ -322,7 +322,7 @@ class PISAMerger:
         for key, M_i in pbar:
             if not (key in weights_B and key in weights_C): continue
                 
-            W_A, W_B, W_C = weights_A[key].float(), weights_B[key].float(), weights_C[key].float()
+            W_A, W_B, W_C = weights_A[key].float().to(self.device), weights_B[key].float().to(self.device), weights_C[key].float().to(self.device)
             M_i = M_i.to(self.device)
 
             # 步骤 1: 提取活跃子空间权重
@@ -407,7 +407,7 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="pisam-default", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=0, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=5, help="使用的 CUDA 设备编号。")
 
     # 数据集配置
     parser.add_argument('--probe_samples', type=int, default=100, help="用于引导合并的目标域样本数量。")

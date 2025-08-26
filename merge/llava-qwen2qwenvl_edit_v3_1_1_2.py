@@ -85,19 +85,19 @@ def normalize_donor_keys(weights: dict) -> dict:
 def need_merge(name:str) -> bool:
     if name in ['model.norm.weight']:
         return False
-    if name in ['lm_head.weight', 'model.embed_tokens.weight']:
+    if name in ['lm_head.weight', ]:
+        return False
+    if name in ['model.embed_tokens.weight']:
         return False
     if name.startswith("model.layers."):
         # 不合并旋转位置编码
         if name.endswith(".self_attn.rotary_emb.inv_freq"):
             return False
         
-        # 精确控制 Attention 块的合并范围
-        # 只排除 O 投影，允许合并 Q, K, V
-        if name.endswith((".self_attn.o_proj.weight", ".self_attn.o_proj.bias")):
-            return False
+        # # 精确控制 Attention 块的合并范围
+        # if name.endswith((".self_attn.o_proj.weight", ".self_attn.o_proj.bias")):
+        #     return False
             
-        # 其他层（包括 MLP, Q/K/V 投影, layernorms）都进行合并
         return True 
     return False
 
@@ -368,15 +368,6 @@ def convert(args, device):
         # 使用标准化后的 donor_weights 进行检查
         if key in donor_weights and key in original_weights and need_merge(key) and base_weights[key].shape == donor_weights[key].shape:
             # 修复点：正确地将参数key映射到其所属的模块（self_attn 或 mlp）
-            parts = key.split('.')
-            module_path = ""
-            if 'self_attn' in parts:
-                # 例如: model.layers.0.self_attn.q_proj.weight -> model.layers.0.self_attn
-                module_path = ".".join(parts[:parts.index('self_attn')+1])
-            elif 'mlp' in parts:
-                # 例如: model.layers.0.mlp.gate_proj.weight -> model.layers.0.mlp
-                module_path = ".".join(parts[:parts.index('mlp')+1])
-
             module_path = key.rsplit('.', 1)[0]
             divergence = divergence_scores.get(module_path, (t_low + t_high) / 2)
             
@@ -391,7 +382,7 @@ def convert(args, device):
                 # 确保模型被加载以计算协方差
                 model_a_for_cov = AutoModelForVision2Seq.from_pretrained(args.base_model_path, torch_dtype=torch.bfloat16).to(device)
                 # 使用正确的散度key（即模块路径）来计算投影
-                projector = compute_covariance_and_projector(model_a_for_cov, tokenizer_for_cov, divergence_key, args).to(device)
+                projector = compute_covariance_and_projector(model_a_for_cov, tokenizer_for_cov, module_path, args).to(device)
                 delta = w_b - w_a
                 
                 # 确保投影矩阵和权重张量可以进行矩阵乘法
@@ -480,9 +471,9 @@ if __name__ == "__main__":
     parser.add_argument('--high_div_percentile', type=float, default=66, help="Percentile to define high divergence threshold.")
     
     # λ coefficients for each divergence zone
-    parser.add_argument('--lambda_s_low', type=float, default=1.5, help="Synergy coeff for low divergence.")
+    parser.add_argument('--lambda_s_low', type=float, default=2.0, help="Synergy coeff for low divergence.")
     parser.add_argument('--lambda_c_low', type=float, default=0.0, help="Conflict coeff for low divergence.")
-    parser.add_argument('--lambda_s_mid', type=float, default=1.5, help="Synergy coeff for medium divergence.")
+    parser.add_argument('--lambda_s_mid', type=float, default=1.2, help="Synergy coeff for medium divergence.")
     parser.add_argument('--lambda_c_mid', type=float, default=0.0, help="Conflict coeff for medium divergence.")
     parser.add_argument('--lambda_o', type=float, default=1.0, help="Orthogonal knowledge coefficient (usually 1.0).")
     

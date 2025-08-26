@@ -12,13 +12,13 @@ import argparse
 from typing import Optional
 from copy import deepcopy
 
-OUTPUT_PATH = "converted-cogvlm-base-noNorm"
+OUTPUT_PATH = "./merged_models/converted-cogvlm-base-noNorm"
 
 CKPT_PATH = {
-    "cogvlm_chat": "/yeesuanAI05/thumt/dyy/model/cogvlm-chat-hf", #"/yeesuanAI05/thumt/dyy/model/cogvlm-chat-hf",
-    "cogvlm_grounding": "/yeesuanAI05/thumt/dyy/model/cogvlm-grounding-generalist-hf",
-    "llava": "/yeesuanAI05/thumt/dyy/model/llava-v1.5-7b",
-    "mplug_owl": "/yeesuanAI05/thumt/dyy/model/mplug-owl2-llama2-7b"
+    "cogvlm_chat": "/home/user/xieqiuhao/AdaMMS/downloaded_models/cogvlm-chat-hf", #"/yeesuanAI05/thumt/dyy/model/cogvlm-chat-hf", zai-org/cogvlm-chat-hf
+    "cogvlm_grounding": "/home/user/xieqiuhao/AdaMMS/downloaded_models/cogvlm-grounding-generalist-hf",
+    "llava": "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-v1.5-7b",
+    "mplug_owl": "/home/user/xieqiuhao/AdaMMS/downloaded_models/mplug-owl2-llama2-7b"
 }
 
 INDEX_FILENAME = {
@@ -242,7 +242,7 @@ if __name__ == "__main__":
     # compare_index()
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=str, default=None, help="Output checkpoint path")
-    parser.add_argument('--alpha', type=float, default=1.0)
+    parser.add_argument('--alpha', type=float, default=0.2)
     parser.add_argument('--interpolation', action='store_true')
     parser.add_argument('--with-grounding', action='store_true')
     parser.add_argument('--noLN', action='store_true')

@@ -95,7 +95,8 @@ class VQAv2ProbeDataset(Dataset):
     def __init__(self, hf_dataset, max_samples=100):
         self.samples = []
         for item in hf_dataset:
-            self.samples.append({"image": item["image"], "text": item["question"]})
+            answer = item["answers"][0]["answer"] if item.get("answers") else "yes"  # 假设有answers，取第一个
+            self.samples.append({"image": item["image"], "text": item["question"], "answer": answer})
             if len(self.samples) >= max_samples: break
     def __len__(self):
         return len(self.samples)
@@ -103,16 +104,14 @@ class VQAv2ProbeDataset(Dataset):
         item = self.samples[idx]
         image = item["image"]
         if image.mode == 'RGBA': image = image.convert('RGB')
-        return {"image": image, "text": item['text']}
+        return {"image": image, "text": item['text'], "answer": item['answer']}
 
 def collate_fn_factory(processor):
     def collate_fn(batch):
         images = [item["image"] for item in batch]
         texts = [item['text'] for item in batch]
-        messages_batch = [[{"role": "user", "content": [{"type": "text", "text": text},{"type": "image"}]}] for text in texts]
-        prompt_batch = [processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_batch]
-        inputs = processor(text=prompt_batch, images=images, return_tensors="pt", padding=True)
-        return inputs
+        answers = [item['answer'] for item in batch]
+        return {"images": images, "texts": texts, "answers": answers}
     return collate_fn
 
 # --- 核心实现类 ---
@@ -140,12 +139,12 @@ class AGIDPMMerger:
     
     def _cache_activations_raw(self, model_info, model_path, required_activations, dataset_raw):
         """为每个模型从原始数据集处理数据并缓存激活（内存优化版）。"""
-        cache_path = os.path.join(self.cache_dir, f"activations_{model_info}.pt")
+        cache_path = os.path.join(self.cache_dir, f"importance_{model_info}.pt")
         if os.path.exists(cache_path) and not self.args.force_recompute:
-            print(f"激活缓存文件 {cache_path} 已存在, 跳过。")
+            print(f"重要性缓存文件 {cache_path} 已存在, 跳过。")
             return torch.load(cache_path, map_location="cpu")
 
-        print(f"正在为 {model_info} ({os.path.basename(model_path)}) 缓存激活...")
+        print(f"正在为 {model_info} ({os.path.basename(model_path)}) 缓存重要性...")
         is_vision_model = "VL" in model_path or "llava" in model_path.lower()
         is_llava = "llava" in model_path.lower()
         
@@ -163,60 +162,8 @@ class AGIDPMMerger:
             model_to_hook = model.model
         target_modules = self._get_target_module_map(model_to_hook)
         
-        # 内存优化：不再存储所有张量，而是存储运行总和和计数
-        activation_stats = defaultdict(lambda: {
-            "input_sum": None, "input_tokens": 0,
-            "output_sum": None, "output_tokens": 0
-        })
-    
-        # 内存优化：钩子函数直接更新总和，而不是追加到列表
-        def get_hook_with_kwargs(name, req_act):
-            def hook_fn(module, args, kwargs, output):
-                # 处理输出
-                if "output" in req_act:
-                    out_tensor = None
-                    if isinstance(output, tuple) and len(output) > 0:
-                        out_tensor = output[0]
-                    else:
-                        out_tensor = output
-                    
-                    if isinstance(out_tensor, torch.Tensor):
-                        t_float = out_tensor.detach().cpu().float()
-                        t_reshaped = t_float.reshape(-1, t_float.shape[-1])
-                        current_sum = torch.sum(t_reshaped, dim=0)
-                        
-                        if activation_stats[name]["output_sum"] is None:
-                            activation_stats[name]["output_sum"] = current_sum
-                        else:
-                            activation_stats[name]["output_sum"] += current_sum
-                        activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
-            
-                # 处理输入
-                if "input" in req_act:
-                    in_tensor = None
-                    if "hidden_states" in kwargs:
-                        in_tensor = kwargs["hidden_states"]
-                    elif isinstance(args, tuple) and len(args) > 0 and isinstance(args[0], torch.Tensor):
-                        in_tensor = args[0]
-                        
-                    if isinstance(in_tensor, torch.Tensor):
-                        t_float = in_tensor.detach().cpu().float()
-                        t_reshaped = t_float.reshape(-1, t_float.shape[-1])
-                        current_sum = torch.sum(t_reshaped, dim=0)
-
-                        if activation_stats[name]["input_sum"] is None:
-                            activation_stats[name]["input_sum"] = current_sum
-                        else:
-                            activation_stats[name]["input_sum"] += current_sum
-                        activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
-            return hook_fn
-    
-        hooks = []
-        for name, module in target_modules.items():
-            hooks.append(module.register_forward_hook(
-                get_hook_with_kwargs(name, required_activations), 
-                with_kwargs=True
-            ))
+        # 内存优化：存储重要性总和和计数
+        importance_stats = defaultdict(lambda: {"sum": None, "count": 0})
     
         original_samples = []
         dataset_iterator = iter(dataset_raw)
@@ -224,53 +171,74 @@ class AGIDPMMerger:
             if len(original_samples) >= self.args.probe_samples: break
             image = item["image"]
             if image.mode == 'RGBA': image = image.convert('RGB')
-            original_samples.append({"image": image, "text": item["question"]})
+            answer = item["answers"][0]["answer"] if item.get("answers") else "yes"
+            original_samples.append({"image": image, "text": item["question"], "answer": answer})
         
         with torch.no_grad():
             num_batches = (len(original_samples) + self.args.probe_batch_size - 1) // self.args.probe_batch_size
             pbar = tqdm(range(0, len(original_samples), self.args.probe_batch_size), total=num_batches, desc=f"前向传播 {model_info}")
             for i in pbar:
                 batch_data = original_samples[i:i+self.args.probe_batch_size]
-                images = [item["image"] for item in batch_data]
-                texts = [item['text'] for item in batch_data]
+                images = [item["image"] for item in batch_data] if images else None
+                texts = [item["text"] for item in batch_data]
+                answers = [item["answer"] for item in batch_data]
                 
-                if is_llava:
-                    conversations = [{"role": "user", "content": [{"type": "text", "text": t}, {"type": "image"}]} for t in texts]
-                    prompts = [processor.apply_chat_template([conv], tokenize=False, add_generation_prompt=True) for conv in conversations]
-                    inputs = processor(text=prompts, images=images, return_tensors="pt", padding=True)
-                elif is_vision_model:
-                    messages_batch = [[{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}] for text in texts]
-                    prompt_batch = [processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_batch]
-                    inputs = processor(text=prompt_batch, images=images, return_tensors="pt", padding=True)
+                if is_llava or is_vision_model:
+                    user_messages = [[{"role": "user", "content": [{"type": "text", "text": t}, {"type": "image"}]}] for t in texts]
+                    user_prompt = [processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in user_messages]
+                    user_inputs = processor(text=user_prompt, images=images, return_tensors="pt", padding=True)
+                    prompt_length = user_inputs["input_ids"].shape[1]
+                    
+                    full_messages = [user_messages[j] + [{"role": "assistant", "content": a}] for j, a in enumerate(answers)]
+                    full_prompt = [processor.apply_chat_template(m, tokenize=False) for m in full_messages]
+                    inputs = processor(text=full_prompt, images=images, return_tensors="pt", padding=True)
+                    
+                    labels = inputs["input_ids"].clone()
+                    labels[:, :prompt_length] = -100
+                    inputs["labels"] = labels
                 else:
                     tokenizer = processor
-                    formatted_texts = [tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True) for text in texts]
-                    inputs = tokenizer(text=formatted_texts, return_tensors="pt", padding=True, truncation=True)
+                    user_formatted = [tokenizer.apply_chat_template([{"role": "user", "content": t}], tokenize=False, add_generation_prompt=True) for t in texts]
+                    user_inputs = tokenizer(user_formatted, return_tensors="pt", padding=True, truncation=True)
+                    prompt_length = user_inputs["input_ids"].shape[1]
+                    
+                    full_formatted = [tokenizer.apply_chat_template([{"role": "user", "content": t}, {"role": "assistant", "content": a}], tokenize=False) for t, a in zip(texts, answers)]
+                    inputs = tokenizer(text=full_formatted, return_tensors="pt", padding=True, truncation=True)
+                    
+                    labels = inputs["input_ids"].clone()
+                    labels[:, :prompt_length] = -100
+                    inputs["labels"] = labels
                 
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                model(**inputs)
+                output = model(**inputs)
+                loss = output.loss
+                loss.backward()
+                
+                for name, module in target_modules.items():
+                    if hasattr(module, 'weight') and module.weight.grad is not None:
+                        current_import = torch.abs(module.weight * module.weight.grad).detach().cpu()
+                        if importance_stats[name]["sum"] is None:
+                            importance_stats[name]["sum"] = current_import
+                        else:
+                            importance_stats[name]["sum"] += current_import
+                        importance_stats[name]["count"] += 1
+                
+                model.zero_grad()
     
-        for h in hooks: h.remove()
-    
-        # 内存优化：从运行总和计算最终平均值
-        averaged_activations = {}
-        for name, stats in activation_stats.items():
-            averaged_activations[name] = {}
-            if stats["input_sum"] is not None and stats["input_tokens"] > 0:
-                averaged_activations[name]["input"] = stats["input_sum"] / stats["input_tokens"]
-            if stats["output_sum"] is not None and stats["output_tokens"] > 0:
-                averaged_activations[name]["output"] = stats["output_sum"] / stats["output_tokens"]
+        # 计算平均重要性
+        averaged_importance = {}
+        for name, stats in importance_stats.items():
+            if stats["sum"] is not None and stats["count"] > 0:
+                averaged_importance[name] = stats["sum"] / stats["count"]
 
-        torch.save(averaged_activations, cache_path)
-        del model, processor, hooks, activation_stats, averaged_activations
+        torch.save(averaged_importance, cache_path)
+        del model, processor, importance_stats, averaged_importance
         gc.collect() 
         torch.cuda.empty_cache()
-        # 返回值是可选的，因为结果已经保存到文件了
-        # return averaged_activations
 
     def stage1_cache_all_activations(self):
         """阶段一：为所有模型分别缓存所需的激活。"""
-        print("\n--- [阶段一: 缓存所有激活] ---")
+        print("\n--- [阶段一: 缓存所有重要性] ---")
         
         # 直接加载原始数据集，不预先处理
         probe_dataset_raw = load_dataset("lmms-lab/VQAv2", split="validation", streaming=True)
@@ -282,22 +250,22 @@ class AGIDPMMerger:
 
     def stage2_analyze_neurons_and_get_masks(self):
         """阶段二：计算近似SNIP并生成非冲突掩码。"""
-        print("\n--- [阶段二: 近似SNIP神经元分析] ---")
+        print("\n--- [阶段二: 神经元分析与选举] ---")
         mask_cache_path = os.path.join(self.cache_dir, f"non_conflict_masks_r{self.args.top_k_ratio}.pt")
         if os.path.exists(mask_cache_path) and not self.args.force_recompute:
             print("非冲突掩码缓存文件已存在, 跳过。")
             return
 
-        print("加载所有权重和缓存的激活...")
+        print("加载所有权重和缓存的重要性...")
         weights_A = load_weights(self.args.base_model_path)
         weights_B_raw = load_weights(self.args.donor_model_path)
         weights_C = load_weights(self.args.original_model_path)
         weights_B = normalize_llm_keys(weights_B_raw, list(weights_C.keys())); del weights_B_raw
 
-        activations = {
-            'A': torch.load(os.path.join(self.cache_dir, "activations_A.pt")),
-            'B': torch.load(os.path.join(self.cache_dir, "activations_B.pt")),
-            'C': torch.load(os.path.join(self.cache_dir, "activations_C.pt"))
+        importance = {
+            'A': torch.load(os.path.join(self.cache_dir, "importance_A.pt")),
+            'B': torch.load(os.path.join(self.cache_dir, "importance_B.pt")),
+            'C': torch.load(os.path.join(self.cache_dir, "importance_C.pt"))
         }
 
         non_conflict_masks = {}
@@ -313,30 +281,31 @@ class AGIDPMMerger:
                 
             module_name = ".".join(key.split('.')[1:-1]) # e.g., layers.0.mlp
             try:
-                # 计算近似梯度
-                delta_Y_A = activations['A'][module_name]['output'] - activations['C'][module_name]['output']
-                g_approx_A = torch.outer(delta_Y_A, activations['A'][module_name]['input'])
+                I_A = importance['A'][module_name]
+                I_B = importance['B'][module_name]
+                I_C = importance['C'][module_name]
                 
-                delta_Y_B = activations['B'][module_name]['output'] - activations['C'][module_name]['output']
-                g_approx_B = torch.outer(delta_Y_B, activations['B'][module_name]['input'])
+                r = self.args.top_k_ratio
+                k = int(I_A.numel() * r)
+                thresh_A = torch.topk(I_A.flatten(), k=k)[0].min()
+                thresh_B = torch.topk(I_B.flatten(), k=k)[0].min()
+                thresh_C = torch.topk(I_C.flatten(), k=k)[0].min()
                 
-                # 计算近似SNIP分数
-                W_A, W_B, W_C = weights_A[key], weights_B[key_in_c], weights_C[key_in_c]
-                snip_A = (W_A.float() * g_approx_A).abs()
-                snip_B = (W_B.float() * g_approx_B).abs()
-
-                # 选举与分离
-                k = int(snip_A.numel() * self.args.top_k_ratio)
-                mask_A = snip_A >= torch.topk(snip_A.flatten(), k=k)[0].min()
-                mask_B = snip_B >= torch.topk(snip_B.flatten(), k=k)[0].min()
+                mask_A = I_A >= thresh_A
+                mask_B = I_B >= thresh_B
+                mask_base = I_C >= thresh_C
                 
-                tau_A, tau_B = W_A - W_C, W_B - W_C
-                conflict_mask = (mask_A & mask_B) & (torch.sign(tau_A) != torch.sign(tau_B))
+                T_A = mask_A & mask_base
+                T_B = mask_B & mask_base
                 
-                final_mask_B = mask_B & (~conflict_mask)
-                non_conflict_masks[key] = final_mask_B
+                intersect_AB = T_A & T_B
+                disjoint_T_A = T_A & ~intersect_AB
+                disjoint_T_B = T_B & ~intersect_AB
+                
+                non_conflict_masks[key + '_A'] = disjoint_T_A
+                non_conflict_masks[key + '_B'] = disjoint_T_B
             except KeyError:
-                print(f"警告: 模块 {module_name} 的激活数据不完整，跳过参数 {key}。")
+                print(f"警告: 模块 {module_name} 的重要性数据不完整，跳过参数 {key}。")
                 continue
 
         torch.save(non_conflict_masks, mask_cache_path)
@@ -344,9 +313,9 @@ class AGIDPMMerger:
 
     def stage3_project_and_merge(self):
         """阶段三：执行分离投影合并。"""
-        print("\n--- [阶段三: 分离投影合并] ---")
+        print("\n--- [阶段三: 非冲突合并] ---")
         
-        print("加载所有权重、掩码和方向向量...")
+        print("加载所有权重、掩码...")
         weights_A = load_weights(self.args.base_model_path)
         weights_B_raw = load_weights(self.args.donor_model_path)
         weights_C = load_weights(self.args.original_model_path)
@@ -354,50 +323,26 @@ class AGIDPMMerger:
 
         mask_cache_path = os.path.join(self.cache_dir, f"non_conflict_masks_r{self.args.top_k_ratio}.pt")
         non_conflict_masks = torch.load(mask_cache_path)
-        activations_A = torch.load(os.path.join(self.cache_dir, "activations_A.pt"))
 
-        # 计算全局任务上下文 bar_tau_B，按参数类型分组
-        global_tau = defaultdict(list)
-        for key in tqdm(non_conflict_masks.keys(), desc="收集 tau_B 以计算全局上下文"):
-            if not need_merge(key): continue
+        final_merged_weights = weights_C.copy()  # 以C作为基模型
+        for key in tqdm(weights_A.keys(), desc="执行合并"):
+            if not need_merge(key): 
+                final_merged_weights[key] = weights_A[key]  # 非合并参数使用A
+                continue
+            
             key_in_c = key.replace("model.language_model.", "model.")
             if not (key_in_c in weights_B and key_in_c in weights_C): continue
-            tau_B = (weights_B[key_in_c] - weights_C[key_in_c]).float()
-            param_type = key.split('.')[-2]  # 如 'q_proj' 或 'mlp'
-            global_tau[param_type].append(tau_B)
-
-        bar_tau_B = {}
-        for ptype, taus in global_tau.items():
-            bar_tau_B[ptype] = torch.mean(torch.stack(taus), dim=0)
-
-        epsilon = 1e-8
-        final_merged_weights = weights_A.copy()
-        for key, mask_B in tqdm(non_conflict_masks.items(), desc="执行合并"):
-            key_in_c = key.replace("model.language_model.", "model.")
-            module_name = ".".join(key.split('.')[1:-1])
-
+            
             W_A, W_B, W_C = weights_A[key], weights_B[key_in_c], weights_C[key_in_c]
-            d_i = activations_A[module_name]['input'].to(self.device)  # 投影方向
+            tau_A = (W_A - W_C).to(self.device)
+            tau_B = (W_B - W_C).to(self.device)
             
-            tau_B = (W_B - W_C).to(self.device).float()
-            param_type = key.split('.')[-2]
-            bar = bar_tau_B[param_type].to(self.device)
-            trace_val = torch.trace(tau_B.t() @ bar)
-            norm_tau = torch.norm(tau_B, p='fro')
-            norm_bar = torch.norm(bar, p='fro')
-            cos_val = trace_val / (norm_tau * norm_bar + epsilon)
-            c_i = max(0, cos_val.item())
-            tau_B_coord = c_i * tau_B
-            tau_B_disjoint = tau_B_coord * mask_B.to(self.device)
+            mask_A = non_conflict_masks.get(key + '_A')
+            mask_B = non_conflict_masks.get(key + '_B')
             
-            d_i_norm_sq = torch.sum(d_i * d_i) + epsilon
-            proj_scalar = torch.matmul(tau_B_disjoint, d_i) / d_i_norm_sq
-            tau_B_proj = torch.outer(proj_scalar, d_i)
-            tau_B_ortho = tau_B_disjoint - tau_B_proj
-
-            # 最终合并
-            W_star = W_A.to(self.device).float() + self.args.lambda_proj * tau_B_proj + self.args.lambda_ortho * tau_B_ortho
-            final_merged_weights[key] = W_star.cpu().to(W_A.dtype)
+            if mask_A is not None and mask_B is not None:
+                W_star = W_C.to(self.device).float() + 1.0 * (tau_A * mask_A.to(self.device)) + 1.0 * (tau_B * mask_B.to(self.device))
+                final_merged_weights[key] = W_star.cpu().to(W_A.dtype)
         
         # 保存模型
         self._save_model(final_merged_weights)
@@ -440,7 +385,7 @@ if __name__ == "__main__":
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--mode', type=str, default="Eagidpm-default", help="为本次合并配置命名。")
+    parser.add_argument('--mode', type=str, default="agidpm-default", help="为本次合并配置命名。")
     parser.add_argument('--cuda_device', type=int, default=7, help="使用的 CUDA 设备编号。")
 
     # 数据集配置
@@ -450,7 +395,7 @@ if __name__ == "__main__":
     # AGIDPM 合并超参数
     parser.add_argument('--top_k_ratio', type=float, default=0.2, help="用于选举关键神经元的Top-K比率。")
     parser.add_argument('--lambda_proj', type=float, default=1.0, help="投影（相关）分量的系数。")
-    parser.add_argument('--lambda_ortho', type=float, default=1.0, help="正交（无关）分量的系数。")
+    parser.add_argument('--lambda_ortho', type=float, default=0.4, help="正交（无关）分量的系数。")
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的激活或掩码。")

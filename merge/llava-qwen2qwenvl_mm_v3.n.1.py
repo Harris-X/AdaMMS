@@ -74,13 +74,32 @@ def normalize_llm_keys(weights_to_norm: dict, reference_keys: list) -> dict:
             
     return normalized_weights
 
-def need_merge(name: str) -> bool:
+def need_merge_(name: str) -> bool:
     """根据层名判断是否需要合并 - 仅合并LLM的权重参数。"""
     is_in_llm_layers = "language_model.layers" in name or "model.layers" in name
     if not is_in_llm_layers: return False
     if not name.endswith(".weight"): return False
     if ".inv_freq" in name: return False # "layernorm" in name or "embed_tokens" in name or "norm" in name or 
     return True
+
+def need_merge(name: str) -> bool:
+    """
+    根据层名判断是否需要进行基于激活的复杂合并。
+    此函数现在仅选择核心 Transformer 层中的线性层权重。
+    """
+    # 检查是否在 transformer layers 中
+    is_in_layers = name.startswith("model.layers.") or name.startswith("language_model.layers.")
+    if not is_in_layers:
+        return False
+
+    # 仅合并线性层的权重，排除所有 layernorm 和其他非线性层参数
+    if name.endswith(('.weight')) and 'layernorm' not in name and 'norm' not in name:
+        # 排除旋转位置编码
+        if name.endswith(".self_attn.rotary_emb.inv_freq"):
+            return False
+        return True
+        
+    return False
 
 # --- 核心实现类 ---
 class SAMSDREAMMerger:
@@ -536,6 +555,29 @@ class SAMSDREAMMerger:
             W_star = W_A.to(self.device) + self.args.lambda_proj * tau_proj + self.args.lambda_ortho * tau_ortho
             final_merged_weights[key] = W_star.cpu().to(weights_A[key].dtype)
         
+         # --- 新增：单独处理边缘层 ---
+        print("正在使用简单加权平均处理边缘层 (如 final norm, lm_head)...")
+        # 找到正确的 final norm 和 lm_head 的键名
+        final_norm_key = next((k for k in weights_A if k.endswith('norm.weight') and 'layers' in k), None)
+        model_norm_key = next((k for k in weights_A if k.endswith('norm.weight') and 'model' in k), None)
+        lm_head_key = next((k for k in weights_A if k.endswith('lm_head.weight')), None)
+
+        # 使用 lambda_proj 作为简单平均的权重
+        lam = self.args.lambda_proj
+        
+        if final_norm_key and final_norm_key in weights_B:
+            print(f"合并: {final_norm_key}")
+            W_A_norm = weights_A[final_norm_key].float()
+            W_B_norm = weights_B[final_norm_key].float()
+            final_merged_weights[final_norm_key] = ((1 - lam) * W_A_norm + lam * W_B_norm).to(W_A_norm.dtype)
+
+        if lm_head_key and lm_head_key in weights_B:
+            print(f"合并: {lm_head_key}")
+            W_A_head = weights_A[lm_head_key].float()
+            W_B_head = weights_B[lm_head_key].float()
+            final_merged_weights[lm_head_key] = ((1 - lam) * W_A_head + lam * W_B_head).to(W_A_head.dtype)
+        # --- 新增结束 ---
+
         self._save_model(final_merged_weights)
 
     def _save_model(self, merged_weights):
@@ -580,7 +622,7 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="sams-dream-0.3-0.8-norm", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=6, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 数据集配置 (修改为元探测数据集)
     parser.add_argument('--n_mmbench', type=int, default=40, help="用于元探测集的MMBench样本数。")
