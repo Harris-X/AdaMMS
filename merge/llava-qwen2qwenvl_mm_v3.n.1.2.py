@@ -560,8 +560,10 @@ class SAMSDREAMMerger:
         
         # 新增：安全合并的超参数
         beta_safety = getattr(self.args, "beta_safety", 2.0)
-        rho_max = getattr(self.args, "rho_ortho_max_ratio", 0.5)  # 正交/投影 规模上限
-        delta_mode = getattr(self.args, "delta_mode", "delta")    # 'delta' 使用 W_B-W_C, 'direct' 使用 W_B
+        rho_max = getattr(self.args, "rho_ortho_max_ratio", 0.5)
+        delta_mode = getattr(self.args, "delta_mode", "delta")
+        two_sided = getattr(self.args, "two_sided_weights", True)  # 新增：权重双侧投影
+        lambda_bias = getattr(self.args, "lambda_bias", 0.1)       # 新增：偏置合并主系数
 
         pbar = tqdm(disjoint_masks.items(), desc="【SAM-S-DREAM】执行重投影融合")
         processed_keys = set()
@@ -578,21 +580,40 @@ class SAMSDREAMMerger:
             tau_B_update = tau_B * M_prime_B.to(self.device)
 
             if W_A.ndim == 2 and key.endswith(".weight"):
-                # --- 多方向投影：基于输入子空间 D_in ---
+                # --- 构造输入子空间 P_in ---
                 D_in = None
                 if module_name in activations_A and "input_samples" in activations_A[module_name]:
-                    D_in = activations_A[module_name]["input_samples"].to(self.device).float()  # [m, in_dim]
+                    D_in = activations_A[module_name]["input_samples"].to(self.device).float()  # [m_in, in_dim]
                 elif module_name in activations_A and "input" in activations_A[module_name]:
                     D_in = activations_A[module_name]["input"].unsqueeze(0).to(self.device).float()  # [1, in_dim]
 
+                # --- 构造输出子空间 P_out（优先使用 B-C 的输出变化子空间）---
+                D_out = None
+                if module_name in activations_B and "output_samples" in activations_B[module_name] and \
+                   module_name in activations_C and "output_samples" in activations_C[module_name]:
+                    D_out = (activations_B[module_name]["output_samples"] -
+                             activations_C[module_name]["output_samples"]).to(self.device).float()  # [m_out, out_dim]
+                elif module_name in activations_B and "output" in activations_B[module_name] and \
+                     module_name in activations_C and "output" in activations_C[module_name]:
+                    D_out = (activations_B[module_name]["output"] -
+                             activations_C[module_name]["output"]).unsqueeze(0).to(self.device).float()  # [1, out_dim]
+
                 if D_in is not None:
-                    # 构造投影矩阵 P = D^T (D D^T)^+ D
-                    G = D_in @ D_in.T + self.EPS * torch.eye(D_in.shape[0], device=self.device)
-                    P_cols = D_in.T @ torch.linalg.pinv(G) @ D_in      # [in_dim, in_dim]
-                    tau_proj = tau_B_update @ P_cols                    # 每行向量投影到 span(D_in)
+                    # P_in = D_in^T (D_in D_in^T)^+ D_in
+                    G_in = D_in @ D_in.T + self.EPS * torch.eye(D_in.shape[0], device=self.device)
+                    P_in = D_in.T @ torch.linalg.pinv(G_in) @ D_in      # [in_dim, in_dim]
+                    if two_sided and (D_out is not None):
+                        # P_out = D_out^T (D_out D_out^T)^+ D_out
+                        G_out = D_out @ D_out.T + self.EPS * torch.eye(D_out.shape[0], device=self.device)
+                        P_out = D_out.T @ torch.linalg.pinv(G_out) @ D_out  # [out_dim, out_dim]
+                        # 双侧投影
+                        tau_proj = P_out @ tau_B_update @ P_in
+                    else:
+                        # 仅输入侧投影（与原实现兼容）
+                        tau_proj = tau_B_update @ P_in
                     tau_ortho = tau_B_update - tau_proj
                 else:
-                    # 回退到单方向
+                    # 回退到单方向（平均输入向量）
                     d_i = activations_A[module_name]['input'].to(self.device).float()
                     d_i_norm_sq = torch.sum(d_i * d_i)
                     if d_i_norm_sq > self.EPS:
@@ -608,22 +629,22 @@ class SAMSDREAMMerger:
                 D_out = None
                 if module_name in activations_B and "output_samples" in activations_B[module_name] and \
                    module_name in activations_C and "output_samples" in activations_C[module_name]:
-                    # 使用 B-C 的输出方向作为子空间（保留B相对C的变化子空间）
-                    D_out = (activations_B[module_name]["output_samples"] - 
+                    D_out = (activations_B[module_name]["output_samples"] -
                              activations_C[module_name]["output_samples"]).to(self.device).float()  # [m, out_dim]
                 elif module_name in activations_B and "output" in activations_B[module_name] and \
                      module_name in activations_C and "output" in activations_C[module_name]:
-                    D_out = (activations_B[module_name]["output"] - 
+                    D_out = (activations_B[module_name]["output"] -
                              activations_C[module_name]["output"]).unsqueeze(0).to(self.device).float()  # [1, out_dim]
                 
                 if D_out is not None:
                     G = D_out @ D_out.T + self.EPS * torch.eye(D_out.shape[0], device=self.device)
                     P_rows = D_out.T @ torch.linalg.pinv(G) @ D_out      # [out_dim, out_dim]
-                    tau_proj = P_rows @ tau_B_update                     # 将向量投影到 span(D_out)
+                    tau_proj = P_rows @ tau_B_update                     # 只保留 B 相对 C 的输出变化方向
                     tau_ortho = tau_B_update - tau_proj
                 else:
+                    # 没有可靠的输出子空间时，对偏置合并极度保守
                     tau_proj = torch.zeros_like(tau_B_update)
-                    tau_ortho = tau_B_update
+                    tau_ortho = torch.zeros_like(tau_B_update)
             else:
                 continue
 
@@ -661,7 +682,16 @@ class SAMSDREAMMerger:
 
             adaptive_lambda_ortho = self.args.lambda_ortho * safety_factor
 
-            W_star = W_A_device + self.args.lambda_proj * tau_proj + adaptive_lambda_ortho * tau_ortho
+            # --- 偏置的主系数更小，且默认不引入正交项 ---
+            if W_A.ndim == 1 and key.endswith(".bias"):
+                self_lambda_proj = min(self.args.lambda_proj, lambda_bias)
+                self_lambda_ortho = 0.0  # 偏置正交项默认禁用
+            else:
+                self_lambda_proj = self.args.lambda_proj
+                # 正交项安全系数计算（已有功能扰动比），保留原逻辑
+                # adaptive_lambda_ortho 已在下方计算
+
+            W_star = W_A_device + self_lambda_proj * tau_proj + adaptive_lambda_ortho * tau_ortho
             final_merged_weights[key] = W_star.cpu().to(weights_A[key].dtype)
 
         # Part 2: 其余参数 (含 norm) 的保守加权平均
@@ -757,6 +787,8 @@ if __name__ == "__main__":
     parser.add_argument('--probe_directions', type=int, default=8, help="每层缓存的输入/输出方向样本数，用于多方向投影。")  # 新增
     parser.add_argument('--rho_ortho_max_ratio', type=float, default=0.5, help="正交增量相对投影增量的最大规模比。")        # 新增
     parser.add_argument('--delta_mode', type=str, default='delta', choices=['delta','direct'], help="delta=使用W_B-W_C；direct=使用W_B。")  # 新增
+    parser.add_argument('--two_sided_weights', type=bool, default=True, help="是否启用权重双侧投影。")  # 新增
+    parser.add_argument('--lambda_bias', type=float, default=0.1, help="偏置合并主系数。")  # 新增
     
     # 功能性参数
     parser.add_argument('--force_recompute', action='store_true', help="强制重新计算缓存的数据。")
