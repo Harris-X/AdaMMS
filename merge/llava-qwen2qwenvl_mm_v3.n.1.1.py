@@ -644,7 +644,7 @@ class SAMSDREAMMerger:
     def run_pipeline(self):
         """按顺序执行所有阶段。"""
         # self.stage1_cache_all_activations()
-        self.stage2_regularized_disjoint_mask_generation()
+        # self.stage2_regularized_disjoint_mask_generation()
         self.stage3_disentangled_reprojection_fusion()
 
 # ########################################################################## #
@@ -658,11 +658,11 @@ if __name__ == "__main__":
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--mode', type=str, default="sams-dream-0.2-0.9-norm", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--mode', type=str, default="sams-dream-0.1-0.8-norm", help="为本次合并配置命名。")
+    parser.add_argument('--cuda_device', type=int, default=6, help="使用的 CUDA 设备编号。")
 
     # 数据集配置 (修改为元探测数据集)
-    parser.add_argument('--n_mmbench', type=int, default=10, help="用于元探测集的MMBench样本数。")
+    parser.add_argument('--n_mmbench', type=int, default=40, help="用于元探测集的MMBench样本数。")
     parser.add_argument('--n_vcr', type=int, default=0, help="用于元探测集的VCR样本数。")
     parser.add_argument('--n_docvqa', type=int, default=10, help="用于元探测集的DocVQA样本数。")
     parser.add_argument('--n_vqa', type=int, default=50, help="用于元探测集的VQA v2样本数。")
