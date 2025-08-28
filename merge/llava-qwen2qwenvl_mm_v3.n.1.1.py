@@ -439,7 +439,7 @@ class SAMSDREAMMerger:
             if not (key in weights_B and key in weights_C): 
                 continue
 
-            module_name = ".".join(key.replace("model.language_model.", "model.").split('.')[1:-1])
+            module_name = ".".join(key.replace("language_model.model.", "model.").split('.')[1:-1])
             if module_name not in activations['A'] or 'output' not in activations['A'][module_name]:
                 pbar.set_description(f"警告: 模块 {module_name} 激活缺失，跳过 {key}")
                 continue
@@ -544,7 +544,7 @@ class SAMSDREAMMerger:
             W_A, W_B, W_C = weights_A[key].float(), weights_B[key].float(), weights_C[key].float()
             M_prime_B = M_prime_B.to(self.device)
 
-            module_name = ".".join(key.replace("model.language_model.", "model.").split('.')[1:-1])
+            module_name = ".".join(key.replace("language_model.model.", "model.").split('.')[1:-1])
             tau_B = (W_B - W_C).to(self.device)
             tau_B_update = tau_B * M_prime_B.to(self.device)
 

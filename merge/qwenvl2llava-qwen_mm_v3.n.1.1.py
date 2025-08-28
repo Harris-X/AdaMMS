@@ -545,7 +545,7 @@ class SAMSDREAMMerger:
             W_A, W_B, W_C = weights_A[key].float(), weights_B[key].float(), weights_C[key].float()
             M_prime_B = M_prime_B.to(self.device)
 
-            module_name = ".".join(key.replace("model.language_model.", "model.").split('.')[1:-1])
+            module_name = ".".join(key.replace("language_model.model.", "model.").split('.')[1:-1])
             tau_B = (W_B - W_C).to(self.device)
             tau_B_update = tau_B * M_prime_B.to(self.device)
 
