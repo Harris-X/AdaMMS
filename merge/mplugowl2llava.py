@@ -439,7 +439,7 @@ class SAMSDREAMMerger:
             if not (key in weights_B and key in weights_C): 
                 continue
 
-            module_name = ".".join(key.replace("language_model.model.", "model.").split('.')[1:-1])
+            module_name = ".".join(key.replace("model.language_model.", "model.").split('.')[1:-1])
             if module_name not in activations['A'] or 'output' not in activations['A'][module_name]:
                 pbar.set_description(f"警告: 模块 {module_name} 激活缺失，跳过 {key}")
                 continue
@@ -643,7 +643,7 @@ class SAMSDREAMMerger:
 
     def run_pipeline(self):
         """按顺序执行所有阶段。"""
-        self.stage1_cache_all_activations()
+        # self.stage1_cache_all_activations()
         self.stage2_regularized_disjoint_mask_generation()
         self.stage3_disentangled_reprojection_fusion()
 
@@ -655,19 +655,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="使用I-DREAM进行最终的、兼顾性能与泛化性的模型合并。")
     
     # 基本配置
-    parser.add_argument('--base_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="基础模型A的路径。")
-    parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="贡献模型B的路径。")
+    parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
+    parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--mode', type=str, default="qwenvl2llava-qwen-0.1-0.8", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=3, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--mode', type=str, default="sams-dream-0.2-0.9-norm", help="为本次合并配置命名。")
+    parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
 
     # 数据集配置 (修改为元探测数据集)
-    parser.add_argument('--n_mmbench', type=int, default=40, help="用于元探测集的MMBench样本数。")
+    parser.add_argument('--n_mmbench', type=int, default=10, help="用于元探测集的MMBench样本数。")
     parser.add_argument('--n_vcr', type=int, default=0, help="用于元探测集的VCR样本数。")
-    parser.add_argument('--n_docvqa', type=int, default=0, help="用于元探测集的DocVQA样本数。")
-    parser.add_argument('--n_vqa', type=int, default=0, help="用于元探测集的VQA v2样本数。")
-    parser.add_argument('--n_scienceqa', type=int, default=0, help="用于元探测集的ScienceQA样本数。")
-    parser.add_argument('--n_stvqa', type=int, default=0, help="用于元探测集的ST-VQA样本数。")
+    parser.add_argument('--n_docvqa', type=int, default=10, help="用于元探测集的DocVQA样本数。")
+    parser.add_argument('--n_vqa', type=int, default=50, help="用于元探测集的VQA v2样本数。")
+    parser.add_argument('--n_scienceqa', type=int, default=50, help="用于元探测集的ScienceQA样本数。")
+    parser.add_argument('--n_stvqa', type=int, default=50, help="用于元探测集的ST-VQA样本数。")
     parser.add_argument('--probe_batch_size', type=int, default=1, help="处理引导数据时的批处理大小。")
 
     # I-DREAM 合并超参数
