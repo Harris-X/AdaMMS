@@ -125,6 +125,7 @@ class SAMSDREAMMerger:
             full_module_name_prefix = f"{base_prefix}{name}"
 
             # 仅为需要复杂合并的模块挂钩
+            need_merged = [f"{full_module_name_prefix}.{param_name}" for param_name, _ in module.named_parameters()]
             if any(need_merge(f"{full_module_name_prefix}.{param_name}") for param_name, _ in module.named_parameters()):
                  module_map[name] = module
 
