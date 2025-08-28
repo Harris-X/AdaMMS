@@ -80,7 +80,7 @@ def need_merge(name: str) -> bool:
     - 仅处理 transformer layers 内部的线性权重与 bias
     - 显式排除所有 norm 与 rotary_emb
     """
-    is_in_layers = name.startswith("model.layers.") or name.startswith("language_model.layers.")
+    is_in_layers = name.startswith("model.layers.") or name.startswith("language_model.layers.") or name.startswith("language_model.model.layers.")
     if not is_in_layers:
         return False
 
