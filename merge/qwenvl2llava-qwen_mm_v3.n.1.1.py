@@ -665,10 +665,10 @@ if __name__ == "__main__":
     # 数据集配置 (修改为元探测数据集)
     parser.add_argument('--n_mmbench', type=int, default=40, help="用于元探测集的MMBench样本数。")
     parser.add_argument('--n_vcr', type=int, default=0, help="用于元探测集的VCR样本数。")
-    parser.add_argument('--n_docvqa', type=int, default=0, help="用于元探测集的DocVQA样本数。")
-    parser.add_argument('--n_vqa', type=int, default=0, help="用于元探测集的VQA v2样本数。")
-    parser.add_argument('--n_scienceqa', type=int, default=0, help="用于元探测集的ScienceQA样本数。")
-    parser.add_argument('--n_stvqa', type=int, default=0, help="用于元探测集的ST-VQA样本数。")
+    parser.add_argument('--n_docvqa', type=int, default=10, help="用于元探测集的DocVQA样本数。")
+    parser.add_argument('--n_vqa', type=int, default=50, help="用于元探测集的VQA v2样本数。")
+    parser.add_argument('--n_scienceqa', type=int, default=50, help="用于元探测集的ScienceQA样本数。")
+    parser.add_argument('--n_stvqa', type=int, default=50, help="用于元探测集的ST-VQA样本数。")
     parser.add_argument('--probe_batch_size', type=int, default=1, help="处理引导数据时的批处理大小。")
 
     # I-DREAM 合并超参数
