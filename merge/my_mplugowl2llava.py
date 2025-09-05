@@ -95,11 +95,11 @@ def need_merge(name: str) -> bool:
     return False
 
 # --- 核心实现类 ---
-class SAMSDREAMMerger:
+class SAFEMerger:
     def __init__(self, args, device):
         self.args = args
         self.device = device
-        self.output_dir = os.path.join("merged_models", f"idream-{args.mode}")
+        self.output_dir = os.path.join("merged_models", f"SAFE-M-{args.mode}")
         self.cache_dir = os.path.join(self.output_dir, "cache")
         
         os.makedirs(self.output_dir, exist_ok=True)
@@ -643,7 +643,7 @@ class SAMSDREAMMerger:
 
     def run_pipeline(self):
         """按顺序执行所有阶段。"""
-        # self.stage1_cache_all_activations()
+        self.stage1_cache_all_activations()
         self.stage2_regularized_disjoint_mask_generation()
         self.stage3_disentangled_reprojection_fusion()
 
@@ -657,18 +657,18 @@ if __name__ == "__main__":
     # 基本配置
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/llava-v1.5-7b", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/mplug-owl2-llama2-7b", help="贡献模型B的路径。")
-    parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
+    parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Llama-2-7b-hf", help="原始共同祖先模型C的路径。")
     parser.add_argument('--mode', type=str, default="my-llava1.5-0.1-0.8", help="为本次合并配置命名。")
-    parser.add_argument('--cuda_device', type=int, default=2, help="使用的 CUDA 设备编号。")
+    parser.add_argument('--cuda_device', type=int, default=3, help="使用的 CUDA 设备编号。")
 
     # 数据集配置 (修改为元探测数据集)
-    parser.add_argument('--n_mmbench', type=int, default=10, help="用于元探测集的MMBench样本数。")
-    parser.add_argument('--n_vcr', type=int, default=0, help="用于元探测集的VCR样本数。")
-    parser.add_argument('--n_docvqa', type=int, default=10, help="用于元探测集的DocVQA样本数。")
-    parser.add_argument('--n_vqa', type=int, default=50, help="用于元探测集的VQA v2样本数。")
-    parser.add_argument('--n_scienceqa', type=int, default=50, help="用于元探测集的ScienceQA样本数。")
-    parser.add_argument('--n_stvqa', type=int, default=50, help="用于元探测集的ST-VQA样本数。")
-    parser.add_argument('--probe_batch_size', type=int, default=1, help="处理引导数据时的批处理大小。")
+    parser.add_argument('--n_mmbench', type=int, default=10, help="用于元探测集的MMBench样本数。") # 40
+    parser.add_argument('--n_vcr', type=int, default=0, help="用于元探测集的VCR样本数。") # 0
+    parser.add_argument('--n_docvqa', type=int, default=0, help="用于元探测集的DocVQA样本数。") # 10
+    parser.add_argument('--n_vqa', type=int, default=0, help="用于元探测集的VQA v2样本数。") # 50
+    parser.add_argument('--n_scienceqa', type=int, default=0, help="用于元探测集的ScienceQA样本数。") # 50
+    parser.add_argument('--n_stvqa', type=int, default=0, help="用于元探测集的ST-VQA样本数。") # 50
+    parser.add_argument('--probe_batch_size', type=int, default=1, help="处理引导数据时的批处理大小。") 
 
     # I-DREAM 合并超参数
     parser.add_argument('--top_k_ratio', type=float, default=0.1, help="【阶段二】用于选举关键神经元的Top-K比率。")
@@ -689,5 +689,5 @@ if __name__ == "__main__":
         print(f"{key}: {value}")
     print("--------------------")
 
-    merger = SAMSDREAMMerger(args, device)
+    merger = SAFEMerger(args, device)
     merger.run_pipeline()
