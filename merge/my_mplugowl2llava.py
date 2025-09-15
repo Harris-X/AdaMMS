@@ -26,6 +26,39 @@ except ImportError:
 
 # --- 权重加载与辅助函数 ---
 
+# liuhaotian/llava-v1.5-7b
+def load_llava_v1_5_7b(args):
+    """加载 liuhaotian/llava-v1.5-7b 模型的权重。"""
+    from llava.model.builder import load_pretrained_model
+    from llava.mm_utils import get_model_name_from_path
+    from llava.eval.run_llava import eval_model
+
+    model_path = "/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-v1.5-7b"
+
+    tokenizer, model, image_processor, context_len = load_pretrained_model(
+        model_path=model_path,
+        model_base=None,
+        model_name=get_model_name_from_path(model_path))
+    print(model)
+
+    return tokenizer, model, image_processor, context_len
+
+
+def load_mplugowl2(args):
+    import torch
+    from PIL import Image
+    from transformers import TextStreamer
+    from mplug_owl2.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+    from mplug_owl2.conversation import conv_templates, SeparatorStyle
+    from mplug_owl2.model.builder import load_pretrained_model
+    from mplug_owl2.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
+
+    model_name = get_model_name_from_path(args.model_path)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, None, model_name, load_8bit=False, load_4bit=False, device="cuda")
+    return tokenizer, model, image_processor, context_len
+
+
+
 def load_weights(base_path, index_filename="model.safetensors.index.json"):
     """根据索引文件或单个文件加载 safetensors 权重。"""
     weights = {}
@@ -689,5 +722,6 @@ if __name__ == "__main__":
         print(f"{key}: {value}")
     print("--------------------")
 
-    merger = SAFEMerger(args, device)
-    merger.run_pipeline()
+    # merger = SAFEMerger(args, device)
+    # merger.run_pipeline()
+    tokenizer, model, image_processor, context_len = load_llava_v1_5_7b(args)

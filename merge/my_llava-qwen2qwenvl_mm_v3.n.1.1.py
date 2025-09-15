@@ -643,8 +643,8 @@ class SAMSDREAMMerger:
 
     def run_pipeline(self):
         """按顺序执行所有阶段。"""
-        # self.stage1_cache_all_activations()
-        # self.stage2_regularized_disjoint_mask_generation()
+        self.stage1_cache_all_activations()
+        self.stage2_regularized_disjoint_mask_generation()
         self.stage3_disentangled_reprojection_fusion()
 
 # ########################################################################## #
