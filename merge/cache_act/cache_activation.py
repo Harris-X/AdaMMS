@@ -34,15 +34,15 @@ import os.path as osp
 import re
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
+import functools
 
 import torch
 import torch.nn as nn
-
+from tqdm import tqdm
 # VLMEvalKit imports
 from vlmeval.config import supported_VLM
 from vlmeval.dataset import build_dataset
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Cache layer activations for a VLM on a dataset")
 	parser.add_argument("--model", required=True, type=str, help="Model name key in supported_VLM (vlmeval/config.py)")
@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--work-dir", type=str, default=".", help="Work dir for intermediate files")
 	parser.add_argument("--save", type=str, default=None, help="Output .pt file path; default under activations/")
 	parser.add_argument("--verbose", action="store_true", help="Print progress and matched modules")
+	parser.add_argument("--use-vllm", action="store_true", help="Pass use_vllm to certain models (e.g., Llama-4, Qwen2-VL series)")
 	return parser.parse_args()
 
 
@@ -148,7 +149,22 @@ def get_hook_with_kwargs(name: str, req_act: Iterable[str], activation_stats: di
 	def hook_fn(module: nn.Module, args, kwargs, output):
 		try:
 			if "output" in req_act:
-				out_tensor = output[0] if isinstance(output, tuple) else output
+				out_tensor = None
+				if isinstance(output, tuple):
+					out_tensor = output[0]
+				elif isinstance(output, list):
+					out_tensor = output[0] if len(output) and isinstance(output[0], torch.Tensor) else None
+				elif isinstance(output, dict):
+					if "hidden_states" in output and isinstance(output["hidden_states"], torch.Tensor):
+						out_tensor = output["hidden_states"]
+					else:
+						# try find first tensor value
+						for v in output.values():
+							if isinstance(v, torch.Tensor):
+								out_tensor = v
+								break
+				else:
+					out_tensor = output
 				if isinstance(out_tensor, torch.Tensor):
 					t = out_tensor.detach()
 					t2d = t.reshape(-1, t.shape[-1]) if t.ndim >= 2 else t.view(1, -1)
@@ -194,32 +210,32 @@ def run_and_cache(model_name: str,
 				  exclude_regex: Optional[str],
 				  work_dir: str,
 				  save_path: Optional[str] = None,
+				  use_vllm: bool = False,
 				  verbose: bool = False) -> str:
 	# Build dataset
 	dataset = build_dataset(dataset_name)
 	assert dataset is not None, f"Dataset not found or unsupported: {dataset_name}"
 
 	# Instantiate model
-	vlm = supported_VLM[model_name]()
+	# (25.06.05) 与框架保持一致：在构建模型前移除 WORLD_SIZE，避免 transformers 新版在 torchrun 下自动采用 TP
+	ws_bak = os.environ.pop('WORLD_SIZE', None)
+	model_kwargs = {}
+	if model_name is not None and (
+		'Llama-4' in model_name or 'Qwen2-VL' in model_name or 'Qwen2.5-VL' in model_name
+	):
+		model_kwargs = {'use_vllm': use_vllm}
+	# Sanitize potential trailing spaces in local model_path provided via functools.partial in config
+	constructor = supported_VLM[model_name]
+	if isinstance(constructor, functools.partial):
+		kw = dict(constructor.keywords or {})
+		if 'model_path' in kw and isinstance(kw['model_path'], str):
+			kw['model_path'] = kw['model_path'].strip()
+		constructor = functools.partial(constructor.func, *(constructor.args or ()), **kw)
+	vlm = constructor(**model_kwargs) if 'constructor' in locals() else supported_VLM[model_name](**model_kwargs)
+	if ws_bak:
+		os.environ['WORLD_SIZE'] = ws_bak
 	if getattr(vlm, "is_api", False):
-		# For API models, hooks are not possible. Save empty activations to succeed gracefully.
-		if save_path is None:
-			os.makedirs("activations", exist_ok=True)
-			base = f"{model_name}_{dataset_name}.pt"
-			save_path = osp.join("activations", base)
-		else:
-			save_dir = osp.dirname(save_path)
-			if save_dir:
-				os.makedirs(save_dir, exist_ok=True)
-		torch.save({}, save_path)
-		if verbose:
-			print(f"[info] API model detected; hooks unavailable. Saved empty activations to {save_path}")
-		# Cleanup
-		del vlm
-		gc.collect();
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-		return save_path
+		raise RuntimeError("API models are not supported for activation caching (no torch hooks).")
 
 	# For non-API models, let dataset provide image dumping if needed
 	if hasattr(vlm, "set_dump_image"):
@@ -246,9 +262,15 @@ def run_and_cache(model_name: str,
 
 	hooks: List[torch.utils.hooks.RemovableHandle] = []
 	for name, module in target_modules.items():
-		hook = module.register_forward_hook(
-			get_hook_with_kwargs(name, req_act, activation_stats), with_kwargs=True
-		)
+		# Prefer new API with kwargs; fallback to legacy hook signature on older PyTorch
+		try:
+			hook = module.register_forward_hook(
+				get_hook_with_kwargs(name, req_act, activation_stats), with_kwargs=True
+			)
+		except TypeError:
+			def legacy_hook(mod, args, output):
+				return get_hook_with_kwargs(name, req_act, activation_stats)(mod, args, {}, output)
+			hook = module.register_forward_hook(legacy_hook)
 		hooks.append(hook)
 
 	# Run up to max_samples items to trigger forwards
@@ -258,7 +280,7 @@ def run_and_cache(model_name: str,
 		print(f"[run] dataset={dataset_name}, samples={total}, model={model_name}")
 
 	processed = 0
-	for i in range(total):
+	for i in tqdm(range(total), desc=f"Infer {model_name}/{dataset_name}"):
 		item = ds.iloc[i]
 		# Build the input struct (message) using model-specific prompt if requested
 		if hasattr(vlm, 'use_custom_prompt') and vlm.use_custom_prompt(dataset_name):
@@ -266,11 +288,16 @@ def run_and_cache(model_name: str,
 		else:
 			struct = dataset.build_prompt(item)
 
-		try:
+		# 与 inference.py 保持一致：支持 SKIP_ERR 环境变量
+		if os.environ.get('SKIP_ERR', '0') == '1':
+			try:
+				_ = vlm.generate(message=struct, dataset=dataset_name)
+			except RuntimeError as err:
+				if torch.cuda.is_available():
+					torch.cuda.synchronize()
+				print(f"[warn] generation failed at index {item['index']}: {type(err).__name__}: {err}")
+		else:
 			_ = vlm.generate(message=struct, dataset=dataset_name)
-		except RuntimeError as err:
-			# Keep going on recoverable CUDA errors if user wants to skip
-			print(f"[warn] generation failed at index {item['index']}: {type(err).__name__}: {err}")
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
 		processed += 1
@@ -296,10 +323,12 @@ def run_and_cache(model_name: str,
 		os.makedirs("activations", exist_ok=True)
 		base = f"{model_name}_{dataset_name}.pt"
 		save_path = osp.join("activations", base)
-	else:
-		save_dir = osp.dirname(save_path)
-		if save_dir:
-			os.makedirs(save_dir, exist_ok=True)
+
+	# Ensure parent directory exists for custom --save path
+	if save_path is not None:
+		parent = osp.dirname(save_path)
+		if parent:
+			os.makedirs(parent, exist_ok=True)
 
 	# Save torch tensors
 	# meta = {
@@ -338,6 +367,7 @@ def main():
 		exclude_regex=args.exclude_regex,
 		work_dir=args.work_dir,
 		save_path=args.save,
+		use_vllm=args.use_vllm,
 		verbose=args.verbose,
 	)
 	print(save_path)
