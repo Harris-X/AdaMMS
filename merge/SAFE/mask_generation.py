@@ -122,5 +122,4 @@ if __name__ == "__main__":
     parser.add_argument("--force_recompute", action='store_true', help="强制重新计算掩码")
     args = parser.parse_args()
 
-    os.makedirs(args.cache_dir, exist_ok=True)
     regularized_disjoint_mask_generation(args)
