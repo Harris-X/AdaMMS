@@ -272,7 +272,6 @@ class CacheActivations:
 
         return module_map
     
-
     def _cache_activations_raw(self, model_info, model_path, required_activations, probe_dataset_list):
         """为每个模型从原始数据集处理数据并缓存激活（内存优化版）。"""
         cache_path = os.path.join(self.cache_dir, f"activations_{model_info}.pt")
