@@ -1,30 +1,34 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Cache neuron activations per layer for a VLMEvalKit-supported local model on a mixed HF meta-probe dataset.
+Cache neuron activations per layer for a VLMEvalKit-supported model on a chosen dataset.
 
-What this script does
-- Build a small "meta probe" dataset in the my_llava-qwen2qwenvl_mm_v3.n.1.1.py style (currently: MMBench EN test split, streaming)
-- Instantiate a VLM from vlmeval.config.supported_VLM (transformers/local models only; API models are not supported)
-- Locate underlying torch.nn.Module and register forward hooks on selected target modules
-- For each sample, build a VLMEvalKit-style message [image, text] and call vlm.generate(...) to trigger forwards
-- Aggregate input/output activations by summing across tokens and averaging at the end
-- Save a dict {module_name: {input: 1D tensor, output: 1D tensor}} to a .pt file
+This script blends two ideas:
+- Load models via VLMEvalKit (supported_VLM) in the same safe manner as inference.py
+- Load a meta probing dataset from Hugging Face (similar to my_llava-* script), and cache activations via forward hooks
 
-Notes
-- Hooks: input looks for kwargs['hidden_states'] or first tensor arg; output uses output or output[0]
-- Pooling: flatten features to [tokens, hidden] and sum across token dim; track token counts to average
-- Only torch local models are supported. API models (e.g., OpenAI, Gemini) cannot be hooked
-- We follow VLMEvalKit inference behaviors for WORLD_SIZE unsetting and SKIP_ERR handling
+Key features:
+- Pick a VLMEvalKit-supported local model (API models are not supported since we need torch hooks)
+- Choose "--hf-dataset meta" to build a mixed probing dataset (MMBench, VCR, DocVQA, VQAv2, ScienceQA, ST-VQA)
+- Or fallback to VLMEvalKit datasets via --data
+- Register forward hooks on selected target modules (regex + optional class filters)
+- Run generation to trigger forwards; aggregate input/output activations (sum over token dimension) and average
+- Save a dictionary {module_name: {input: 1D tensor, output: 1D tensor}}
 
-Example
-python cache_activation_new.py \
-  --model mPLUG-Owl2 \
-  --n-mmbench 64 \
-  --max-samples 128 \
-  --req-act input output \
-  --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
-  --include-types Linear LayerNorm \
-  --save activations/mmplug_meta.pt \
-  --verbose
+Example:
+  python cache_activation_new.py \
+    --model mPLUG-Owl2 \
+    --hf-dataset meta \
+    --n-mmbench 50 --n-vqa 50 \
+    --req-act input output \
+    --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
+    --save activations/mmplug-meta.pt
+
+Notes:
+- Only local torch models are supported (API models cannot be hooked).
+- Hooks try kwargs['hidden_states'] first or args[0] as input tensor.
+- Output is assumed to be a Tensor or first element of a tuple, pooled by flattening to [tokens, hidden] and summing.
+- When using --hf-dataset meta, images are saved to a tmp folder as files and referenced by path in messages.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ import functools
 import gc
 import os
 import os.path as osp
+import random
 import re
 import uuid
 import warnings
@@ -44,68 +49,228 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-try:
-    from datasets import load_dataset  # huggingface datasets
-except Exception as e:  # pragma: no cover
-    load_dataset = None
-
 # VLMEvalKit imports
 from vlmeval.config import supported_VLM
+try:
+    from vlmeval.dataset import build_dataset as vlmeval_build_dataset
+except Exception:
+    vlmeval_build_dataset = None
+
+# HF datasets
+try:
+    from datasets import load_dataset
+except Exception as e:
+    load_dataset = None
+    _DATASETS_IMPORT_ERR = e
+else:
+    _DATASETS_IMPORT_ERR = None
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 
-# ---------------------------
-# Dataset construction (HF)
-# ---------------------------
-def _create_meta_probe_dataset(n_mmbench: int, seed: int = 42) -> List[Dict[str, Any]]:
-    """
-    Build a meta-probe dataset in the style of my_llava-qwen2qwenvl_mm_v3.n.1.1.py.
+# -------------------------
+# CLI
+# -------------------------
 
-    Currently includes:
-    - MMBench EN test (streaming): questions are MCQ; we format options into the question text
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Cache layer activations for a VLM on a dataset (meta/HF or VLMEval)")
+    # model/dataset
+    parser.add_argument("--model", required=True, type=str, help="Model name key in supported_VLM (vlmeval/config.py)")
+    parser.add_argument("--data", required=False, type=str, default=None,
+                        help="Dataset name supported by VLMEvalKit (ignored if --hf-dataset is set)")
+    parser.add_argument("--hf-dataset", type=str, default=None,
+                        help="Special HF loader key; currently supports: 'meta'. If set, overrides --data")
 
-    Returns a list of samples, each: {"image": PIL.Image.Image, "question": str, "answer": Optional[str]}
-    """
+    # meta dataset knobs
+    parser.add_argument("--n-mmbench", type=int, default=0, help="Samples to draw from MMBench (en/test)")
+    parser.add_argument("--n-vcr", type=int, default=0, help="Samples to draw from VCR (validation, Q->A)")
+    parser.add_argument("--n-docvqa", type=int, default=0, help="Samples to draw from DocVQA (validation)")
+    parser.add_argument("--n-vqa", type=int, default=0, help="Samples to draw from VQAv2 (validation)")
+    parser.add_argument("--n-scienceqa", type=int, default=0, help="Samples to draw from ScienceQA (validation, has image)")
+    parser.add_argument("--n-stvqa", type=int, default=0, help="Samples to draw from ST-VQA task1 (test)")
+    parser.add_argument("--max-samples", type=int, default=None, help="Cap total samples (after composition)")
+
+    # hook + selection
+    parser.add_argument("--req-act", nargs="+", default=["output"], choices=["input", "output"],
+                        help="Which activations to record: input/output (one or both)")
+    parser.add_argument("--module-regex", type=str,
+                        default=r"mlp\. |self_attn\.|attention\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn".replace(" ", ""),
+                        help="Regex to select modules by name. Applied to named_modules() full path.")
+    parser.add_argument("--include-types", nargs="*", default=["Linear"],
+                        help="Optional nn.Module class name filters, e.g. Linear Conv2d LayerNorm; empty=all")
+    parser.add_argument("--exclude-regex", type=str, default=r"lm_head|embed|embedding",
+                        help="Regex to exclude modules by name")
+
+    # misc
+    parser.add_argument("--work-dir", type=str, default=".", help="Work dir for tmp files")
+    parser.add_argument("--save", type=str, default=None, help="Output .pt file path; default under activations/")
+    parser.add_argument("--verbose", action="store_true", help="Print progress and matched modules")
+    parser.add_argument("--use-vllm", action="store_true",
+                        help="Pass use_vllm to certain models (e.g., Llama-4, Qwen2-VL series)")
+
+    return parser.parse_args()
+
+
+# -------------------------
+# Meta dataset builder (HF)
+# -------------------------
+
+def _ensure_hf_import():
     if load_dataset is None:
-        raise RuntimeError("HuggingFace datasets is not installed. Please `pip install datasets`.")
+        raise RuntimeError(
+            f"datasets is not available for --hf-dataset; please install `datasets`. Import error: {_DATASETS_IMPORT_ERR}"
+        )
 
+
+def _dump_image_to_file(img: Any, root: str) -> str:
+    os.makedirs(root, exist_ok=True)
+    # Convert to RGB if it's a PIL Image with alpha
+    if Image is not None and isinstance(img, Image.Image):
+        if img.mode == 'RGBA':
+            img = img.convert('RGB')
+        elif img.mode != 'RGB':
+            try:
+                img = img.convert('RGB')
+            except Exception:
+                pass
+    # save
+    fname = f"{uuid.uuid4().hex}.jpg"
+    path = osp.join(root, fname)
+    try:
+        if Image is not None and isinstance(img, Image.Image):
+            img.save(path, format='JPEG', quality=95)
+        else:
+            # datasets Image feature returns PIL Image; if not, try array-like
+            from PIL import Image as _PILImage
+            _PILImage.fromarray(img).save(path, format='JPEG', quality=95)
+    except Exception as e:
+        raise RuntimeError(f"Failed to save image to {path}: {e}")
+    return path
+
+
+def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Compose a meta probing dataset by sampling from several HF datasets.
+
+    Returns list of dict with keys: {image (PIL), question (str), optional answer/answers}.
+    """
+    _ensure_hf_import()
     meta_probe_samples: List[Dict[str, Any]] = []
-    if n_mmbench and n_mmbench > 0:
-        print(f"[MetaProbe] Loading {n_mmbench} samples from lmms-lab/MMBench (en, test, streaming)...")
-        ds = load_dataset("lmms-lab/MMBench", "en", split="test", streaming=True)
-        ds = ds.shuffle(seed=seed).take(n_mmbench)
-        for item in ds:
-            question = item.get("question", "")
-            # format options
-            options_parts = []
-            for opt_key in ["A", "B", "C", "D", "E", "F"]:
-                if opt_key in item and item[opt_key] is not None and item[opt_key] != "":
-                    options_parts.append(f"{opt_key}. {item[opt_key]}")
-            options = "\n".join(options_parts)
 
-            if item.get("hint"):
-                full_q = f"{item['hint']}\n{question}\n{options}" if options else f"{item['hint']}\n{question}"
+    # 1) MMBench EN (test split). Multiple-choice; format options into the question.
+    if getattr(args, 'n_mmbench', 0) > 0:
+        print(f"[Meta] Loading {args.n_mmbench} from MMBench (en/test)...")
+        ds = load_dataset("lmms-lab/MMBench", 'en', split="test", streaming=True)
+        for item in ds.shuffle(seed=42).take(args.n_mmbench):
+            q = item['question']
+            options = []
+            for key in ['A', 'B', 'C', 'D', 'E', 'F']:
+                if key in item and item[key] is not None:
+                    options.append(f"{key}. {item[key]}")
+            options_str = "\n".join(options)
+            if item.get('hint'):
+                full_q = f"{item['hint']}\n{q}\n{options_str}" if options_str else f"{item['hint']}\n{q}"
             else:
-                full_q = f"{question}\n{options}" if options else question
-
+                full_q = f"{q}\n{options_str}" if options_str else q
             meta_probe_samples.append({
-                "image": item["image"],  # PIL image from HF datasets
+                "image": item["image"],
                 "question": full_q,
-                "answer": item.get("answer")
+                "answer": item.get("answer", None)
             })
-        # ensure iterator is freed
         del ds
 
-    if len(meta_probe_samples) == 0:
-        raise RuntimeError("No samples constructed. Please increase --n-mmbench or extend the loader.")
+    # 2) VCR (Q->A). validation split
+    if getattr(args, 'n_vcr', 0) > 0:
+        print(f"[Meta] Loading {args.n_vcr} from VCR (validation, Q->A)...")
+        ds = load_dataset("pingzhili/vcr-qa", split="validation", streaming=True)
+        for item in ds.shuffle(seed=42).take(args.n_vcr):
+            q = item['question']
+            choices = item.get('answer_choices', [])
+            choices_str = "\n".join([f"- {c}" for c in choices])
+            full_q = f"{q}\n\nChoices:\n{choices_str}" if choices_str else q
+            # reference correct text (optional)
+            label = item.get('answer_label', None)
+            correct_text = choices[label] if (isinstance(label, int) and 0 <= label < len(choices)) else None
+            meta_probe_samples.append({
+                "image": item["image"],
+                "question": full_q,
+                "answer": correct_text
+            })
+        del ds
 
+    # 3) DocVQA (validation)
+    if getattr(args, 'n_docvqa', 0) > 0:
+        print(f"[Meta] Loading {args.n_docvqa} from DocVQA (validation)...")
+        ds = load_dataset("lmms-lab/DocVQA", "DocVQA", split="validation", streaming=True)
+        for item in ds.shuffle(seed=42).take(args.n_docvqa):
+            meta_probe_samples.append({
+                "image": item["image"],
+                "question": item["question"],
+                "answers": item.get("answers", None)
+            })
+        del ds
+
+    # 4) VQAv2 (validation)
+    if getattr(args, 'n_vqa', 0) > 0:
+        print(f"[Meta] Loading {args.n_vqa} from VQAv2 (validation)...")
+        ds = load_dataset("lmms-lab/VQAv2", split="validation", streaming=True)
+        for item in ds.shuffle(seed=42).take(args.n_vqa):
+            meta_probe_samples.append({
+                "image": item["image"],
+                "question": item["question"],
+            })
+        del ds
+
+    # 5) ScienceQA (validation, filter samples that contain images)
+    if getattr(args, 'n_scienceqa', 0) > 0:
+        print(f"[Meta] Loading {args.n_scienceqa} from ScienceQA (validation, has image)...")
+        ds = load_dataset("derek-thomas/ScienceQA", split="validation")
+        # filter to entries with image
+        ds_img = ds.filter(lambda x: x.get('image') is not None)
+        cnt = 0
+        for item in ds_img.shuffle(seed=42):
+            if cnt >= args.n_scienceqa:
+                break
+            hint = item.get('hint', None)
+            q = item.get('question', '')
+            full_q = f"{hint} {q}" if hint else q
+            meta_probe_samples.append({
+                "image": item["image"],
+                "question": full_q,
+            })
+            cnt += 1
+        del ds
+
+    # 6) ST-VQA task1 (test)
+    if getattr(args, 'n_stvqa', 0) > 0:
+        print(f"[Meta] Loading {args.n_stvqa} from ST-VQA task1 (test)...")
+        ds = load_dataset("danjacobellis/stvqa_task1", split="test", streaming=True)
+        for item in ds.shuffle(seed=42).take(args.n_stvqa):
+            meta_probe_samples.append({
+                "image": item["image"],
+                "question": item["question"],
+            })
+        del ds
+
+    random.shuffle(meta_probe_samples)
+    if args.max_samples is not None:
+        meta_probe_samples = meta_probe_samples[: args.max_samples]
+    print(f"[Meta] Built meta probing dataset, total samples: {len(meta_probe_samples)}")
     return meta_probe_samples
 
 
-# ---------------------------
-# Utilities for model & hooks
-# ---------------------------
+# -------------------------
+# Torch model inspection & selection
+# -------------------------
+
 def get_underlying_torch_model(vlm_obj) -> Optional[nn.Module]:
-    """Try to retrieve the underlying torch.nn.Module from a VLMEvalKit model wrapper."""
+    """Try to retrieve the underlying torch.nn.Module from a VLMEvalKit model wrapper.
+
+    Many wrappers use attribute `model` to hold the HF/torch model. If not present but the
+    wrapper itself is an nn.Module, return the wrapper. Otherwise return None.
+    """
     if hasattr(vlm_obj, "model") and isinstance(getattr(vlm_obj, "model"), nn.Module):
         return getattr(vlm_obj, "model")
     if isinstance(vlm_obj, nn.Module):
@@ -113,19 +278,8 @@ def get_underlying_torch_model(vlm_obj) -> Optional[nn.Module]:
     return None
 
 
-def _type_filter(include_types: List[str]) -> Optional[Tuple[type, ...]]:
-    if not include_types:
-        return None
-    # map provided names to classes when available; otherwise compare by __name__ later
-    classes: List[type] = []
-    for name in include_types:
-        if not name:
-            continue
-        if hasattr(nn, name):
-            cls = getattr(nn, name)
-            if isinstance(cls, type):
-                classes.append(cls)
-    return tuple(classes) if classes else None
+def _class_name(m: nn.Module) -> str:
+    return m.__class__.__name__
 
 
 def get_target_module_map(
@@ -133,240 +287,200 @@ def get_target_module_map(
     module_regex: str,
     include_types: List[str],
     exclude_regex: Optional[str] = None,
-    verbose: bool = False,
+    verbose: bool = False
 ) -> Dict[str, nn.Module]:
-    """Select named modules from the model using regex and type filters."""
-    inc_pat = re.compile(module_regex) if module_regex else None
-    exc_pat = re.compile(exclude_regex) if exclude_regex else None
-    include_type_tuple = _type_filter(include_types)
-    include_names = set(t for t in include_types) if include_types else set()
+    pat = re.compile(module_regex)
+    ex_pat = re.compile(exclude_regex) if exclude_regex else None
+    allow_set = set(include_types or [])
 
-    selected: Dict[str, nn.Module] = {}
+    matched: Dict[str, nn.Module] = {}
     for name, mod in model.named_modules():
-        # leaf modules often suffice
-        # still allow non-leaf if it matches and is a known op type
-        if inc_pat and not inc_pat.search(name):
+        if name == "":
             continue
-        if exc_pat and exc_pat.search(name):
+        if not pat.search(name):
             continue
-
-        ok_type = True
-        if include_type_tuple is not None:
-            ok_type = isinstance(mod, include_type_tuple)
-        elif include_names:
-            ok_type = (mod.__class__.__name__ in include_names)
-
-        if not ok_type:
+        if ex_pat and ex_pat.search(name):
             continue
-
-        selected[name] = mod
+        if allow_set and _class_name(mod) not in allow_set:
+            continue
+        matched[name] = mod
 
     if verbose:
-        print(f"[HookSelect] Matched {len(selected)} modules.")
-        for k in sorted(selected.keys())[:50]:
-            print("  ", k, "|", selected[k].__class__.__name__)
-        if len(selected) > 50:
-            print("  ...")
-
-    if not selected:
-        raise RuntimeError("No modules matched. Please relax --module-regex or --include-types.")
-    return selected
+        print(f"[Hook] Matched {len(matched)} modules:")
+        for n, m in matched.items():
+            print(f" - {n} ({_class_name(m)})")
+    return matched
 
 
-def make_activation_hook(name: str, req_act: Iterable[str], activation_stats: dict):
-    """Forward hook function factory collecting input/output sums and token counts."""
+# -------------------------
+# Hook function (input/output sum & average)
+# -------------------------
+
+def get_hook_with_kwargs(name: str, req_act: Iterable[str], activation_stats: dict):
     def hook_fn(module, args, kwargs, output):
-        # output activations
+        # Output
         if "output" in req_act:
             out_tensor = output[0] if isinstance(output, tuple) else output
             if isinstance(out_tensor, torch.Tensor):
-                t = out_tensor.detach().cpu().float()
-                t2 = t.reshape(-1, t.shape[-1])
-                s = torch.sum(t2, dim=0)
+                t_float = out_tensor.detach().cpu().float()
+                try:
+                    t_reshaped = t_float.reshape(-1, t_float.shape[-1])
+                except Exception:
+                    return
+                current_sum = torch.sum(t_reshaped, dim=0)
                 if activation_stats[name]["output_sum"] is None:
-                    activation_stats[name]["output_sum"] = s
+                    activation_stats[name]["output_sum"] = current_sum
                 else:
-                    activation_stats[name]["output_sum"] += s
-                activation_stats[name]["output_tokens"] += t2.shape[0]
-
-        # input activations
+                    activation_stats[name]["output_sum"] += current_sum
+                activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
+        # Input
         if "input" in req_act:
-            in_tensor = kwargs.get("hidden_states", args[0] if args and isinstance(args[0], torch.Tensor) else None)
+            in_tensor = kwargs.get("hidden_states", args[0] if (args and isinstance(args[0], torch.Tensor)) else None)
             if isinstance(in_tensor, torch.Tensor):
-                t = in_tensor.detach().cpu().float()
-                t2 = t.reshape(-1, t.shape[-1])
-                s = torch.sum(t2, dim=0)
+                t_float = in_tensor.detach().cpu().float()
+                try:
+                    t_reshaped = t_float.reshape(-1, t_float.shape[-1])
+                except Exception:
+                    return
+                current_sum = torch.sum(t_reshaped, dim=0)
                 if activation_stats[name]["input_sum"] is None:
-                    activation_stats[name]["input_sum"] = s
+                    activation_stats[name]["input_sum"] = current_sum
                 else:
-                    activation_stats[name]["input_sum"] += s
-                activation_stats[name]["input_tokens"] += t2.shape[0]
-
+                    activation_stats[name]["input_sum"] += current_sum
+                activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
     return hook_fn
 
 
-# ---------------------------
-# Image dump helper
-# ---------------------------
-def ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
+# -------------------------
+# Main caching routine
+# -------------------------
 
-
-def dump_pil_to_file(img, work_dir: str) -> str:
-    img_dir = osp.join(work_dir, "tmp_images")
-    ensure_dir(img_dir)
-    fname = f"{uuid.uuid4().hex}.png"
-    fpath = osp.join(img_dir, fname)
-    # normalize mode
-    try:
-        from PIL import Image
-        if isinstance(img, Image.Image):
-            if img.mode == "RGBA":
-                img = img.convert("RGB")
-            img.save(fpath)
-        else:
-            # datasets may return PIL already; otherwise try .save
-            img.save(fpath)
-    except Exception:
-        # fallback via torchvision if available
-        try:
-            import torchvision.transforms.functional as TF
-            TF.to_pil_image(img).save(fpath)
-        except Exception as e:
-            raise RuntimeError(f"Failed to dump image: {e}")
-    return fpath
-
-
-# ---------------------------
-# Main logic
-# ---------------------------
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Cache layer activations (meta-probe HF dataset) for a VLMEvalKit model")
-    p.add_argument("--model", type=str, required=True, help="Model name in vlmeval.config.supported_VLM")
-    p.add_argument("--n-mmbench", type=int, default=64, help="Number of samples to take from MMBench (streaming)")
-    p.add_argument("--max-samples", type=int, default=128, help="Global limit on total samples processed")
-    p.add_argument("--module-regex", type=str, default=r"mlp\.|self_attn\.|attention\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn",
-                   help="Regex to select module names (from model.named_modules())")
-    p.add_argument("--include-types", nargs="*", default=["Linear"],
-                   help="Optional nn.Module class names to include (e.g., Linear LayerNorm Conv2d); empty=all")
-    p.add_argument("--exclude-regex", type=str, default=r"lm_head|embed|embedding",
-                   help="Regex to exclude module names")
-    p.add_argument("--req-act", nargs="+", choices=["input", "output"], default=["output"],
-                   help="Which activations to record")
-    p.add_argument("--save", type=str, default=None, help="Path to save .pt (default activations/{model}_meta.pt)")
-    p.add_argument("--work-dir", type=str, default=".", help="Work directory (for temp images, etc.)")
-    p.add_argument("--use-vllm", action="store_true", help="Pass use_vllm to Llama-4/Qwen2-VL/Qwen2.5-VL series")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--verbose", action="store_true")
-    return p.parse_args()
-
-
+@torch.no_grad()
 def main():
     args = parse_args()
+
     work_dir = args.work_dir
-    ensure_dir(work_dir)
-    ensure_dir(osp.join(work_dir, "tmp_images"))
+    os.makedirs(work_dir, exist_ok=True)
+    tmp_img_dir = osp.join(work_dir, 'tmp_images')
+    os.makedirs(tmp_img_dir, exist_ok=True)
 
-    # Build meta-probe dataset (HF style)
-    samples = _create_meta_probe_dataset(n_mmbench=args.n_mmbench, seed=args.seed)
-    if args.max_samples and len(samples) > args.max_samples:
-        samples = samples[: args.max_samples]
+    # -------- Build dataset messages --------
+    dataset_id: str
+    messages: List[List[Dict[str, Any]]] = []
 
-    # Instantiate model (VLMEvalKit style, compatible with inference.py semantics)
-    if args.model not in supported_VLM:
-        raise KeyError(f"Unknown model '{args.model}'. Check vlmeval/config.py supported_VLM.")
+    if args.hf_dataset is not None:
+        key = args.hf_dataset.strip().lower()
+        if key != 'meta':
+            raise ValueError("--hf-dataset currently only supports 'meta'")
+        if load_dataset is None:
+            raise RuntimeError(
+                f"datasets is not available; please install `datasets`. Import error: {_DATASETS_IMPORT_ERR}"
+            )
+        samples = build_meta_probe_dataset(args)
+        for s in samples:
+            img = s["image"]
+            # convert + save
+            if Image is not None and isinstance(img, Image.Image) and img.mode == 'RGBA':
+                img = img.convert('RGB')
+            img_path = _dump_image_to_file(img, tmp_img_dir)
+            text = s.get("question", "")
+            messages.append([
+                dict(type='image', value=img_path),
+                dict(type='text', value=text)
+            ])
+        dataset_id = 'HF:meta'
+    elif args.data is not None:
+        if vlmeval_build_dataset is None:
+            raise RuntimeError("vlmeval.dataset.build_dataset is unavailable; cannot load --data dataset.")
+        dataset = vlmeval_build_dataset(name=args.data, work_dir=work_dir)
+        dataset_id = dataset.dataset_name
+        data = dataset.data
+        max_n = len(data) if args.max_samples is None else min(len(data), args.max_samples)
+        for i in range(max_n):
+            struct = dataset.build_prompt(data.iloc[i])
+            messages.append(struct)
+    else:
+        raise ValueError("Please specify either --hf-dataset meta or --data <DatasetName>.")
 
-    ws_bak = os.environ.pop("WORLD_SIZE", None)
-    model_kwargs: Dict[str, Any] = {}
-    if args.model is not None and (
-        "Llama-4" in args.model or "Qwen2-VL" in args.model or "Qwen2.5-VL" in args.model
+    # -------- Instantiate model via VLMEvalKit (safe WORLD_SIZE handling) --------
+    ws_bak = os.environ.pop('WORLD_SIZE', None)
+    model_kwargs = {}
+    model_name = args.model
+    if model_name is not None and (
+        'Llama-4' in model_name or 'Qwen2-VL' in model_name or 'Qwen2.5-VL' in model_name
     ):
-        model_kwargs = {"use_vllm": args.use_vllm}
+        model_kwargs = {'use_vllm': args.use_vllm}
 
-    constructor = supported_VLM[args.model]
+    constructor = supported_VLM[model_name]
     if isinstance(constructor, functools.partial):
         kw = dict(constructor.keywords or {})
-        if "model_path" in kw and isinstance(kw["model_path"], str):
-            kw["model_path"] = kw["model_path"].strip()
+        if 'model_path' in kw and isinstance(kw['model_path'], str):
+            kw['model_path'] = kw['model_path'].strip()
         constructor = functools.partial(constructor.func, *(constructor.args or ()), **kw)
-    vlm = constructor(**model_kwargs) if "constructor" in locals() else supported_VLM[args.model](**model_kwargs)
+    vlm = constructor(**model_kwargs) if 'constructor' in locals() else supported_VLM[model_name](**model_kwargs)
     if ws_bak:
-        os.environ["WORLD_SIZE"] = ws_bak
+        os.environ['WORLD_SIZE'] = ws_bak
 
-    if getattr(vlm, "is_api", False):
+    if getattr(vlm, 'is_api', False):
         raise RuntimeError("API models are not supported for activation caching (no torch hooks).")
 
-    # Try to set dump_image if wrapper uses it (not required here, we pre-dump to paths)
-    if hasattr(vlm, "set_dump_image"):
-        def _dump_image_adapter(line: Any) -> str:
-            # Accepts dict with 'image' holding a PIL Image
-            img = line["image"] if isinstance(line, dict) and "image" in line else line
-            return dump_pil_to_file(img, work_dir)
-        try:
-            vlm.set_dump_image(_dump_image_adapter)
-        except Exception:
-            pass
+    # If we used a VLMEval dataset (not HF meta), let model know how to dump images if needed
+    if args.hf_dataset is None and args.data is not None and hasattr(vlm, 'set_dump_image') and hasattr(dataset, 'dump_image'):
+        vlm.set_dump_image(dataset.dump_image)
 
+    # -------- Prepare target modules & hooks --------
     torch_model = get_underlying_torch_model(vlm)
     if torch_model is None:
         raise RuntimeError("Cannot find underlying torch model to hook (no .model and wrapper is not nn.Module)")
     torch_model.eval()
 
-    # Select target modules and register hooks
     target_modules = get_target_module_map(
         torch_model,
         module_regex=args.module_regex,
-        include_types=args.include_types,
+        include_types=args.include_types or [],
         exclude_regex=args.exclude_regex,
         verbose=args.verbose,
     )
+    if not target_modules:
+        raise RuntimeError("No modules matched given --module-regex/--include-types/--exclude-regex filters.")
 
     activation_stats = defaultdict(lambda: {
         "input_sum": None, "input_tokens": 0,
-        "output_sum": None, "output_tokens": 0,
+        "output_sum": None, "output_tokens": 0
     })
 
-    hooks = []
-    for name, module in target_modules.items():
-        h = module.register_forward_hook(make_activation_hook(name, args.req_act, activation_stats), with_kwargs=True)
-        hooks.append(h)
+    hooks = [
+        module.register_forward_hook(
+            get_hook_with_kwargs(name, args.req_act, activation_stats), with_kwargs=True
+        )
+        for name, module in target_modules.items()
+    ]
 
-    # Iterate samples; build VLMEvalKit message and call vlm.generate to trigger forwards
-    dataset_id = "HF:meta_probe"
+    # -------- Run forwards to collect activations --------
     processed = 0
-    for i, item in enumerate(tqdm(samples, desc=f"Forwarding {args.model} on {dataset_id}")):
-        img = item.get("image")
-        if img is None:
-            continue
-        img_path = dump_pil_to_file(img, work_dir)
-        struct = [
-            {"type": "image", "value": img_path},
-            {"type": "text", "value": item.get("question", "") or ""},
-        ]
-
-        # With SKIP_ERR handling consistent with vlmeval.inference
-        if os.environ.get("SKIP_ERR", "0") == "1":
+    err_count = 0
+    for struct in tqdm(messages, desc=f"Forward {model_name} on {dataset_id}"):
+        if os.environ.get('SKIP_ERR', '0') == '1':
             try:
                 _ = vlm.generate(message=struct, dataset=dataset_id)
             except RuntimeError as err:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                warnings.warn(f"generation failed at sample {i}: {type(err).__name__}: {err}")
+                warnings.warn(f"generation failed: {type(err).__name__}: {err}")
+                err_count += 1
         else:
             _ = vlm.generate(message=struct, dataset=dataset_id)
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         processed += 1
 
-    # Remove hooks
     for h in hooks:
-        try:
-            h.remove()
-        except Exception:
-            pass
+        h.remove()
 
-    # Average activations
+    if args.verbose:
+        print(f"Processed samples: {processed}, errors: {err_count}")
+
+    # -------- Aggregate & save --------
     averaged_activations: Dict[str, Dict[str, torch.Tensor]] = {}
     for name, stats in activation_stats.items():
         averaged_activations[name] = {}
@@ -375,22 +489,20 @@ def main():
         if stats["output_sum"] is not None and stats["output_tokens"] > 0:
             averaged_activations[name]["output"] = stats["output_sum"] / stats["output_tokens"]
 
-    # Save
-    save_path = args.save or osp.join("activations", f"{args.model}_meta.pt")
-    os.makedirs(osp.dirname(save_path), exist_ok=True)
+    save_path = args.save
+    if not save_path:
+        os.makedirs('activations', exist_ok=True)
+        suffix = (args.hf_dataset or args.data or 'unknown').replace('/', '_')
+        save_path = osp.join('activations', f"{args.model}_{suffix}.pt")
     torch.save(averaged_activations, save_path)
 
     # Cleanup
-    del vlm, torch_model, hooks, activation_stats, averaged_activations
+    del vlm, hooks, activation_stats, averaged_activations
     gc.collect()
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    if args.verbose:
-        print(f"[Done] Processed {processed} samples. Saved activations to: {save_path}")
+    print(f"[Done] Saved averaged activations to: {save_path}")
 
 
 if __name__ == "__main__":
