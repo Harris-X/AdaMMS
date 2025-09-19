@@ -31,11 +31,12 @@ import argparse
 import gc
 import os
 import os.path as osp
+from random import random
 import re
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
 import functools
-
+from datasets import load_dataset
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -61,6 +62,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--save", type=str, default=None, help="Output .pt file path; default under activations/")
 	parser.add_argument("--verbose", action="store_true", help="Print progress and matched modules")
 	parser.add_argument("--use-vllm", action="store_true", help="Pass use_vllm to certain models (e.g., Llama-4, Qwen2-VL series)")
+	parser.add_argument("--only-llm", action="store_true", help="用于缓存LLM模型")
 	return parser.parse_args()
 
 
@@ -198,6 +200,123 @@ def get_hook_with_kwargs(name: str, req_act: Iterable[str], activation_stats: di
 			print(f"[hook:{name}] skipped due to: {type(e).__name__}: {e}")
 
 	return hook_fn
+
+
+def load_opt_dataset(args):
+	"""
+	构建并返回一个由多个数据源组成的元探测数据集。
+	此版本包含了更具挑战性的数据集。
+	"""
+	print("--- [元探测数据集构建] ---")
+	meta_probe_samples = []
+	
+	# ======================================================================
+	# 类别 1: 综合评估 (Comprehensive-Evaluation)
+	# ======================================================================
+
+	# 推荐数据集: MMBench (替代 MME, SEED-Bench)
+	if hasattr(args, 'n_mmbench') and args.n_mmbench > 0:
+		print(f"从 MMBench 加载 {args.n_mmbench} 个样本...")
+		# MMBench 的问题是选择题，需要格式化
+		mmbench_dataset = load_dataset("lmms-lab/MMBench", 'en',split="test", streaming=True).shuffle(seed=42).take(args.n_mmbench)
+		for item in mmbench_dataset:
+			# 组合问题和选项
+			question = item['question']
+			options = f"A. {item['A']}\nB. {item['B']}\nC. {item['C']}\nD. {item['D']}"
+			# 如果有提示，可以加在问题前面
+			if item.get('hint'):
+				full_question = f"{item['hint']}\n{question}\n{options}"
+			else:
+				full_question = f"{question}\n{options}"
+			
+			meta_probe_samples.append({"image": item["image"], "question": full_question, "answer": item["answer"]})
+		del mmbench_dataset  # 释放内存
+	# ======================================================================
+	# 类别 2: 认知与推理 (Cognition and Reasoning)
+	# ======================================================================
+
+	# 推荐数据集: VCR (Visual Commonsense Reasoning) (替代 GQA, MMMU)
+	if hasattr(args, 'n_vcr') and args.n_vcr > 0:
+		print(f"从 VCR 加载 {args.n_vcr} 个样本...")
+		# VCR 包含问题->答案(Q->A)和答案->理由(A->R)两个子任务。这里我们使用 Q->A。
+		# 注意: VCR 的 'image' 字段是字符串路径，需要特殊处理，但 huggingface 会自动加载。
+		vcr_dataset = load_dataset("pingzhili/vcr-qa", split="validation", streaming=True).shuffle(seed=42).take(args.n_vcr)
+		for item in vcr_dataset:
+			# 格式化问题和答案选项
+			question = item['question']
+			choices = "\n".join([f"- {c}" for c in item['answer_choices']])
+			full_question = f"{question}\n\nChoices:\n{choices}"
+			
+			# 记录正确答案的文本以供参考
+			correct_answer_text = item['answer_choices'][item['answer_label']]
+			meta_probe_samples.append({"image": item["image"], "question": full_question, "answer": correct_answer_text})
+		del vcr_dataset  # 释放内存
+	# ======================================================================
+	# 类别 3: 富文本视觉问答 (Text-rich VQA)
+	# ======================================================================
+
+	# 推荐数据集: DocVQA (替代 TextVQA, OCRBench)
+	if hasattr(args, 'n_docvqa') and args.n_docvqa > 0:
+		print(f"从 DocVQA 加载 {args.n_docvqa} 个样本...")
+		# DocVQA 的问题字段名为 'question'
+		docvqa_dataset = load_dataset("lmms-lab/DocVQA", "DocVQA", split="validation", streaming=True).shuffle(seed=42).take(args.n_docvqa)
+		for item in docvqa_dataset:
+			# DocVQA 的 'answers' 是一个列表，这里我们只用问题
+			meta_probe_samples.append({"image": item["image"], "question": item["question"], "answers": item["answers"]})
+		del docvqa_dataset  # 释放内存
+
+	# (此处可以保留或添加您原来的数据集加载逻辑)
+	# 1. 加载并处理 VQA v2 (综合能力)
+	if args.n_vqa > 0:
+		print(f"从 VQA v2 加载 {args.n_vqa} 个样本...")
+		vqa_dataset = load_dataset("lmms-lab/VQAv2", split="validation", streaming=True).shuffle(seed=42).take(args.n_vqa)
+		for item in vqa_dataset:
+			meta_probe_samples.append({"image": item["image"], "question": item["question"]})
+	
+		del vqa_dataset  # 释放内存
+
+	# 2. 加载并处理 ScienceQA (认知与推理)
+	if args.n_scienceqa > 0:
+		print(f"从 ScienceQA 加载 {args.n_scienceqa} 个样本...")
+		# ScienceQA non-streaming for easier filtering
+		scienceqa_dataset = load_dataset("derek-thomas/ScienceQA", split="validation").shuffle(seed=42)
+		# 筛选出包含图像的样本
+		scienceqa_with_images = scienceqa_dataset.filter(lambda x: x['image'] is not None)
+		count = 0
+		for item in scienceqa_with_images:
+			if count >= args.n_scienceqa: break
+			question = f"{item['hint']} {item['question']}" if item['hint'] else item['question']
+			meta_probe_samples.append({"image": item["image"], "question": question})
+			count += 1
+		del scienceqa_dataset  # 释放内存
+
+	# 3. 加载并处理 ST-VQA (富文本VQA)
+	if args.n_stvqa > 0:
+		print(f"从 ST-VQA 加载 {args.n_stvqa} 个样本...")
+		# ST-VQA 字段名为 'question', 'image'
+		stvqa_dataset = load_dataset("danjacobellis/stvqa_task1", split="test", streaming=True).shuffle(seed=42).take(args.n_stvqa)
+		for item in stvqa_dataset:
+				meta_probe_samples.append({"image": item["image"], "question": item["question"]})
+		del stvqa_dataset  # 释放内存
+	# 打乱最终的数据集
+	random.shuffle(meta_probe_samples)
+	print(f"元探测数据集构建完成，总样本数: {len(meta_probe_samples)}")
+	print("--------------------------")
+	return meta_probe_samples
+
+
+def llm_run_and_cache(
+		model_name,
+		dataset,
+		req_act: Iterable[str],
+		module_regex: str,
+		include_types: List[str],
+		exclude_regex: Optional[str],
+		save_path: Optional[str] = None,
+):
+	pass
+	
+	
 
 
 @torch.no_grad()
