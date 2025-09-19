@@ -29,6 +29,20 @@ Notes:
 - Hooks try kwargs['hidden_states'] first or args[0] as input tensor.
 - Output is assumed to be a Tensor or first element of a tuple, pooled by flattening to [tokens, hidden] and summing.
 - When using --hf-dataset meta, images are saved to a tmp folder as files and referenced by path in messages.
+
+Tip: run scripts/pre_download_hf_meta.py beforehand to cache HF datasets locally and avoid long waits at first run.
+
+New (added):
+- Support caching activations for pure-text LLMs loaded via Hugging Face transformers (e.g., meta-llama/Llama-2-7b-hf).
+- Use only the textual part of datasets (questions + choices/hints) and ignore images.
+- Example for LLM:
+        python cache_activation_new.py \
+            --hf-llm-id meta-llama/Llama-2-7b-hf \
+            --hf-dataset meta \
+            --n-mmbench 50 \
+            --req-act input output \
+            --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
+            --probe-batch-size 4 --llm-max-length 1024
 """
 
 from __future__ import annotations
@@ -58,7 +72,7 @@ except Exception:
 
 # HF datasets
 try:
-    from datasets import load_dataset
+    from datasets import load_dataset, DownloadConfig
 except Exception as e:
     load_dataset = None
     _DATASETS_IMPORT_ERR = e
@@ -70,6 +84,12 @@ try:
 except Exception:
     Image = None
 
+# New: optional transformers import for pure LLM path
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except Exception:
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
 
 # -------------------------
 # CLI
@@ -78,7 +98,10 @@ except Exception:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cache layer activations for a VLM on a dataset (meta/HF or VLMEval)")
     # model/dataset
-    parser.add_argument("--model", required=True, type=str, help="Model name key in supported_VLM (vlmeval/config.py)")
+    # Note: either --model (VLMEvalKit) or --hf-llm-id (transformers) should be provided
+    parser.add_argument("--model", required=False, type=str, help="Model name key in supported_VLM (vlmeval/config.py)")
+    parser.add_argument("--hf-llm-id", type=str, default=None,
+                        help="HuggingFace model id or local path for transformers AutoModelForCausalLM; e.g., meta-llama/Llama-2-7b-hf")
     parser.add_argument("--data", required=False, type=str, default=None,
                         help="Dataset name supported by VLMEvalKit (ignored if --hf-dataset is set)")
     parser.add_argument("--hf-dataset", type=str, default=None,
@@ -92,6 +115,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-scienceqa", type=int, default=0, help="Samples to draw from ScienceQA (validation, has image)")
     parser.add_argument("--n-stvqa", type=int, default=0, help="Samples to draw from ST-VQA task1 (test)")
     parser.add_argument("--max-samples", type=int, default=None, help="Cap total samples (after composition)")
+    # 新增：HF 下载与镜像控制
+    parser.add_argument("--hf-no-streaming", action="store_true",
+                        help="Disable datasets streaming mode; use regular download (more stable, larger download).")
+    parser.add_argument("--hf-endpoint", type=str, default=None,
+                        help="Override HF_ENDPOINT (e.g., https://huggingface.co or a mirror). Use 'disable' to unset.")
 
     # hook + selection
     parser.add_argument("--req-act", nargs="+", default=["output"], choices=["input", "output"],
@@ -110,6 +138,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Print progress and matched modules")
     parser.add_argument("--use-vllm", action="store_true",
                         help="Pass use_vllm to certain models (e.g., Llama-4, Qwen2-VL series)")
+
+    # New: transformers LLM runtime knobs
+    parser.add_argument("--llm-device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
+                        help="Device for transformers LLM (cuda/cpu)")
+    parser.add_argument("--llm-dtype", type=str, default="auto",
+                        choices=["auto", "float16", "bfloat16", "float32"],
+                        help="torch dtype for transformers LLM load; auto=HF default")
+    parser.add_argument("--trust-remote-code", action="store_true",
+                        help="Pass trust_remote_code=True to transformers.from_pretrained")
+    parser.add_argument("--probe-batch-size", type=int, default=4,
+                        help="Batch size for forward pass when using transformers LLM (text-only)")
+    parser.add_argument("--llm-max-length", type=int, default=1024,
+                        help="Max token length for tokenizer(truncation)")
 
     return parser.parse_args()
 
@@ -157,13 +198,72 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
     Returns list of dict with keys: {image (PIL), question (str), optional answer/answers}.
     """
     _ensure_hf_import()
+    # 若指定端点，优先设置（可覆盖全局环境的镜像设置）
+    if args.hf_endpoint is not None:
+        if args.hf_endpoint.strip().lower() == "disable":
+            os.environ.pop("HF_ENDPOINT", None)
+        else:
+            os.environ["HF_ENDPOINT"] = args.hf_endpoint.strip()
+
+    streaming = not getattr(args, "hf_no_streaming", False)
+    dl_cfg = DownloadConfig(max_retries=10, resume_download=True, use_etag=True)
+
+    def _set_ep(ep: Optional[str]):
+        if ep is None:
+            return
+        if ep.strip().lower() == "disable":
+            os.environ.pop("HF_ENDPOINT", None)
+        else:
+            os.environ["HF_ENDPOINT"] = ep.strip()
+
+    def _load_ds(path, name=None, split="validation"):
+        # 在当前端点失败时，自动回退到官方端点，并在需要时回退到非流式
+        current_ep = os.environ.get("HF_ENDPOINT")
+        trial_eps = [current_ep, "https://huggingface.co"]
+        seen = set(); ordered_eps = []
+        for ep in trial_eps:
+            key = ep or "__none__"
+            if key in seen: continue
+            seen.add(key); ordered_eps.append(ep)
+
+        last_exc = None
+        for ep in ordered_eps:
+            _set_ep(ep)
+            ep_str = ep or os.environ.get("HF_ENDPOINT") or "<default>"
+            for sflag in [streaming, False] if streaming else [False]:
+                try:
+                    print(f"[Meta] try load {path} ({name or ''}) split={split} streaming={sflag} ep={ep_str}")
+                    if name is None:
+                        return load_dataset(path, split=split, streaming=sflag, download_config=None if sflag else dl_cfg)
+                    else:
+                        return load_dataset(path, name, split=split, streaming=sflag, download_config=None if sflag else dl_cfg)
+                except Exception as e:
+                    last_exc = e
+                    print(f"[Meta][warn] load failed at ep={ep_str} streaming={sflag}: {type(e).__name__}: {e}")
+        raise RuntimeError(f"[Meta] Failed to load {path} ({name or ''}) split={split} after retries: {last_exc}")
+
+    def _iter_first_n(ds, n: int):
+        if n <= 0:
+            return
+        if streaming:
+            for item in ds.shuffle(seed=42).take(n):
+                yield item
+        else:
+            dss = ds.shuffle(seed=42)
+            n_eff = min(n, len(dss))
+            if n_eff <= 0:
+                return
+            # select 会避免把全量加载到内存（仍需完整下载到本地缓存）
+            for item in dss.select(range(n_eff)):
+                yield item
+
     meta_probe_samples: List[Dict[str, Any]] = []
 
-    # 1) MMBench EN (test split). Multiple-choice; format options into the question.
+    # 1) MMBench EN (test)
     if getattr(args, 'n_mmbench', 0) > 0:
         print(f"[Meta] Loading {args.n_mmbench} from MMBench (en/test)...")
-        ds = load_dataset("lmms-lab/MMBench", 'en', split="test", streaming=True)
-        for item in ds.shuffle(seed=42).take(args.n_mmbench):
+        ds = _load_ds("lmms-lab/MMBench", "en", "test")
+        for item in _iter_first_n(ds, args.n_mmbench):
             q = item['question']
             options = []
             for key in ['A', 'B', 'C', 'D', 'E', 'F']:
@@ -181,16 +281,15 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
             })
         del ds
 
-    # 2) VCR (Q->A). validation split
+    # 2) VCR (validation, Q->A)
     if getattr(args, 'n_vcr', 0) > 0:
         print(f"[Meta] Loading {args.n_vcr} from VCR (validation, Q->A)...")
-        ds = load_dataset("pingzhili/vcr-qa", split="validation", streaming=True)
-        for item in ds.shuffle(seed=42).take(args.n_vcr):
+        ds = _load_ds("pingzhili/vcr-qa", None, "validation")
+        for item in _iter_first_n(ds, args.n_vcr):
             q = item['question']
             choices = item.get('answer_choices', [])
             choices_str = "\n".join([f"- {c}" for c in choices])
             full_q = f"{q}\n\nChoices:\n{choices_str}" if choices_str else q
-            # reference correct text (optional)
             label = item.get('answer_label', None)
             correct_text = choices[label] if (isinstance(label, int) and 0 <= label < len(choices)) else None
             meta_probe_samples.append({
@@ -203,8 +302,8 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
     # 3) DocVQA (validation)
     if getattr(args, 'n_docvqa', 0) > 0:
         print(f"[Meta] Loading {args.n_docvqa} from DocVQA (validation)...")
-        ds = load_dataset("lmms-lab/DocVQA", "DocVQA", split="validation", streaming=True)
-        for item in ds.shuffle(seed=42).take(args.n_docvqa):
+        ds = _load_ds("lmms-lab/DocVQA", "DocVQA", "validation")
+        for item in _iter_first_n(ds, args.n_docvqa):
             meta_probe_samples.append({
                 "image": item["image"],
                 "question": item["question"],
@@ -215,43 +314,48 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
     # 4) VQAv2 (validation)
     if getattr(args, 'n_vqa', 0) > 0:
         print(f"[Meta] Loading {args.n_vqa} from VQAv2 (validation)...")
-        ds = load_dataset("lmms-lab/VQAv2", split="validation", streaming=True)
-        for item in ds.shuffle(seed=42).take(args.n_vqa):
+        ds = _load_ds("lmms-lab/VQAv2", None, "validation")
+        for item in _iter_first_n(ds, args.n_vqa):
             meta_probe_samples.append({
                 "image": item["image"],
                 "question": item["question"],
             })
         del ds
 
-    # 5) ScienceQA (validation, filter samples that contain images)
+    # 5) ScienceQA (validation, has image) 仅非流式
     if getattr(args, 'n_scienceqa', 0) > 0:
         print(f"[Meta] Loading {args.n_scienceqa} from ScienceQA (validation, has image)...")
-        ds = load_dataset("derek-thomas/ScienceQA", split="validation")
-        # filter to entries with image
-        ds_img = ds.filter(lambda x: x.get('image') is not None)
-        cnt = 0
-        for item in ds_img.shuffle(seed=42):
-            if cnt >= args.n_scienceqa:
-                break
-            hint = item.get('hint', None)
-            q = item.get('question', '')
-            full_q = f"{hint} {q}" if hint else q
-            meta_probe_samples.append({
-                "image": item["image"],
-                "question": full_q,
-            })
-            cnt += 1
+        ds = _load_ds("derek-thomas/ScienceQA", None, "validation")
+        if streaming:
+            # streaming 模式下 filter 不便，直接顺序筛选
+            cnt = 0
+            for item in ds:
+                if item.get('image') is None:
+                    continue
+                hint = item.get('hint', None)
+                q = item.get('question', '')
+                full_q = f"{hint} {q}" if hint else q
+                meta_probe_samples.append({"image": item["image"], "question": full_q})
+                cnt += 1
+                if cnt >= args.n_scienceqa:
+                    break
+        else:
+            ds_img = ds.filter(lambda x: x.get('image') is not None)
+            dss = ds_img.shuffle(seed=42)
+            n_eff = min(args.n_scienceqa, len(dss))
+            for item in dss.select(range(n_eff)):
+                hint = item.get('hint', None)
+                q = item.get('question', '')
+                full_q = f"{hint} {q}" if hint else q
+                meta_probe_samples.append({"image": item["image"], "question": full_q})
         del ds
 
     # 6) ST-VQA task1 (test)
     if getattr(args, 'n_stvqa', 0) > 0:
         print(f"[Meta] Loading {args.n_stvqa} from ST-VQA task1 (test)...")
-        ds = load_dataset("danjacobellis/stvqa_task1", split="test", streaming=True)
-        for item in ds.shuffle(seed=42).take(args.n_stvqa):
-            meta_probe_samples.append({
-                "image": item["image"],
-                "question": item["question"],
-            })
+        ds = _load_ds("danjacobellis/stvqa_task1", None, "test")
+        for item in _iter_first_n(ds, args.n_stvqa):
+            meta_probe_samples.append({"image": item["image"], "question": item["question"]})
         del ds
 
     random.shuffle(meta_probe_samples)
@@ -259,6 +363,41 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
         meta_probe_samples = meta_probe_samples[: args.max_samples]
     print(f"[Meta] Built meta probing dataset, total samples: {len(meta_probe_samples)}")
     return meta_probe_samples
+
+
+# -------------------------
+# Utilities for text-only prompts (LLM path)
+# -------------------------
+
+def _get_texts_from_meta_samples(samples: List[Dict[str, Any]]) -> List[str]:
+    """Extract text prompts from meta samples (ignore images).
+
+    Each sample has 'question' already including choices/hints if applicable.
+    """
+    texts = []
+    for s in samples:
+        q = s.get("question", "")
+        if not isinstance(q, str):
+            q = str(q)
+        texts.append(q)
+    return texts
+
+def _extract_texts_from_vlmeval_dataset(dataset, max_n: Optional[int]) -> List[str]:
+    """Build text prompts from a VLMEval dataset by concatenating text segments in messages.
+
+    This is a best-effort extraction: we collect all dicts with type='text' and join them.
+    """
+    data = dataset.data
+    max_n = len(data) if max_n is None else min(len(data), max_n)
+    texts: List[str] = []
+    for i in range(max_n):
+        struct = dataset.build_prompt(data.iloc[i])  # list of {type: 'image'|'text', value:...}
+        parts = []
+        for seg in struct:
+            if isinstance(seg, dict) and seg.get("type") == "text":
+                parts.append(str(seg.get("value", "")))
+        texts.append("\n".join([p for p in parts if p]))
+    return texts
 
 
 # -------------------------
@@ -364,9 +503,15 @@ def main():
     tmp_img_dir = osp.join(work_dir, 'tmp_images')
     os.makedirs(tmp_img_dir, exist_ok=True)
 
-    # -------- Build dataset messages --------
+    # -------- Determine mode: VLMEval VLM vs transformers LLM --------
+    use_hf_llm = args.hf_llm_id is not None and len(args.hf_llm_id) > 0
+    if not use_hf_llm and not args.model:
+        raise ValueError("Please provide either --model (VLMEvalKit) or --hf-llm-id (transformers).")
+
+    # -------- Build dataset payload --------
     dataset_id: str
-    messages: List[List[Dict[str, Any]]] = []
+    messages: List[List[Dict[str, Any]]] = []  # for VLM path (multi-modal messages)
+    texts_for_llm: List[str] = []              # for LLM path (plain text)
 
     if args.hf_dataset is not None:
         key = args.hf_dataset.strip().lower()
@@ -377,62 +522,98 @@ def main():
                 f"datasets is not available; please install `datasets`. Import error: {_DATASETS_IMPORT_ERR}"
             )
         samples = build_meta_probe_dataset(args)
-        for s in samples:
-            img = s["image"]
-            # convert + save
-            if Image is not None and isinstance(img, Image.Image) and img.mode == 'RGBA':
-                img = img.convert('RGB')
-            img_path = _dump_image_to_file(img, tmp_img_dir)
-            text = s.get("question", "")
-            messages.append([
-                dict(type='image', value=img_path),
-                dict(type='text', value=text)
-            ])
+        if use_hf_llm:
+            # New: text-only prompts for transformers LLM
+            texts_for_llm = _get_texts_from_meta_samples(samples)
+        else:
+            for s in samples:
+                img = s["image"]
+                # convert + save
+                if Image is not None and isinstance(img, Image.Image) and img.mode == 'RGBA':
+                    img = img.convert('RGB')
+                img_path = _dump_image_to_file(img, tmp_img_dir)
+                text = s.get("question", "")
+                messages.append([
+                    dict(type='image', value=img_path),
+                    dict(type='text', value=text)
+                ])
         dataset_id = 'HF:meta'
     elif args.data is not None:
         if vlmeval_build_dataset is None:
             raise RuntimeError("vlmeval.dataset.build_dataset is unavailable; cannot load --data dataset.")
         dataset = vlmeval_build_dataset(name=args.data, work_dir=work_dir)
         dataset_id = dataset.dataset_name
-        data = dataset.data
-        max_n = len(data) if args.max_samples is None else min(len(data), args.max_samples)
-        for i in range(max_n):
-            struct = dataset.build_prompt(data.iloc[i])
-            messages.append(struct)
+        if use_hf_llm:
+            texts_for_llm = _extract_texts_from_vlmeval_dataset(dataset, args.max_samples)
+        else:
+            data = dataset.data
+            max_n = len(data) if args.max_samples is None else min(len(data), args.max_samples)
+            for i in range(max_n):
+                struct = dataset.build_prompt(data.iloc[i])
+                messages.append(struct)
     else:
         raise ValueError("Please specify either --hf-dataset meta or --data <DatasetName>.")
 
-    # -------- Instantiate model via VLMEvalKit (safe WORLD_SIZE handling) --------
-    ws_bak = os.environ.pop('WORLD_SIZE', None)
-    model_kwargs = {}
-    model_name = args.model
-    if model_name is not None and (
-        'Llama-4' in model_name or 'Qwen2-VL' in model_name or 'Qwen2.5-VL' in model_name
-    ):
-        model_kwargs = {'use_vllm': args.use_vllm}
+    # -------- Instantiate model (either VLMEvalKit VLM or transformers LLM) --------
+    torch_model: Optional[nn.Module] = None
+    vlm = None
+    if use_hf_llm:
+        if AutoModelForCausalLM is None or AutoTokenizer is None:
+            raise RuntimeError("transformers is not available; please install transformers to use --hf-llm-id")
 
-    constructor = supported_VLM[model_name]
-    if isinstance(constructor, functools.partial):
-        kw = dict(constructor.keywords or {})
-        if 'model_path' in kw and isinstance(kw['model_path'], str):
-            kw['model_path'] = kw['model_path'].strip()
-        constructor = functools.partial(constructor.func, *(constructor.args or ()), **kw)
-    vlm = constructor(**model_kwargs) if 'constructor' in locals() else supported_VLM[model_name](**model_kwargs)
-    if ws_bak:
-        os.environ['WORLD_SIZE'] = ws_bak
+        # parse dtype
+        dt = args.llm_dtype
+        torch_dtype = None
+        if dt == "float16":
+            torch_dtype = torch.float16
+        elif dt == "bfloat16":
+            torch_dtype = torch.bfloat16
+        elif dt == "float32":
+            torch_dtype = torch.float32
+        else:
+            torch_dtype = None  # auto
 
-    if getattr(vlm, 'is_api', False):
-        raise RuntimeError("API models are not supported for activation caching (no torch hooks).")
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.hf_llm_id, use_fast=True, trust_remote_code=args.trust_remote_code
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            args.hf_llm_id, torch_dtype=torch_dtype, trust_remote_code=args.trust_remote_code
+        )
+        device = torch.device(args.llm_device)
+        model.to(device)
+        model.eval()
+        torch_model = model
+    else:
+        # VLMEvalKit (safe WORLD_SIZE handling)
+        ws_bak = os.environ.pop('WORLD_SIZE', None)
+        model_kwargs = {}
+        model_name = args.model
+        if model_name is not None and (
+            'Llama-4' in model_name or 'Qwen2-VL' in model_name or 'Qwen2.5-VL' in model_name
+        ):
+            model_kwargs = {'use_vllm': args.use_vllm}
 
-    # If we used a VLMEval dataset (not HF meta), let model know how to dump images if needed
-    if args.hf_dataset is None and args.data is not None and hasattr(vlm, 'set_dump_image') and hasattr(dataset, 'dump_image'):
-        vlm.set_dump_image(dataset.dump_image)
+        constructor = supported_VLM[model_name]
+        if isinstance(constructor, functools.partial):
+            kw = dict(constructor.keywords or {})
+            if 'model_path' in kw and isinstance(kw['model_path'], str):
+                kw['model_path'] = kw['model_path'].strip()
+            constructor = functools.partial(constructor.func, *(constructor.args or ()), **kw)
+        vlm = constructor(**model_kwargs) if 'constructor' in locals() else supported_VLM[model_name](**model_kwargs)
+        if ws_bak:
+            os.environ['WORLD_SIZE'] = ws_bak
 
-    # -------- Prepare target modules & hooks --------
-    torch_model = get_underlying_torch_model(vlm)
-    if torch_model is None:
-        raise RuntimeError("Cannot find underlying torch model to hook (no .model and wrapper is not nn.Module)")
-    torch_model.eval()
+        if getattr(vlm, 'is_api', False):
+            raise RuntimeError("API models are not supported for activation caching (no torch hooks).")
+
+        # If we used a VLMEval dataset (not HF meta), let model know how to dump images if needed
+        if args.hf_dataset is None and args.data is not None and hasattr(vlm, 'set_dump_image') and hasattr(dataset, 'dump_image'):
+            vlm.set_dump_image(dataset.dump_image)
+
+        torch_model = get_underlying_torch_model(vlm)
+        if torch_model is None:
+            raise RuntimeError("Cannot find underlying torch model to hook (no .model and wrapper is not nn.Module)")
+        torch_model.eval()
 
     target_modules = get_target_module_map(
         torch_model,
@@ -459,20 +640,56 @@ def main():
     # -------- Run forwards to collect activations --------
     processed = 0
     err_count = 0
-    for struct in tqdm(messages, desc=f"Forward {model_name} on {dataset_id}"):
-        if os.environ.get('SKIP_ERR', '0') == '1':
+    if use_hf_llm:
+        # New: batch text-only forwards with transformers
+        assert torch_model is not None
+        model = torch_model  # type: ignore
+        device = torch.device(args.llm_device)
+        # tokenizer defined above in LLM branch
+        # To avoid mypy confusion, re-create here (safe, loads from cache)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.hf_llm_id, use_fast=True, trust_remote_code=args.trust_remote_code
+        )
+        bsz = max(1, int(args.probe_batch_size))
+        for i in tqdm(range(0, len(texts_for_llm), bsz), desc=f"Forward LLM on {dataset_id}"):
+            batch_texts = texts_for_llm[i:i+bsz]
+            enc = tokenizer(
+                batch_texts,
+                return_tensors='pt',
+                padding=True,
+                truncation=True,
+                max_length=args.llm_max_length
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
             try:
-                _ = vlm.generate(message=struct, dataset=dataset_id)
+                _ = model(**enc, use_cache=False)
             except RuntimeError as err:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                warnings.warn(f"generation failed: {type(err).__name__}: {err}")
-                err_count += 1
-        else:
-            _ = vlm.generate(message=struct, dataset=dataset_id)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        processed += 1
+                if os.environ.get('SKIP_ERR', '0') == '1':
+                    warnings.warn(f"forward failed: {type(err).__name__}: {err}")
+                    err_count += 1
+                else:
+                    raise
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            processed += len(batch_texts)
+    else:
+        # Original: drive forwards via vlm.generate on multi-modal messages
+        for struct in tqdm(messages, desc=f"Forward {args.model} on {dataset_id}"):
+            if os.environ.get('SKIP_ERR', '0') == '1':
+                try:
+                    _ = vlm.generate(message=struct, dataset=dataset_id)
+                except RuntimeError as err:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    warnings.warn(f"generation failed: {type(err).__name__}: {err}")
+                    err_count += 1
+            else:
+                _ = vlm.generate(message=struct, dataset=dataset_id)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            processed += 1
 
     for h in hooks:
         h.remove()
@@ -497,7 +714,9 @@ def main():
     torch.save(averaged_activations, save_path)
 
     # Cleanup
-    del vlm, hooks, activation_stats, averaged_activations
+    del hooks, activation_stats, averaged_activations
+    if not use_hf_llm:
+        del vlm
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
