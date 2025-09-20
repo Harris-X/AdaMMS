@@ -242,28 +242,66 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     print(f"[Meta][warn] load failed at ep={ep_str} streaming={sflag}: {type(e).__name__}: {e}")
         raise RuntimeError(f"[Meta] Failed to load {path} ({name or ''}) split={split} after retries: {last_exc}")
 
-    def _iter_first_n(ds, n: int):
+    def _yield_first_n(path: str, name: Optional[str], split: str, n: int):
+        """Robustly yield first n items with retries across endpoint and streaming modes.
+
+        This handles failures that occur during iteration (common in streaming mode) by
+        switching to non-streaming and/or the official endpoint.
+        """
         if n <= 0:
             return
+        current_ep = os.environ.get("HF_ENDPOINT")
+        trial_eps = [current_ep, "https://huggingface.co"]
+        seen = set(); ordered_eps = []
+        for ep in trial_eps:
+            key = ep or "__none__"
+            if key in seen: continue
+            seen.add(key); ordered_eps.append(ep)
+
+        # try combinations: requested streaming first, then non-streaming; across endpoints
+        attempts = []
         if streaming:
-            for item in ds.shuffle(seed=42).take(n):
-                yield item
-        else:
-            dss = ds.shuffle(seed=42)
-            n_eff = min(n, len(dss))
-            if n_eff <= 0:
-                return
-            # select 会避免把全量加载到内存（仍需完整下载到本地缓存）
-            for item in dss.select(range(n_eff)):
-                yield item
+            attempts.append(True)
+        attempts.append(False)
+
+        for ep in ordered_eps:
+            _set_ep(ep)
+            ep_str = ep or os.environ.get("HF_ENDPOINT") or "<default>"
+            for sflag in attempts:
+                try:
+                    print(f"[Meta] try iterate {path} ({name or ''}) split={split} streaming={sflag} ep={ep_str}")
+                    # load
+                    if name is None:
+                        ds = load_dataset(path, split=split, streaming=sflag, download_config=None if sflag else dl_cfg)
+                    else:
+                        ds = load_dataset(path, name, split=split, streaming=sflag, download_config=None if sflag else dl_cfg)
+                    # iterate
+                    cnt = 0
+                    if sflag:
+                        for item in ds.shuffle(seed=42).take(n):
+                            yield item
+                            cnt += 1
+                        if cnt >= n:
+                            return
+                    else:
+                        dss = ds.shuffle(seed=42)
+                        n_eff = min(n, len(dss))
+                        if n_eff <= 0:
+                            return
+                        for item in dss.select(range(n_eff)):
+                            yield item
+                        return
+                except Exception as e:
+                    print(f"[Meta][warn] iterate failed at ep={ep_str} streaming={sflag}: {type(e).__name__}: {e}")
+                    continue
+        raise RuntimeError(f"[Meta] Failed to iterate dataset {path} ({name or ''}) split={split} for first {n} samples after retries")
 
     meta_probe_samples: List[Dict[str, Any]] = []
 
     # 1) MMBench EN (test)
     if getattr(args, 'n_mmbench', 0) > 0:
         print(f"[Meta] Loading {args.n_mmbench} from MMBench (en/test)...")
-        ds = _load_ds("lmms-lab/MMBench", "en", "test")
-        for item in _iter_first_n(ds, args.n_mmbench):
+        for item in _yield_first_n("lmms-lab/MMBench", "en", "test", args.n_mmbench):
             q = item['question']
             options = []
             for key in ['A', 'B', 'C', 'D', 'E', 'F']:
@@ -279,13 +317,11 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 "question": full_q,
                 "answer": item.get("answer", None)
             })
-        del ds
 
     # 2) VCR (validation, Q->A)
     if getattr(args, 'n_vcr', 0) > 0:
         print(f"[Meta] Loading {args.n_vcr} from VCR (validation, Q->A)...")
-        ds = _load_ds("pingzhili/vcr-qa", None, "validation")
-        for item in _iter_first_n(ds, args.n_vcr):
+        for item in _yield_first_n("pingzhili/vcr-qa", None, "validation", args.n_vcr):
             q = item['question']
             choices = item.get('answer_choices', [])
             choices_str = "\n".join([f"- {c}" for c in choices])
@@ -297,30 +333,25 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 "question": full_q,
                 "answer": correct_text
             })
-        del ds
 
     # 3) DocVQA (validation)
     if getattr(args, 'n_docvqa', 0) > 0:
         print(f"[Meta] Loading {args.n_docvqa} from DocVQA (validation)...")
-        ds = _load_ds("lmms-lab/DocVQA", "DocVQA", "validation")
-        for item in _iter_first_n(ds, args.n_docvqa):
+        for item in _yield_first_n("lmms-lab/DocVQA", "DocVQA", "validation", args.n_docvqa):
             meta_probe_samples.append({
                 "image": item["image"],
                 "question": item["question"],
                 "answers": item.get("answers", None)
             })
-        del ds
 
     # 4) VQAv2 (validation)
     if getattr(args, 'n_vqa', 0) > 0:
         print(f"[Meta] Loading {args.n_vqa} from VQAv2 (validation)...")
-        ds = _load_ds("lmms-lab/VQAv2", None, "validation")
-        for item in _iter_first_n(ds, args.n_vqa):
+        for item in _yield_first_n("lmms-lab/VQAv2", None, "validation", args.n_vqa):
             meta_probe_samples.append({
                 "image": item["image"],
                 "question": item["question"],
             })
-        del ds
 
     # 5) ScienceQA (validation, has image) 仅非流式
     if getattr(args, 'n_scienceqa', 0) > 0:
@@ -353,10 +384,8 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
     # 6) ST-VQA task1 (test)
     if getattr(args, 'n_stvqa', 0) > 0:
         print(f"[Meta] Loading {args.n_stvqa} from ST-VQA task1 (test)...")
-        ds = _load_ds("danjacobellis/stvqa_task1", None, "test")
-        for item in _iter_first_n(ds, args.n_stvqa):
+        for item in _yield_first_n("danjacobellis/stvqa_task1", None, "test", args.n_stvqa):
             meta_probe_samples.append({"image": item["image"], "question": item["question"]})
-        del ds
 
     random.shuffle(meta_probe_samples)
     if args.max_samples is not None:
@@ -658,7 +687,7 @@ def main():
                 return_tensors='pt',
                 padding=True,
                 truncation=True,
-                max_length=args.llm_max_length
+                # max_length=args.llm_max_length 
             )
             enc = {k: v.to(device) for k, v in enc.items()}
             try:
