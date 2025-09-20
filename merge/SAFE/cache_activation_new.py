@@ -858,7 +858,8 @@ def main():
     if not save_path:
         os.makedirs('activations', exist_ok=True)
         suffix = (args.hf_dataset or args.data or 'unknown').replace('/', '_')
-        save_path = osp.join('activations', f"{args.model}_{suffix}.pt")
+        model_name_ = args.hf_llm_id if use_hf_llm else args.model
+        save_path = osp.join('activations', f"{model_name_}_{suffix}.pt")
     torch.save(averaged_activations, save_path)
 
     # Cleanup
