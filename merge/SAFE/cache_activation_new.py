@@ -120,6 +120,8 @@ def parse_args() -> argparse.Namespace:
                         help="Disable datasets streaming mode; use regular download (more stable, larger download).")
     parser.add_argument("--hf-endpoint", type=str, default=None,
                         help="Override HF_ENDPOINT (e.g., https://huggingface.co or a mirror). Use 'disable' to unset.")
+    parser.add_argument("--hf-offline", action="store_true",
+                        help="Force offline mode for HF datasets (use local cache only); implies --hf-no-streaming.")
 
     # hook + selection
     parser.add_argument("--req-act", nargs="+", default=["output"], choices=["input", "output"],
@@ -205,8 +207,18 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
         else:
             os.environ["HF_ENDPOINT"] = args.hf_endpoint.strip()
 
-    streaming = not getattr(args, "hf_no_streaming", False)
-    dl_cfg = DownloadConfig(max_retries=10, resume_download=True, use_etag=True)
+    # Offline/streaming config
+    offline = bool(getattr(args, "hf_offline", False))
+    if offline:
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+    streaming = False if offline else (not getattr(args, "hf_no_streaming", False))
+    dl_cfg = DownloadConfig(
+        max_retries=0 if offline else 10,
+        resume_download=not offline,
+        use_etag=not offline,
+        local_files_only=offline,
+    )
 
     def _set_ep(ep: Optional[str]):
         if ep is None:
@@ -605,6 +617,9 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(
             args.hf_llm_id, use_fast=True, trust_remote_code=args.trust_remote_code
         )
+        # Ensure pad token exists for batching (common for LLaMA)
+        if tokenizer.pad_token_id is None and hasattr(tokenizer, "eos_token") and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
         model = AutoModelForCausalLM.from_pretrained(
             args.hf_llm_id, torch_dtype=torch_dtype, trust_remote_code=args.trust_remote_code
         )
@@ -679,6 +694,8 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(
             args.hf_llm_id, use_fast=True, trust_remote_code=args.trust_remote_code
         )
+        if tokenizer.pad_token_id is None and hasattr(tokenizer, "eos_token") and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
         bsz = max(1, int(args.probe_batch_size))
         for i in tqdm(range(0, len(texts_for_llm), bsz), desc=f"Forward LLM on {dataset_id}"):
             batch_texts = texts_for_llm[i:i+bsz]
@@ -687,7 +704,7 @@ def main():
                 return_tensors='pt',
                 padding=True,
                 truncation=True,
-                # max_length=args.llm_max_length 
+                max_length=args.llm_max_length 
             )
             enc = {k: v.to(device) for k, v in enc.items()}
             try:
