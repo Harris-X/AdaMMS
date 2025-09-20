@@ -43,6 +43,10 @@ New (added):
             --req-act input output \
             --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
             --probe-batch-size 4 --llm-max-length 1024
+
+Multi-GPU (new):
+- For transformers LLM, pass --llm-device-map auto (or other maps) to shard the model across GPUs using accelerate.
+- When device_map is set, the code will not .to(device) the whole model and will keep batch tensors on CPU to let HF dispatch them automatically.
 """
 
 from __future__ import annotations
@@ -153,6 +157,8 @@ def parse_args() -> argparse.Namespace:
                         help="Batch size for forward pass when using transformers LLM (text-only)")
     parser.add_argument("--llm-max-length", type=int, default=1024,
                         help="Max token length for tokenizer(truncation)")
+    parser.add_argument("--llm-device-map", type=str, default=None,
+                        help="Transformers device_map for multi-GPU sharding, e.g. 'auto', 'balanced', 'balanced_low_0'. Use None to disable.")
 
     return parser.parse_args()
 
@@ -620,11 +626,28 @@ def main():
         # Ensure pad token exists for batching (common for LLaMA)
         if tokenizer.pad_token_id is None and hasattr(tokenizer, "eos_token") and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(
-            args.hf_llm_id, torch_dtype=torch_dtype, trust_remote_code=args.trust_remote_code
-        )
-        device = torch.device(args.llm_device)
-        model.to(device)
+
+        device_map = args.llm_device_map
+        if device_map is not None and device_map.lower() == "none":
+            device_map = None
+
+        if device_map is not None:
+            # Multi-GPU sharded load via accelerate
+            model = AutoModelForCausalLM.from_pretrained(
+                args.hf_llm_id,
+                torch_dtype=torch_dtype,
+                trust_remote_code=args.trust_remote_code,
+                device_map=device_map,
+                low_cpu_mem_usage=True,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.hf_llm_id,
+                torch_dtype=torch_dtype,
+                trust_remote_code=args.trust_remote_code,
+            )
+            device = torch.device(args.llm_device)
+            model.to(device)
         model.eval()
         torch_model = model
     else:
@@ -688,6 +711,7 @@ def main():
         # New: batch text-only forwards with transformers
         assert torch_model is not None
         model = torch_model  # type: ignore
+        device_map = args.llm_device_map
         device = torch.device(args.llm_device)
         # tokenizer defined above in LLM branch
         # To avoid mypy confusion, re-create here (safe, loads from cache)
@@ -706,7 +730,10 @@ def main():
                 truncation=True,
                 max_length=args.llm_max_length 
             )
-            enc = {k: v.to(device) for k, v in enc.items()}
+            # If model is sharded across GPUs with device_map, keep tensors on CPU
+            # to let transformers/accelerate dispatch them automatically.
+            if device_map is None or (isinstance(device_map, str) and device_map.lower() == "none"):
+                enc = {k: v.to(device) for k, v in enc.items()}
             try:
                 _ = model(**enc, use_cache=False)
             except RuntimeError as err:
