@@ -47,7 +47,14 @@ New (added):
 Multi-GPU (new):
 - For transformers LLM, pass --llm-device-map auto (or other maps) to shard the model across GPUs using accelerate.
 - When device_map is set, the code will not .to(device) the whole model and will keep batch tensors on CPU to let HF dispatch them automatically.
+
+单卡：使用物理 2 号卡 python cache_activation_new.py --gpus 2 --hf-llm-id /path/to/Llama-2-7b-hf --hf-dataset meta --n-mmbench 50 --req-act input output --module-regex "mlp.|self_attn.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" --probe-batch-size 1 --llm-max-length 512
+
+多卡：使用物理 2、6 号卡，并让 transformers 自动分片 python cache_activation_new.py --gpus 2,6 --hf-llm-id /path/to/Llama-2-7b-hf --hf-dataset meta --n-mmbench 50 --req-act input output --module-regex "mlp.|self_attn.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" --probe-batch-size 1 --llm-max-length 512 --llm-device-map auto
+
 """
+
+
 
 from __future__ import annotations
 
@@ -94,7 +101,6 @@ try:
 except Exception:
     AutoModelForCausalLM = None
     AutoTokenizer = None
-
 # -------------------------
 # CLI
 # -------------------------
@@ -126,6 +132,11 @@ def parse_args() -> argparse.Namespace:
                         help="Override HF_ENDPOINT (e.g., https://huggingface.co or a mirror). Use 'disable' to unset.")
     parser.add_argument("--hf-offline", action="store_true",
                         help="Force offline mode for HF datasets (use local cache only); implies --hf-no-streaming.")
+    # 新增：缓存目录与回退控制
+    parser.add_argument("--hf-cache-dir", type=str, default=None,
+                        help="Override HuggingFace cache dir for datasets (sets HF_HOME/HF_DATASETS_CACHE/HUGGINGFACE_HUB_CACHE and DownloadConfig.cache_dir).")
+    parser.add_argument("--hf-disable-streaming-fallback", action="store_true",
+                        help="Disable automatic fallback to streaming when non-streaming fails due to disk space.")
 
     # hook + selection
     parser.add_argument("--req-act", nargs="+", default=["output"], choices=["input", "output"],
@@ -145,9 +156,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-vllm", action="store_true",
                         help="Pass use_vllm to certain models (e.g., Llama-4, Qwen2-VL series)")
 
+    # GPU selection
+    parser.add_argument("--gpus", type=str, default=None,
+                        help="Comma-separated GPU ids to use, e.g. '0,2'. Will set CUDA_VISIBLE_DEVICES accordingly.")
+
     # New: transformers LLM runtime knobs
-    parser.add_argument("--llm-device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="Device for transformers LLM (cuda/cpu)")
+    parser.add_argument("--llm-device", type=str, default="cuda",
+                        help="Device for transformers LLM (cuda/cpu). If using --gpus, the indices refer to the remapped list.")
     parser.add_argument("--llm-dtype", type=str, default="auto",
                         choices=["auto", "float16", "bfloat16", "float32"],
                         help="torch dtype for transformers LLM load; auto=HF default")
@@ -218,12 +233,29 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
     if offline:
         os.environ["HF_DATASETS_OFFLINE"] = "1"
         os.environ["HF_HUB_OFFLINE"] = "1"
+
+    # 新增：缓存目录设置
+    if args.hf_cache_dir:
+        # Expand ~ and make absolute to avoid writing to system default caches
+        _cache_dir = osp.abspath(osp.expanduser(args.hf_cache_dir))
+        os.makedirs(_cache_dir, exist_ok=True)
+        # Point all relevant caches and temp dir to the specified location
+        os.environ["HF_HOME"] = _cache_dir
+        os.environ["HF_DATASETS_CACHE"] = _cache_dir
+        os.environ["HUGGINGFACE_HUB_CACHE"] = _cache_dir
+        os.environ["TRANSFORMERS_CACHE"] = _cache_dir
+        # Redirect temp files (parquet/arrow/temp extractions) away from system /tmp
+        os.environ.setdefault("TMPDIR", _cache_dir)
+    else:
+        _cache_dir = None
+
     streaming = False if offline else (not getattr(args, "hf_no_streaming", False))
     dl_cfg = DownloadConfig(
         max_retries=0 if offline else 10,
         resume_download=not offline,
         use_etag=not offline,
         local_files_only=offline,
+        cache_dir=_cache_dir,
     )
 
     def _set_ep(ep: Optional[str]):
@@ -234,8 +266,23 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
         else:
             os.environ["HF_ENDPOINT"] = ep.strip()
 
+    # 新增：判定是否是“磁盘空间不足”错误
+    def _is_disk_oom(exc: Exception) -> bool:
+        s = str(exc).lower()
+        return ("not enough disk space" in s) or ("no space left on device" in s) or ("errno 28" in s)
+
+    def _streaming_order() -> List[bool]:
+        # 请求顺序：若用户要求 streaming，则优先 True；否则先 False，再视情况回退 True
+        order = []
+        if streaming:
+            order.extend([True, False])
+        else:
+            order.append(False)
+            if (not offline) and (not args.hf_disable_streaming_fallback):
+                order.append(True)
+        return order
+
     def _load_ds(path, name=None, split="validation"):
-        # 在当前端点失败时，自动回退到官方端点，并在需要时回退到非流式
         current_ep = os.environ.get("HF_ENDPOINT")
         trial_eps = [current_ep, "https://huggingface.co"]
         seen = set(); ordered_eps = []
@@ -248,7 +295,7 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
         for ep in ordered_eps:
             _set_ep(ep)
             ep_str = ep or os.environ.get("HF_ENDPOINT") or "<default>"
-            for sflag in [streaming, False] if streaming else [False]:
+            for sflag in _streaming_order():
                 try:
                     print(f"[Meta] try load {path} ({name or ''}) split={split} streaming={sflag} ep={ep_str}")
                     if name is None:
@@ -258,13 +305,25 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 except Exception as e:
                     last_exc = e
                     print(f"[Meta][warn] load failed at ep={ep_str} streaming={sflag}: {type(e).__name__}: {e}")
+                    # 非流式因磁盘不足 -> 直接尝试流式一次（即便用户传了 --hf-no-streaming），除非用户禁用了回退
+                    if (not sflag) and _is_disk_oom(e) and (not offline) and (not args.hf_disable_streaming_fallback):
+                        try:
+                            print(f"[Meta] disk full; fallback to streaming=True ep={ep_str}")
+                            if name is None:
+                                return load_dataset(path, split=split, streaming=True, download_config=None)
+                            else:
+                                return load_dataset(path, name, split=split, streaming=True, download_config=None)
+                        except Exception as e2:
+                            last_exc = e2
+                            print(f"[Meta][warn] fallback streaming load failed: {type(e2).__name__}: {e2}")
+                    continue
         raise RuntimeError(f"[Meta] Failed to load {path} ({name or ''}) split={split} after retries: {last_exc}")
 
     def _yield_first_n(path: str, name: Optional[str], split: str, n: int):
         """Robustly yield first n items with retries across endpoint and streaming modes.
 
-        This handles failures that occur during iteration (common in streaming mode) by
-        switching to non-streaming and/or the official endpoint.
+        This handles failures that occur during iteration (common in streaming or when non-streaming hits disk limits)
+        by switching modes and/or endpoints.
         """
         if n <= 0:
             return
@@ -276,24 +335,16 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
             if key in seen: continue
             seen.add(key); ordered_eps.append(ep)
 
-        # try combinations: requested streaming first, then non-streaming; across endpoints
-        attempts = []
-        if streaming:
-            attempts.append(True)
-        attempts.append(False)
-
         for ep in ordered_eps:
             _set_ep(ep)
             ep_str = ep or os.environ.get("HF_ENDPOINT") or "<default>"
-            for sflag in attempts:
+            for sflag in _streaming_order():
                 try:
                     print(f"[Meta] try iterate {path} ({name or ''}) split={split} streaming={sflag} ep={ep_str}")
-                    # load
                     if name is None:
                         ds = load_dataset(path, split=split, streaming=sflag, download_config=None if sflag else dl_cfg)
                     else:
                         ds = load_dataset(path, name, split=split, streaming=sflag, download_config=None if sflag else dl_cfg)
-                    # iterate
                     cnt = 0
                     if sflag:
                         for item in ds.shuffle(seed=42).take(n):
@@ -311,6 +362,20 @@ def build_meta_probe_dataset(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         return
                 except Exception as e:
                     print(f"[Meta][warn] iterate failed at ep={ep_str} streaming={sflag}: {type(e).__name__}: {e}")
+                    # 非流式迭代时磁盘不足 -> 尝试流式回退
+                    if (not sflag) and _is_disk_oom(e) and (not offline) and (not args.hf_disable_streaming_fallback):
+                        try:
+                            print(f"[Meta] disk full on iterate; retry with streaming=True ep={ep_str}")
+                            if name is None:
+                                ds = load_dataset(path, split=split, streaming=True, download_config=None)
+                            else:
+                                ds = load_dataset(path, name, split=split, streaming=True, download_config=None)
+                            for item in ds.shuffle(seed=42).take(n):
+                                yield item
+                            return
+                        except Exception as e2:
+                            print(f"[Meta][warn] streaming iterate fallback failed: {type(e2).__name__}: {e2}")
+                            continue
                     continue
         raise RuntimeError(f"[Meta] Failed to iterate dataset {path} ({name or ''}) split={split} for first {n} samples after retries")
 
@@ -544,6 +609,16 @@ def get_hook_with_kwargs(name: str, req_act: Iterable[str], activation_stats: di
 @torch.no_grad()
 def main():
     args = parse_args()
+
+    # Apply GPU selection early
+    if getattr(args, "gpus", None):
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+        print(f"[Env] CUDA_VISIBLE_DEVICES set to: {args.gpus}")
+
+    # If CUDA is not available but user kept --llm-device=cuda, fallback to cpu to avoid runtime error
+    if getattr(args, "llm_device", "cuda") == "cuda" and not torch.cuda.is_available():
+        print("[Warn] CUDA not available; falling back to --llm-device=cpu")
+        args.llm_device = "cpu"
 
     work_dir = args.work_dir
     os.makedirs(work_dir, exist_ok=True)
