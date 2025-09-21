@@ -4,13 +4,13 @@ import safetensors
 import torch
 from tqdm import tqdm
 from utils import load_weights, need_merge, normalize_llm_keys
-
+import os.path as osp
 
 
 def regularized_disjoint_mask_generation(args):
         """阶段二：【SAfe】生成夏普斯感知的非冲突更新掩码。"""
         print("\n--- [阶段二: SAfe 夏普斯感知评分与掩码生成] ---")
-        mask_cache_path = os.path.join(args.cache_dir, f"SAfe_disjoint_mask_r{args.top_k_ratio}_alpha{args.alpha}.pt")
+        mask_cache_path = os.path.join(args.cache_dir, f"mask_r{args.top_k_ratio}_alpha{args.alpha}.pt")
         if os.path.exists(mask_cache_path) and not args.force_recompute:
             print("SAfe 非冲突掩码缓存文件已存在, 跳过。")
             return
@@ -23,10 +23,30 @@ def regularized_disjoint_mask_generation(args):
         weights_B = normalize_llm_keys(weights_B_raw, list(weights_A.keys())); del weights_B_raw
         weights_C = normalize_llm_keys(weights_C_raw, list(weights_A.keys())); del weights_C_raw
 
+        
+        A_activations_path = osp.basename(args.base_model_path.rstrip(os.sep)) + "_meta.pt"
+        if osp.exists(osp.join(args.cache_dir, "activations", A_activations_path)):
+            print(f"从缓存加载 A 模型激活: {A_activations_path}")
+            activations_A = torch.load(osp.join(args.cache_dir, "activations", A_activations_path))
+        else:
+            raise FileNotFoundError(f"A 模型激活文件未找到: {osp.join(args.cache_dir, 'activations', A_activations_path)}")
+        B_activations_path = osp.basename(args.donor_model_path.rstrip(os.sep)) + "_meta.pt"
+        if osp.exists(osp.join(args.cache_dir, "activations", B_activations_path)):
+            print(f"从缓存加载 B 模型激活: {B_activations_path}")
+            activations_B = torch.load(osp.join(args.cache_dir, "activations", B_activations_path))
+        else:
+            raise FileNotFoundError(f"B 模型激活文件未找到: {osp.join(args.cache_dir, 'activations', B_activations_path)}")
+        C_activations_path = osp.basename(args.original_model_path.rstrip(os.sep)) + "_meta.pt"
+        if osp.exists(osp.join(args.cache_dir, "activations", C_activations_path)):
+            print(f"从缓存加载 C 模型激活: {C_activations_path}")
+            activations_C = torch.load(osp.join(args.cache_dir, "activations", C_activations_path))
+        else:
+            raise FileNotFoundError(f"C 模型激活文件未找到: {osp.join(args.cache_dir, 'activations', C_activations_path)}")
+
         activations = {
-            'A': torch.load(os.path.join(args.cache_dir, "activations_A.pt")),
-            'B': torch.load(os.path.join(args.cache_dir, "activations_B.pt")),
-            'C': torch.load(os.path.join(args.cache_dir, "activations_C.pt"))
+            'A': activations_A,
+            'B': activations_B,
+            'C': activations_C
         }
 
         disjoint_masks = {}
@@ -113,10 +133,10 @@ def regularized_disjoint_mask_generation(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base_model_path", type=str, required=True, help="基础模型权重路径")
-    parser.add_argument("--donor_model_path", type=str, required=True, help="捐赠模型权重路径")
-    parser.add_argument("--original_model_path", type=str, required=True, help="原始模型权重路径")
-    parser.add_argument("--cache_dir", type=str, default="./cache", help="缓存目录")
+    parser.add_argument('--base_model_path', type=str, default="/root/autodl-tmp/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
+    parser.add_argument('--donor_model_path', type=str, default="/root/autodl-tmp/AdaMMS/downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
+    parser.add_argument('--original_model_path', type=str, default="/root/autodl-tmp/AdaMMS/downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
+    parser.add_argument("--cache_dir", type=str, default="/root/autodl-tmp/AdaMMS/merge/SAFE/activations", help="缓存目录")
     parser.add_argument("--top_k_ratio", type=float, default=0.1, help="选择的神经元比例")
     parser.add_argument("--alpha", type=float, default=0.1, help="夏普斯惩罚系数")
     parser.add_argument("--force_recompute", action='store_true', help="强制重新计算掩码")
