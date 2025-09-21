@@ -154,3 +154,5 @@ if __name__ == "__main__":
     parser.add_argument('--lambda_norm', type=float, default=0.0, help="norm 参数的加权平均系数（不走梯度合并）。")
     parser.add_argument('--mode', type=str, default="SAFE", help="为本次合并配置命名。")
     args = parser.parse_args()
+
+    disentangled_reprojection_fusion(args)
