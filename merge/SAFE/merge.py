@@ -147,7 +147,7 @@ def disentangled_reprojection_fusion(args):
 def _save_model(args, merged_weights):
     """保存模型权重。"""
     print("\n正在保存合并后的模型...")
-    output_dir = osp.basename(args.donor_model_path.rstrip(os.sep))
+    output_dir = osp.basename(args.base_model_path.rstrip(os.sep))
     output_dir = osp.join(args.output_dir, output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
