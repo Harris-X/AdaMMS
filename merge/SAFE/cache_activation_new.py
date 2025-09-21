@@ -37,12 +37,16 @@ New (added):
 - Use only the textual part of datasets (questions + choices/hints) and ignore images.
 - Example for LLM:
         python cache_activation_new.py \
-            --hf-llm-id meta-llama/Llama-2-7b-hf \
+            --hf-llm-id /root/autodl-tmp/AdaMMS/downloaded_models/Llama-2-7b-hf \
+            --gpus 0,1,2,3 \
             --hf-dataset meta \
+            --hf-offline \
             --n-mmbench 50 \
             --req-act input output \
             --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
-            --probe-batch-size 4 --llm-max-length 1024
+            --probe-batch-size 1 --llm-max-length 1024 \
+            --llm-dtype float16 \
+            --llm-device-map auto
 
 Multi-GPU (new):
 - For transformers LLM, pass --llm-device-map auto (or other maps) to shard the model across GPUs using accelerate.
