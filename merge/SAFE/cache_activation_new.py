@@ -1018,7 +1018,12 @@ def main():
         os.makedirs('activations', exist_ok=True)
         suffix = (args.hf_dataset or args.data or 'unknown').replace('/', '_')
         model_name_ = args.hf_llm_id if use_hf_llm else args.model
-        save_path = osp.join('activations', f"{model_name_}_{suffix}.pt")
+        # 若传入的是绝对路径或包含斜杠的 HF 模型 ID，使用 basename，避免 os.path.join 被绝对路径覆盖
+        if isinstance(model_name_, str):
+            model_label = osp.basename(model_name_.rstrip(os.sep))
+        else:
+            model_label = str(model_name_)
+        save_path = osp.join('activations', f"{model_label}_{suffix}.pt")
     torch.save(averaged_activations, save_path)
 
     # Cleanup
