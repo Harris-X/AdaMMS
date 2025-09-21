@@ -23,7 +23,7 @@ Example:
     --hf-offline \
     --req-act input output \
     --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
-    --probe-batch-size 1
+    --probe-batch-size 1\
     --vlm-device-map auto \
     --vlm-dtype float16
 
@@ -46,7 +46,7 @@ New (added):
             --hf-offline \
             --req-act input output \
             --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
-            --probe-batch-size 1 --llm-max-length 1024 \
+            --probe-batch-size 1 --llm-max-length 512 \
             --llm-dtype float16 \
             --llm-device-map auto
 
@@ -108,17 +108,32 @@ except Exception:
     AutoModelForCausalLM = None
     AutoTokenizer = None
 
-# Optional accelerate helpers for sharding VLM underlying HF model across GPUs
+# Optional accelerate/transformers helpers for sharding VLM underlying HF model across GPUs
+_acc_dispatch_model = None
+_acc_get_balanced_memory = None
+_acc_infer_auto_device_map = None
 try:
-    from accelerate.utils import (
-        dispatch_model as _acc_dispatch_model,
-        get_balanced_memory as _acc_get_balanced_memory,
-        infer_auto_device_map as _acc_infer_auto_device_map,
-    )
+    # Prefer accelerate top-level import when available
+    from accelerate import dispatch_model as _acc_dispatch_model  # type: ignore
 except Exception:
-    _acc_dispatch_model = None
-    _acc_get_balanced_memory = None
-    _acc_infer_auto_device_map = None
+    try:
+        from accelerate.utils import dispatch_model as _acc_dispatch_model  # type: ignore
+    except Exception:
+        _acc_dispatch_model = None
+
+# get_balanced_memory / infer_auto_device_map exist in transformers.utils in many versions
+try:
+    from transformers.utils import get_balanced_memory as _acc_get_balanced_memory  # type: ignore
+    from transformers.utils import infer_auto_device_map as _acc_infer_auto_device_map  # type: ignore
+except Exception:
+    try:
+        from accelerate.utils import (
+            get_balanced_memory as _acc_get_balanced_memory,  # type: ignore
+            infer_auto_device_map as _acc_infer_auto_device_map,  # type: ignore
+        )
+    except Exception:
+        _acc_get_balanced_memory = None
+        _acc_infer_auto_device_map = None
 # -------------------------
 # CLI
 # -------------------------
@@ -186,12 +201,17 @@ def parse_args() -> argparse.Namespace:
                         help="torch dtype for transformers LLM load; auto=HF default")
     parser.add_argument("--trust-remote-code", action="store_true",
                         help="Pass trust_remote_code=True to transformers.from_pretrained")
-    parser.add_argument("--probe-batch-size", type=int, default=4,
+    parser.add_argument("--probe-batch-size", type=int, default=1,
                         help="Batch size for forward pass when using transformers LLM (text-only)")
-    parser.add_argument("--llm-max-length", type=int, default=1024,
+    parser.add_argument("--llm-max-length", type=int, default=512,
                         help="Max token length for tokenizer(truncation)")
     parser.add_argument("--llm-device-map", type=str, default=None,
                         help="Transformers device_map for multi-GPU sharding, e.g. 'auto', 'balanced', 'balanced_low_0'. Use None to disable.")
+    # 与 VLM 一致：默认使用 generate 路径触发模块前向
+    parser.add_argument("--llm-forward-mode", type=str, choices=["generate", "forward"], default="generate",
+                        help="LLM 前向路径：'generate' 与 VLM 一致（推荐），或 'forward' 直接调用 model(**enc)。默认 generate。")
+    parser.add_argument("--llm-new-tokens", type=int, default=1,
+                        help="当使用 --llm-forward-mode generate 时，生成的新 token 数（建议 1）。")
 
     # VLM (VLMEvalKit) optional multi-GPU sharding via accelerate
     parser.add_argument("--vlm-device-map", type=str, default=None,
@@ -592,6 +612,42 @@ def get_target_module_map(
 
 
 # -------------------------
+# Device helpers (LLM)
+# -------------------------
+
+def _pick_llm_input_device(model: nn.Module) -> torch.device:
+    """Choose a device to place input tensors for generate/forward.
+
+    - If the model is sharded (hf_device_map exists), pick the lowest-index CUDA device in the map.
+    - Else, use the device of the first parameter (covers single-GPU or CPU).
+    - Fallback to CPU if anything goes wrong.
+    """
+    try:
+        # Prefer device from device map if present
+        if hasattr(model, 'hf_device_map') and isinstance(getattr(model, 'hf_device_map'), dict):
+            dev_indices = []
+            for v in model.hf_device_map.values():
+                if isinstance(v, str) and v.startswith('cuda'):
+                    try:
+                        idx = int(v.split(':')[1]) if ':' in v else 0
+                        dev_indices.append(idx)
+                    except Exception:
+                        continue
+            if dev_indices:
+                return torch.device(f'cuda:{min(dev_indices)}')
+        # Fall back to first param device
+        try:
+            p = next(model.parameters())
+            if hasattr(p, 'device'):
+                return p.device
+        except StopIteration:
+            pass
+    except Exception:
+        pass
+    return torch.device('cpu')
+
+
+# -------------------------
 # Hook function (input/output sum & average)
 # -------------------------
 
@@ -806,14 +862,40 @@ def main():
                         if _acc_get_balanced_memory is None or _acc_infer_auto_device_map is None:
                             warnings.warn("accelerate auto device map utilities unavailable; skip sharding.")
                         else:
+                            # Move model to CPU first to avoid double allocation on GPU during dispatch
+                            try:
+                                any_cuda = any(p.is_cuda for p in torch_model.parameters())
+                            except Exception:
+                                any_cuda = False
+                            if any_cuda:
+                                if args.verbose:
+                                    print("[VLM][accelerate] Moving model to CPU before dispatch to avoid GPU OOM...")
+                                torch_model.to('cpu')
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
                             no_split = list(getattr(args, "vlm_no_split_classes", []) or [])
-                            max_mem = _acc_get_balanced_memory(torch_model, dtype=_torch_dtype, no_split_module_classes=no_split)
-                            inferred = _acc_infer_auto_device_map(torch_model, max_memory=max_mem, no_split_module_classes=no_split)
+                            # Balanced memory if available
+                            try:
+                                max_mem = _acc_get_balanced_memory(torch_model, dtype=_torch_dtype, no_split_module_classes=no_split) if _acc_get_balanced_memory else None
+                            except Exception:
+                                max_mem = None
+                            # Infer device map
+                            if max_mem is not None:
+                                inferred = _acc_infer_auto_device_map(torch_model, max_memory=max_mem, no_split_module_classes=no_split)
+                            else:
+                                inferred = _acc_infer_auto_device_map(torch_model, no_split_module_classes=no_split)
                             _acc_dispatch_model(torch_model, device_map=inferred)
                             if args.verbose:
                                 print("[VLM][accelerate] Dispatched underlying model with auto device map:")
                                 try:
                                     print(inferred)
+                                except Exception:
+                                    pass
+                                # Print parameter device distribution
+                                try:
+                                    from collections import Counter as _Counter
+                                    cnt = _Counter(str(p.device) for p in torch_model.parameters() if hasattr(p, 'device'))
+                                    print(f"[VLM][accelerate] Param device counts: {dict(cnt)}")
                                 except Exception:
                                     pass
                     else:
@@ -869,12 +951,25 @@ def main():
                 truncation=True,
                 max_length=args.llm_max_length 
             )
-            # If model is sharded across GPUs with device_map, keep tensors on CPU
-            # to let transformers/accelerate dispatch them automatically.
-            if device_map is None or (isinstance(device_map, str) and device_map.lower() == "none"):
-                enc = {k: v.to(device) for k, v in enc.items()}
+            # 选择合适的设备放置输入，避免 generate 的设备不一致警告
+            # - 若设置了 device_map（可能分片），优先把输入放到分片的首个 GPU 设备
+            # - 否则放到 --llm-device 指定的设备
+            target_dev = _pick_llm_input_device(model) if device_map is not None and not (isinstance(device_map, str) and device_map.lower() == "none") else device
+            enc = {k: v.to(target_dev) for k, v in enc.items()}
             try:
-                _ = model(**enc, use_cache=False)
+                if args.llm_forward_mode == "generate":
+                    # 与 VLM 一致：走生成路径，触发与 VLM 相同位置的模块前向（prefill + 1 step 解码）
+                    _ = model.generate(
+                        input_ids=enc.get("input_ids"),
+                        attention_mask=enc.get("attention_mask"),
+                        max_new_tokens=max(1, int(getattr(args, "llm_new_tokens", 1))),
+                        do_sample=False,
+                        temperature=0.0,
+                        use_cache=True,
+                    )
+                else:
+                    # 直接前向：较快，但与 VLM generate 略有差异
+                    _ = model(**enc, use_cache=False)
             except RuntimeError as err:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
