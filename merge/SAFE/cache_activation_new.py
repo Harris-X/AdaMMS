@@ -17,12 +17,15 @@ Key features:
 
 Example:
   python cache_activation_new.py \
+    --gpus 0,1,2,3 \
     --model mPLUG-Owl2 \
     --hf-dataset meta \
-    --n-mmbench 50 --n-vqa 50 \
+    --hf-offline \
     --req-act input output \
     --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
-    --save activations/mmplug-meta.pt
+    --probe-batch-size 1
+    --vlm-device-map auto \
+    --vlm-dtype float16
 
 Notes:
 - Only local torch models are supported (API models cannot be hooked).
@@ -41,7 +44,6 @@ New (added):
             --gpus 0,1,2,3 \
             --hf-dataset meta \
             --hf-offline \
-            --n-mmbench 50 \
             --req-act input output \
             --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
             --probe-batch-size 1 --llm-max-length 1024 \
@@ -105,6 +107,18 @@ try:
 except Exception:
     AutoModelForCausalLM = None
     AutoTokenizer = None
+
+# Optional accelerate helpers for sharding VLM underlying HF model across GPUs
+try:
+    from accelerate.utils import (
+        dispatch_model as _acc_dispatch_model,
+        get_balanced_memory as _acc_get_balanced_memory,
+        infer_auto_device_map as _acc_infer_auto_device_map,
+    )
+except Exception:
+    _acc_dispatch_model = None
+    _acc_get_balanced_memory = None
+    _acc_infer_auto_device_map = None
 # -------------------------
 # CLI
 # -------------------------
@@ -122,12 +136,12 @@ def parse_args() -> argparse.Namespace:
                         help="Special HF loader key; currently supports: 'meta'. If set, overrides --data")
 
     # meta dataset knobs
-    parser.add_argument("--n-mmbench", type=int, default=0, help="Samples to draw from MMBench (en/test)")
+    parser.add_argument("--n-mmbench", type=int, default=40, help="Samples to draw from MMBench (en/test)")
     parser.add_argument("--n-vcr", type=int, default=0, help="Samples to draw from VCR (validation, Q->A)")
-    parser.add_argument("--n-docvqa", type=int, default=0, help="Samples to draw from DocVQA (validation)")
-    parser.add_argument("--n-vqa", type=int, default=0, help="Samples to draw from VQAv2 (validation)")
-    parser.add_argument("--n-scienceqa", type=int, default=0, help="Samples to draw from ScienceQA (validation, has image)")
-    parser.add_argument("--n-stvqa", type=int, default=0, help="Samples to draw from ST-VQA task1 (test)")
+    parser.add_argument("--n-docvqa", type=int, default=10, help="Samples to draw from DocVQA (validation)")
+    parser.add_argument("--n-vqa", type=int, default=50, help="Samples to draw from VQAv2 (validation)")
+    parser.add_argument("--n-scienceqa", type=int, default=50, help="Samples to draw from ScienceQA (validation, has image)")
+    parser.add_argument("--n-stvqa", type=int, default=50, help="Samples to draw from ST-VQA task1 (test)")
     parser.add_argument("--max-samples", type=int, default=None, help="Cap total samples (after composition)")
     # 新增：HF 下载与镜像控制
     parser.add_argument("--hf-no-streaming", action="store_true",
@@ -178,6 +192,16 @@ def parse_args() -> argparse.Namespace:
                         help="Max token length for tokenizer(truncation)")
     parser.add_argument("--llm-device-map", type=str, default=None,
                         help="Transformers device_map for multi-GPU sharding, e.g. 'auto', 'balanced', 'balanced_low_0'. Use None to disable.")
+
+    # VLM (VLMEvalKit) optional multi-GPU sharding via accelerate
+    parser.add_argument("--vlm-device-map", type=str, default=None,
+                        help="Optional device map for underlying HF model inside VLM wrappers. Use 'auto' to infer and shard across visible GPUs. If None, keep default single-device placement by wrapper.")
+    parser.add_argument("--vlm-dtype", type=str, default="auto",
+                        choices=["auto", "float16", "bfloat16", "float32"],
+                        help="Dtype hint used when inferring device map (only takes effect if --vlm-device-map is set).")
+    parser.add_argument("--vlm-no-split-classes", nargs="*", default=[
+        "LlamaDecoderLayer", "MistralDecoderLayer", "QWenDecoderLayer", "Qwen2DecoderLayer", "Qwen2VLDecoderLayer"
+    ], help="Class names that should not be split when inferring device map with accelerate.")
 
     return parser.parse_args()
 
@@ -760,6 +784,42 @@ def main():
         if torch_model is None:
             raise RuntimeError("Cannot find underlying torch model to hook (no .model and wrapper is not nn.Module)")
         torch_model.eval()
+
+        # Optional: shard the underlying HF model across multiple GPUs using accelerate
+        if getattr(args, "vlm_device_map", None):
+            if _acc_dispatch_model is None:
+                warnings.warn("accelerate is not available; --vlm-device-map ignored. Please 'pip install accelerate'.")
+            else:
+                # resolve dtype
+                _dt = (args.vlm_dtype or "auto").lower()
+                _torch_dtype = None
+                if _dt == "float16":
+                    _torch_dtype = torch.float16
+                elif _dt == "bfloat16":
+                    _torch_dtype = torch.bfloat16
+                elif _dt == "float32":
+                    _torch_dtype = torch.float32
+
+                try:
+                    dmap = args.vlm_device_map
+                    if isinstance(dmap, str) and dmap.lower() == "auto":
+                        if _acc_get_balanced_memory is None or _acc_infer_auto_device_map is None:
+                            warnings.warn("accelerate auto device map utilities unavailable; skip sharding.")
+                        else:
+                            no_split = list(getattr(args, "vlm_no_split_classes", []) or [])
+                            max_mem = _acc_get_balanced_memory(torch_model, dtype=_torch_dtype, no_split_module_classes=no_split)
+                            inferred = _acc_infer_auto_device_map(torch_model, max_memory=max_mem, no_split_module_classes=no_split)
+                            _acc_dispatch_model(torch_model, device_map=inferred)
+                            if args.verbose:
+                                print("[VLM][accelerate] Dispatched underlying model with auto device map:")
+                                try:
+                                    print(inferred)
+                                except Exception:
+                                    pass
+                    else:
+                        warnings.warn("Custom --vlm-device-map is not parsed in this script; only 'auto' is supported.")
+                except Exception as e:
+                    warnings.warn(f"[VLM][accelerate] dispatch failed: {type(e).__name__}: {e}")
 
     target_modules = get_target_module_map(
         torch_model,
