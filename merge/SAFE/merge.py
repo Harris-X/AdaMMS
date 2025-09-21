@@ -7,7 +7,7 @@ import safetensors
 import torch
 from tqdm import tqdm
 
-from utils import load_weights
+from utils import load_weights, need_merge
 
 EPS = 1e-9
 
@@ -73,29 +73,41 @@ def disentangled_reprojection_fusion(args):
     device = torch.device(getattr(args, 'device', 'cuda' if torch.cuda.is_available() else 'cpu'))
 
     final_merged_weights = weights_A.copy()
-    
-    pbar = tqdm(disjoint_masks.items(), desc="执行重投影融合")
-    processed_keys = set()
-    for key, M_prime_B in pbar:
-        # 使用 canonical key 映射到 B/C 原始键
+
+    pbar = tqdm(weights_A.keys(), desc="执行重投影融合(仅need_merge)")
+    for key in pbar:
+        # 不需要复杂合并的参数：保留 A 原值
+        if not need_merge(key):
+            continue
+
+        # 映射 B/C 原始键
         a_canon = canon_param_key(key)
         b_key = b_canon_to_orig.get(a_canon, None)
         c_key = c_canon_to_orig.get(a_canon, None)
         if b_key is None or c_key is None:
+            # 找不到对应权重，保留 A
             continue
-        
-        processed_keys.add(key)
+
+        # 掩码必须存在
+        if key not in disjoint_masks:
+            continue
+        M_prime_B = disjoint_masks[key].to(device)
+
+        # 读取权重
         W_A = weights_A[key].float()
         W_B = weights_B_raw[b_key].float()
         W_C = weights_C_raw[c_key].float()
-        M_prime_B = M_prime_B.to(device)
 
+        # 激活模块名
         module_name = canon_module_from_param_key(key)
+
         tau_B = (W_B - W_C).to(device)
-        tau_B_update = tau_B * M_prime_B.to(device)
+        tau_B_update = tau_B * M_prime_B
 
         if W_A.ndim == 2 and key.endswith(".weight"):
-            # 2D：沿输入激活投影
+            # 需要 A 的输入激活
+            if module_name not in activations_A or 'input' not in activations_A[module_name]:
+                continue
             d_i = activations_A[module_name]['input'].to(device).float()
             d_i_norm_sq = torch.sum(d_i * d_i)
             if d_i_norm_sq > EPS:
@@ -107,88 +119,98 @@ def disentangled_reprojection_fusion(args):
                 tau_ortho = tau_B_update
 
         elif W_A.ndim == 1 and key.endswith(".bias"):
-            # 1D bias：沿输出差分方向投影（g_bias = Y_B - Y_C）
+            # 需要 B/C 的输出激活方向
             out_B = activations_B.get(module_name, {}).get('output', None)
             out_C = activations_C.get(module_name, {}).get('output', None)
             if out_B is None or out_C is None:
-                # 回退：若方向缺失，使用简单加权更新已掩码的分量
+                # 没有方向信息则跳过，保留 A
+                continue
+            g_dir = (out_B - out_C).to(device).float()
+            g_norm_sq = torch.sum(g_dir * g_dir)
+            if g_norm_sq > EPS:
+                proj_scalar = torch.sum(tau_B_update * g_dir) / g_norm_sq
+                tau_proj = proj_scalar * g_dir
+                tau_proj = tau_proj * M_prime_B  # 仅掩码位置
+                tau_ortho = tau_B_update - tau_proj
+            else:
                 tau_proj = torch.zeros_like(tau_B_update)
                 tau_ortho = tau_B_update
-            else:
-                g_dir = (out_B - out_C).to(device).float()
-                g_norm_sq = torch.sum(g_dir * g_dir)
-                if g_norm_sq > EPS:
-                    proj_scalar = torch.sum(tau_B_update * g_dir) / g_norm_sq
-                    tau_proj = proj_scalar * g_dir
-                    # 仅在被掩码的位置更新；未掩码位置置零
-                    tau_proj = tau_proj * M_prime_B
-                    tau_ortho = tau_B_update - tau_proj
-                else:
-                    tau_proj = torch.zeros_like(tau_B_update)
-                    tau_ortho = tau_B_update
         else:
-            # 非预期形状
+            # 其他形状不处理
             continue
 
         W_star = W_A.to(device) + args.lambda_proj * tau_proj + args.lambda_ortho * tau_ortho
         final_merged_weights[key] = W_star.cpu().to(weights_A[key].dtype)
 
-    # Part 2: 其余参数 (含 norm) 的保守加权平均
-    print("\n正在使用简单加权平均处理其余参数 (norm, 其他未入选的参数)...")
-    lam_default = args.lambda_proj
-    lam_norm = getattr(args, "lambda_norm", 0.0)  # 新增: norm 的保守合并系数
-
-    other_keys_pbar = tqdm(weights_A.keys(), desc="简单平均合并")
-    for key in other_keys_pbar:
-        # print(f"keys: {key}")
-        if key in processed_keys:
-            # print(f"跳过已处理的键: {key}")
-            continue
-        # 仍然需要判断 B 中是否存在对应权重（用 raw）
-        a_canon = canon_param_key(key)
-        b_key = b_canon_to_orig.get(a_canon, None)
-        if b_key is None:
-            continue
-        if "lm_head" in key or "model.embed_tokens.weight" in key:
-            # print(f"特殊键: {key}")
-            continue
-
-        W_A = weights_A[key].float()
-        W_B = weights_B_raw[b_key].float()
-
-        lam = lam_default
-        key_l = key.lower()
-        if ('norm' in key_l) : # or ('layernorm' in key_l)
-            # print(f"norm层: {key}")
-            lam = lam_norm  # norm 更保守
-
-        final_merged_weights[key] = ((1 - lam) * W_A + lam * W_B).to(W_A.dtype)
-    
     _save_model(args, final_merged_weights)
 
 def _save_model(args, merged_weights):
     """保存模型权重。"""
     print("\n正在保存合并后的模型...")
-    index_path = os.path.join(args.base_model_path, "model.safetensors.index.json")
-    with open(index_path, "r") as f:
-        index_map = json.load(f)["weight_map"]
-    
-    sharded_weights = defaultdict(dict)
-    for key, value in merged_weights.items():
-        if key in index_map:
-            sharded_weights[index_map[key]][key] = value
-    
-    for filename, weights_dict in sharded_weights.items():
-        safetensors.torch.save_file(weights_dict, os.path.join(args.output_dir, filename))
-    
-    shutil.copy(index_path, os.path.join(args.output_dir, os.path.basename(index_path)))
-    for filename in os.listdir(args.base_model_path):
-        if filename.endswith(('.json', '.model', '.py', '.md')):
-            source_file = os.path.join(args.base_model_path, filename)
-            dest_file = os.path.join(args.output_dir, filename)
-            if not os.path.exists(dest_file):
-                    shutil.copy(source_file, dest_file)
-    print(f"模型成功合并并保存至: {args.output_dir}")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    sft_index = os.path.join(args.base_model_path, "model.safetensors.index.json")
+    bin_index = os.path.join(args.base_model_path, "pytorch_model.bin.index.json")
+
+    def copy_side_files():
+        for filename in os.listdir(args.base_model_path):
+            if filename.endswith((".json", ".model", ".py", ".md")):
+                src = os.path.join(args.base_model_path, filename)
+                dst = os.path.join(args.output_dir, filename)
+                if not os.path.exists(dst):
+                    shutil.copy(src, dst)
+
+    if os.path.exists(sft_index):
+        # Save as safetensors shards following index map
+        with open(sft_index, "r") as f:
+            index_map = json.load(f)["weight_map"]
+        sharded_weights = defaultdict(dict)
+        for key, value in merged_weights.items():
+            if key in index_map:
+                sharded_weights[index_map[key]][key] = value
+        for filename, weights_dict in sharded_weights.items():
+            safetensors.torch.save_file(weights_dict, os.path.join(args.output_dir, filename))
+        shutil.copy(sft_index, os.path.join(args.output_dir, os.path.basename(sft_index)))
+        copy_side_files()
+        print(f"模型成功合并并保存至: {args.output_dir} (safetensors 分片)")
+        return
+
+    if os.path.exists(bin_index):
+        # Save as PyTorch .bin shards following index map
+        with open(bin_index, "r") as f:
+            index_map = json.load(f)["weight_map"]
+        sharded_weights = defaultdict(dict)
+        for key, value in merged_weights.items():
+            if key in index_map:
+                sharded_weights[index_map[key]][key] = value
+        for filename, weights_dict in sharded_weights.items():
+            torch.save(weights_dict, os.path.join(args.output_dir, filename))
+        shutil.copy(bin_index, os.path.join(args.output_dir, os.path.basename(bin_index)))
+        copy_side_files()
+        print(f"模型成功合并并保存至: {args.output_dir} (.bin 分片)")
+        return
+
+    # Fallback: single-file save
+    sft_single = os.path.join(args.base_model_path, "model.safetensors")
+    bin_single = os.path.join(args.base_model_path, "pytorch_model.bin")
+    if os.path.exists(sft_single):
+        out_path = os.path.join(args.output_dir, os.path.basename(sft_single))
+        safetensors.torch.save_file(merged_weights, out_path)
+        copy_side_files()
+        print(f"模型成功合并并保存至: {out_path} (单一 safetensors)")
+        return
+    if os.path.exists(bin_single):
+        out_path = os.path.join(args.output_dir, os.path.basename(bin_single))
+        torch.save(merged_weights, out_path)
+        copy_side_files()
+        print(f"模型成功合并并保存至: {out_path} (单一 .bin)")
+        return
+
+    # If none detected, default to safetensors single-file name
+    out_path = os.path.join(args.output_dir, "model.safetensors")
+    safetensors.torch.save_file(merged_weights, out_path)
+    copy_side_files()
+    print(f"模型成功合并并保存至: {out_path} (默认 safetensors)")
 
 if __name__ == "__main__":
     import argparse
