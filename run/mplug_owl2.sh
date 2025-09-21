@@ -1,5 +1,5 @@
 #!/bin/bash
-
+# GPUS=0,1,2,3 USE_TORCHRUN=never bash /root/autodl-tmp/AdaMMS/run/mplug_owl2.sh
 # ==============================================================================
 #                  mplug-owl2-llama2-7b 模型评测脚本 (最终修正版 v2)
 # ==============================================================================
@@ -19,7 +19,7 @@ GPUS=${GPUS:-0}
 # 模型路径现在已在 VLMEvalKit 的 config.py 中设置，此处仅用于存在性检查/展示
 # 注意：SAFE 合并后的默认输出目录为 /root/autodl-tmp/AdaMMS/merge/SAFE/output
 MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/AdaMMS/merge/SAFE/output/mplug-owl2-llama2-7b}"
-EVAL_DIR="${EVAL_DIR:-./mplug_owl2_eval_results}"  # 评测结果保存目录
+EVAL_DIR="${EVAL_DIR:-./mplug_owl2_ori_eval_results}"  # 评测结果保存目录
 
 # 自动定位 VLMEvalKit 目录（以当前脚本所在目录为基准）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
