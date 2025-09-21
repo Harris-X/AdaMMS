@@ -7,8 +7,8 @@
 # --- 1. 基本设置 ---
 GPU=6                     # 设置要使用的 GPU ID
 # 模型路径现在已在 config.py 中设置，此处仅作记录
-MODEL_PATH="/home/user/xieqiuhao/AdaMMS/downloaded_models/Qwen2-VL-7B-Instruct"
-EVAL_DIR="/home/user/xieqiuhao/AdaMMS/eval_results_single_run/Qwen2-VL-7B-Instruct_eval_results"  # 评测结果保存目录
+MODEL_PATH="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-v1.5-7b"
+EVAL_DIR="/home/user/xieqiuhao/AdaMMS/eval_results_single_run/"  # 评测结果保存目录
 VLMKIT_DIR="/home/user/xieqiuhao/AdaMMS/VLMEvalKit"  # VLMEvalKit 目录
 
 # 检查模型路径是否存在
@@ -39,17 +39,17 @@ SECONDS=0
 # --- 4. 进入VLMEvalKit目录并运行评测 ---
 cd $VLMKIT_DIR
 
-# 修正：确保安装 mplug-owl2 所需的、且唯一的 transformers 版本
-echo "--- 正在检查并设置正确的 transformers 版本 (4.33.0) ---"
-pip install transformers==4.33.0 
+# # 修正：确保安装 mplug-owl2 所需的、且唯一的 transformers 版本
+# echo "--- 正在检查并设置正确的 transformers 版本 (4.33.0) ---"
+# pip install transformers==4.55.2
 
 for task in $TASK_LIST; do
     echo "--- 正在评测任务: $task ---"
     
     # run.py 会自动从 config.py 中读取 'mPLUG-Owl2' 的路径。
-    python run.py \
+    CUDA_VISIBLE_DEVICES=$GPU python run.py \
         --data $task \
-        --model mPLUG-Owl2 \
+        --model llava_v1.5_7b \
         --work-dir $EVAL_DIR \
         --verbose \
         --mode all

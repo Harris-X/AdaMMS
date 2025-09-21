@@ -5,9 +5,9 @@
 # ==============================================================================
 
 # --- 1. 基本设置 (请根据你的环境修改) ---
-GPU=6 # 请设置为你希望使用的 GPU ID 6 
+GPU=2 # 请设置为你希望使用的 GPU ID 6 
 PORT=29517 # 建议为每个独立脚本使用不同端口，避免冲突
-MODEL_PATH="/home/user/xieqiuhao/AdaMMS/merged_models/idream-sams-dream-0.1-0.8-safety" # <--- 在这里设置你要评测的模型路径 merged_models/grafted-s1.0-c0.0
+MODEL_PATH="/home/user/xieqiuhao/AdaMMS/downloaded_models/llava-v1.5-7b" # <--- 在这里设置你要评测的模型路径 merged_models/grafted-s1.0-c0.0
 EVAL_BASE="./eval_results_single_run" # 评测结果的根目录 
 
 # 检查模型路径是否存在
@@ -43,7 +43,7 @@ SECONDS=0
 for task in $TASK_LIST; do
     echo "--- 正在运行评测任务: $task ---"
     CUDA_VISIBLE_DEVICES=$GPU accelerate launch --num_processes=1 --gpu_ids $GPU --main_process_port $PORT -m lmms_eval \
-        --model qwen2_vl \
+        --model llava_v1.5_7b \
         --model_args pretrained=$MODEL_PATH \
         --tasks $task \
         --batch_size 1 \

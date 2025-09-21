@@ -4,12 +4,26 @@
 #                  mplug-owl2-llama2-7b 模型评测脚本 (最终修正版 v2)
 # ==============================================================================
 
+#!/usr/bin/env bash
+
 # --- 1. 基本设置 ---
-GPU=7                     # 设置要使用的 GPU ID
-# 模型路径现在已在 config.py 中设置，此处仅作记录
-MODEL_PATH="/home/user/xieqiuhao/AdaMMS/downloaded_models/mplug-owl2-llama2-7b"
-EVAL_DIR="./mplug_owl2_eval_results"  # 评测结果保存目录
-VLMKIT_DIR="/home/user/xieqiuhao/AdaMMS/VLMEvalKit"  # VLMEvalKit 目录
+# 支持逗号分隔的多 GPU 列表，例如 "0,1,2,3"；也兼容旧变量 GPU（单卡）
+GPUS=${GPUS:-}
+GPU=${GPU:-}
+if [ -z "$GPUS" ] && [ -n "$GPU" ]; then
+    GPUS="$GPU"
+fi
+# 默认使用 0 号卡（如未指定）
+GPUS=${GPUS:-0}
+
+# 模型路径现在已在 VLMEvalKit 的 config.py 中设置，此处仅用于存在性检查/展示
+# 注意：SAFE 合并后的默认输出目录为 /root/autodl-tmp/AdaMMS/merge/SAFE/output
+MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/AdaMMS/merge/SAFE/output/mplug-owl2-llama2-7b}"
+EVAL_DIR="${EVAL_DIR:-./mplug_owl2_eval_results}"  # 评测结果保存目录
+
+# 自动定位 VLMEvalKit 目录（以当前脚本所在目录为基准）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VLMKIT_DIR="${VLMKIT_DIR:-$(cd "$SCRIPT_DIR/../VLMEvalKit" && pwd)}"
 
 # 检查模型路径是否存在
 if [ ! -d "$MODEL_PATH" ]; then
@@ -29,6 +43,7 @@ MODEL_NAME=$(basename $MODEL_PATH)
 echo "===================================================="
 echo "  评测模型: $MODEL_NAME"
 echo "  模型路径: $MODEL_PATH (通过 config.py 加载)"
+echo "  使用 GPU: $GPUS"
 echo "  评测任务: $TASK_LIST"
 echo "  结果将保存至: $EVAL_DIR"
 echo "===================================================="
@@ -37,26 +52,70 @@ date +"%Y-%m-%d %H:%M:%S"
 SECONDS=0
 
 # --- 4. 进入VLMEvalKit目录并运行评测 ---
-cd $VLMKIT_DIR
+cd "$VLMKIT_DIR"
 
 # 修正：确保安装 mplug-owl2 所需的、且唯一的 transformers 版本
 echo "--- 正在检查并设置正确的 transformers 版本 (4.33.0) ---"
-pip install transformers==4.33.0
+pip install -q transformers==4.33.0
+
+# --- 3.1 启动方式：根据 GPU 数量自动选择 python 或 torchrun ---
+export CUDA_VISIBLE_DEVICES="$GPUS"
+# 避免某些机型/拓扑下 NCCL 的 P2P/IB 报错，默认关闭，可通过环境变量覆盖
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
+export NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE:-0}
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+
+# 允许手动控制是否使用 torchrun：auto | always | never
+USE_TORCHRUN=${USE_TORCHRUN:-auto}
+IFS=',' read -ra GPU_ARR <<< "$GPUS"
+NPROC=${#GPU_ARR[@]}
+case "$USE_TORCHRUN" in
+    always)
+        LAUNCHER=(torchrun --nproc-per-node=$NPROC)
+        ;;
+    never)
+        LAUNCHER=(python)
+        ;;
+    *) # auto
+        if [ "$NPROC" -gt 1 ]; then
+            LAUNCHER=(torchrun --nproc-per-node=$NPROC)
+        else
+            LAUNCHER=(python)
+        fi
+        ;;
+esac
 
 for task in $TASK_LIST; do
     echo "--- 正在评测任务: $task ---"
     
     # run.py 会自动从 config.py 中读取 'mPLUG-Owl2' 的路径。
-    python run.py \
+    "${LAUNCHER[@]}" run.py \
         --data $task \
         --model mPLUG-Owl2 \
         --work-dir $EVAL_DIR \
         --verbose \
         --mode all
-    
-    # 检查上一个命令是否成功
-    if [ $? -ne 0 ]; then
-        echo "错误: 任务 '$task' 评测失败."
+
+    # 检查上一个命令是否成功；若 torchrun 失败则自动回退到 python 模式再尝试一次
+    status=$?
+    if [ $status -ne 0 ]; then
+        echo "警告: 任务 '$task' 使用 ${LAUNCHER[0]} 失败(退出码 $status)。"
+        if [ "${LAUNCHER[0]}" = "torchrun" ]; then
+            echo "尝试回退到单进程 python 模式 (device_map=auto, 多卡分片，非多进程并行)。"
+            LAUNCHER_FALLBACK=(python)
+            "${LAUNCHER_FALLBACK[@]}" run.py \
+                --data $task \
+                --model mPLUG-Owl2 \
+                --work-dir $EVAL_DIR \
+                --verbose \
+                --mode all
+            status=$?
+        fi
+
+        if [ $status -ne 0 ]; then
+            echo "错误: 任务 '$task' 评测失败."
+        fi
     fi
 done
 
