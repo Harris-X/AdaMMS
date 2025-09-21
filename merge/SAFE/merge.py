@@ -147,7 +147,9 @@ def disentangled_reprojection_fusion(args):
 def _save_model(args, merged_weights):
     """保存模型权重。"""
     print("\n正在保存合并后的模型...")
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = osp.basename(args.donor_model_path.rstrip(os.sep))
+    output_dir = osp.join(args.output_dir, output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     sft_index = os.path.join(args.base_model_path, "model.safetensors.index.json")
     bin_index = os.path.join(args.base_model_path, "pytorch_model.bin.index.json")
@@ -156,7 +158,7 @@ def _save_model(args, merged_weights):
         for filename in os.listdir(args.base_model_path):
             if filename.endswith((".json", ".model", ".py", ".md")):
                 src = os.path.join(args.base_model_path, filename)
-                dst = os.path.join(args.output_dir, filename)
+                dst = os.path.join(output_dir, filename)
                 if not os.path.exists(dst):
                     shutil.copy(src, dst)
 
@@ -169,10 +171,10 @@ def _save_model(args, merged_weights):
             if key in index_map:
                 sharded_weights[index_map[key]][key] = value
         for filename, weights_dict in sharded_weights.items():
-            safetensors.torch.save_file(weights_dict, os.path.join(args.output_dir, filename))
-        shutil.copy(sft_index, os.path.join(args.output_dir, os.path.basename(sft_index)))
+            safetensors.torch.save_file(weights_dict, os.path.join(output_dir, filename))
+        shutil.copy(sft_index, os.path.join(output_dir, os.path.basename(sft_index)))
         copy_side_files()
-        print(f"模型成功合并并保存至: {args.output_dir} (safetensors 分片)")
+        print(f"模型成功合并并保存至: {output_dir} (safetensors 分片)")
         return
 
     if os.path.exists(bin_index):
@@ -184,33 +186,34 @@ def _save_model(args, merged_weights):
             if key in index_map:
                 sharded_weights[index_map[key]][key] = value
         for filename, weights_dict in sharded_weights.items():
-            torch.save(weights_dict, os.path.join(args.output_dir, filename))
-        shutil.copy(bin_index, os.path.join(args.output_dir, os.path.basename(bin_index)))
+            torch.save(weights_dict, os.path.join(output_dir, filename))
+        shutil.copy(bin_index, os.path.join(output_dir, os.path.basename(bin_index)))
         copy_side_files()
-        print(f"模型成功合并并保存至: {args.output_dir} (.bin 分片)")
+        print(f"模型成功合并并保存至: {output_dir} (.bin 分片)")
         return
 
     # Fallback: single-file save
     sft_single = os.path.join(args.base_model_path, "model.safetensors")
     bin_single = os.path.join(args.base_model_path, "pytorch_model.bin")
     if os.path.exists(sft_single):
-        out_path = os.path.join(args.output_dir, os.path.basename(sft_single))
+        out_path = os.path.join(output_dir, os.path.basename(sft_single))
         safetensors.torch.save_file(merged_weights, out_path)
         copy_side_files()
         print(f"模型成功合并并保存至: {out_path} (单一 safetensors)")
         return
     if os.path.exists(bin_single):
-        out_path = os.path.join(args.output_dir, os.path.basename(bin_single))
+        out_path = os.path.join(output_dir, os.path.basename(bin_single))
         torch.save(merged_weights, out_path)
         copy_side_files()
         print(f"模型成功合并并保存至: {out_path} (单一 .bin)")
         return
 
     # If none detected, default to safetensors single-file name
-    out_path = os.path.join(args.output_dir, "model.safetensors")
+    out_path = os.path.join(output_dir, "model.safetensors")
     safetensors.torch.save_file(merged_weights, out_path)
     copy_side_files()
     print(f"模型成功合并并保存至: {out_path} (默认 safetensors)")
+
 
 if __name__ == "__main__":
     import argparse
