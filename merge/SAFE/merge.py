@@ -1,54 +1,102 @@
 from collections import defaultdict
 import json
 import os
+import os.path as osp
 import shutil
 import safetensors
 import torch
 from tqdm import tqdm
 
-from utils import load_weights, normalize_llm_keys
+from utils import load_weights
 
 EPS = 1e-9
 
 def disentangled_reprojection_fusion(args):
-    """阶段三：【SAM-S-DREAM】执行解耦重投影融合。"""
-    print("\n--- [阶段三: SAM-S-DREAM 解耦重投影融合] ---")
+    """阶段三：执行解耦重投影融合。"""
+    print("\n--- [阶段三: 解耦重投影融合] ---")
     
     print("加载所有权重、掩码和激活...")
     weights_A = load_weights(args.base_model_path)
     weights_B_raw = load_weights(args.donor_model_path)
     weights_C_raw = load_weights(args.original_model_path)
-    
-    weights_B = normalize_llm_keys(weights_B_raw, list(weights_A.keys())); del weights_B_raw
-    weights_C = normalize_llm_keys(weights_C_raw, list(weights_A.keys())); del weights_C_raw
 
-    mask_cache_path = os.path.join(args.cache_dir, f"sams-dream_disjoint_mask_r{args.top_k_ratio}_alpha{args.alpha}.pt")
-    disjoint_masks = torch.load(mask_cache_path)
-    
-    activations_A = torch.load(os.path.join(args.cache_dir, "activations_A.pt"))
-    # 新增：bias 投影需要 B/C 的输出方向
-    activations_B = torch.load(os.path.join(args.cache_dir, "activations_B.pt"))
-    activations_C = torch.load(os.path.join(args.cache_dir, "activations_C.pt"))
+    # 与阶段二一致：掩码文件名
+    mask_cache_path = os.path.join(args.cache_dir, f"mask_r{args.top_k_ratio}_alpha{args.alpha}.pt")
+    disjoint_masks = torch.load(mask_cache_path, map_location="cpu")
+
+    # 激活文件：按 basename(model_path)_meta.pt 加载，并做键名规范化
+    def canon_module_name(name: str) -> str:
+        k = name.replace("language_model.model.", "model.").replace("language_model.", "model.")
+        if "layers" in k:
+            pos = k.find("layers")
+            k = "model." + k[pos:]
+        return k
+
+    def canon_activations(acts: dict) -> dict:
+        return {canon_module_name(k): v for k, v in acts.items()}
+
+    A_activations_path = osp.basename(args.base_model_path.rstrip(os.sep)) + "_meta.pt"
+    B_activations_path = osp.basename(args.donor_model_path.rstrip(os.sep)) + "_meta.pt"
+    C_activations_path = osp.basename(args.original_model_path.rstrip(os.sep)) + "_meta.pt"
+
+    activations_A = canon_activations(torch.load(osp.join(args.cache_dir, A_activations_path), map_location="cpu"))
+    activations_B = canon_activations(torch.load(osp.join(args.cache_dir, B_activations_path), map_location="cpu"))
+    activations_C = canon_activations(torch.load(osp.join(args.cache_dir, C_activations_path), map_location="cpu"))
+
+    # 参数键的规范化 + B/C 原始键映射
+    def canon_param_key(param_key: str) -> str:
+        k = param_key.replace("language_model.model.", "model.").replace("language_model.", "model.")
+        if "layers" in k:
+            pos = k.find("layers")
+            k = "model." + k[pos:]
+        return k
+
+    def canon_module_from_param_key(param_key: str) -> str:
+        k = canon_param_key(param_key)
+        parts = k.split('.')
+        if len(parts) >= 2:
+            parts = parts[:-1]
+        return '.'.join(parts)
+
+    b_canon_to_orig = {}
+    for k in weights_B_raw.keys():
+        ck = canon_param_key(k)
+        if ck not in b_canon_to_orig:
+            b_canon_to_orig[ck] = k
+    c_canon_to_orig = {}
+    for k in weights_C_raw.keys():
+        ck = canon_param_key(k)
+        if ck not in c_canon_to_orig:
+            c_canon_to_orig[ck] = k
+
+    # 设备
+    device = torch.device(getattr(args, 'device', 'cuda' if torch.cuda.is_available() else 'cpu'))
 
     final_merged_weights = weights_A.copy()
     
-    pbar = tqdm(disjoint_masks.items(), desc="【SAM-S-DREAM】执行重投影融合")
+    pbar = tqdm(disjoint_masks.items(), desc="执行重投影融合")
     processed_keys = set()
     for key, M_prime_B in pbar:
-        if not (key in weights_B and key in weights_C): 
+        # 使用 canonical key 映射到 B/C 原始键
+        a_canon = canon_param_key(key)
+        b_key = b_canon_to_orig.get(a_canon, None)
+        c_key = c_canon_to_orig.get(a_canon, None)
+        if b_key is None or c_key is None:
             continue
         
         processed_keys.add(key)
-        W_A, W_B, W_C = weights_A[key].float(), weights_B[key].float(), weights_C[key].float()
-        M_prime_B = M_prime_B.to(args.device)
+        W_A = weights_A[key].float()
+        W_B = weights_B_raw[b_key].float()
+        W_C = weights_C_raw[c_key].float()
+        M_prime_B = M_prime_B.to(device)
 
-        module_name = ".".join(key.replace("language_model.model.", "model.").split('.')[1:-1])
-        tau_B = (W_B - W_C).to(args.device)
-        tau_B_update = tau_B * M_prime_B.to(args.device)
+        module_name = canon_module_from_param_key(key)
+        tau_B = (W_B - W_C).to(device)
+        tau_B_update = tau_B * M_prime_B.to(device)
 
         if W_A.ndim == 2 and key.endswith(".weight"):
             # 2D：沿输入激活投影
-            d_i = activations_A[module_name]['input'].to(args.device).float()
+            d_i = activations_A[module_name]['input'].to(device).float()
             d_i_norm_sq = torch.sum(d_i * d_i)
             if d_i_norm_sq > EPS:
                 proj_scalar = (tau_B_update @ d_i) / d_i_norm_sq
@@ -67,7 +115,7 @@ def disentangled_reprojection_fusion(args):
                 tau_proj = torch.zeros_like(tau_B_update)
                 tau_ortho = tau_B_update
             else:
-                g_dir = (out_B - out_C).to(args.device).float()
+                g_dir = (out_B - out_C).to(device).float()
                 g_norm_sq = torch.sum(g_dir * g_dir)
                 if g_norm_sq > EPS:
                     proj_scalar = torch.sum(tau_B_update * g_dir) / g_norm_sq
@@ -82,7 +130,7 @@ def disentangled_reprojection_fusion(args):
             # 非预期形状
             continue
 
-        W_star = W_A.to(args.device) + args.lambda_proj * tau_proj + args.lambda_ortho * tau_ortho
+        W_star = W_A.to(device) + args.lambda_proj * tau_proj + args.lambda_ortho * tau_ortho
         final_merged_weights[key] = W_star.cpu().to(weights_A[key].dtype)
 
     # Part 2: 其余参数 (含 norm) 的保守加权平均
@@ -96,14 +144,17 @@ def disentangled_reprojection_fusion(args):
         if key in processed_keys:
             # print(f"跳过已处理的键: {key}")
             continue
-        if key not in weights_B:
+        # 仍然需要判断 B 中是否存在对应权重（用 raw）
+        a_canon = canon_param_key(key)
+        b_key = b_canon_to_orig.get(a_canon, None)
+        if b_key is None:
             continue
         if "lm_head" in key or "model.embed_tokens.weight" in key:
             # print(f"特殊键: {key}")
             continue
 
         W_A = weights_A[key].float()
-        W_B = weights_B[key].float()
+        W_B = weights_B_raw[b_key].float()
 
         lam = lam_default
         key_l = key.lower()
@@ -113,7 +164,7 @@ def disentangled_reprojection_fusion(args):
 
         final_merged_weights[key] = ((1 - lam) * W_A + lam * W_B).to(W_A.dtype)
     
-    _save_model(final_merged_weights)
+    _save_model(args, final_merged_weights)
 
 def _save_model(args, merged_weights):
     """保存模型权重。"""
@@ -145,14 +196,15 @@ if __name__ == "__main__":
     parser.add_argument('--base_model_path', type=str, default="./downloaded_models/Qwen2-VL-7B-Instruct", help="基础模型A的路径。")
     parser.add_argument('--donor_model_path', type=str, default="./downloaded_models/llava-onevision-qwen2-7b-si-hf", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="./downloaded_models/Qwen2-7B-Instruct", help="原始共同祖先模型C的路径。")
-    parser.add_argument('--args.cache_dir', type=str, default="./merged_models", help="cache目录")
-    parser.add_argument('--args.output_dir', type=str, default="./merged_models", help="合并后模型的输出目录。")
+    parser.add_argument('--cache_dir', type=str, default="./merged_models/SAFE/cache", help="cache目录（掩码/激活存放处）")
+    parser.add_argument('--output_dir', type=str, default="./merged_models/SAFE/output", help="合并后模型的输出目录。")
     parser.add_argument('--top_k_ratio', type=float, default=0.1, help="【阶段二】用于选举关键神经元的Top-K比率。")
     parser.add_argument('--alpha', type=float, default=0.1, help="【阶段二】夏普斯惩罚系数，控制对高曲率区域的惩罚力度。")
     parser.add_argument('--lambda_proj', type=float, default=1.0, help="【阶段三】投影（相关）分量的合并系数。")
     parser.add_argument('--lambda_ortho', type=float, default=0.8, help="【阶段三】正交（无关）分量的合并系数，保护泛化性。")
     parser.add_argument('--lambda_norm', type=float, default=0.0, help="norm 参数的加权平均系数（不走梯度合并）。")
     parser.add_argument('--mode', type=str, default="SAFE", help="为本次合并配置命名。")
+    parser.add_argument('--device', type=str, default=None, help="PyTorch 设备，如 cuda:0 或 cpu；默认自动选择。")
     args = parser.parse_args()
 
     disentangled_reprojection_fusion(args)
