@@ -1,0 +1,16 @@
+python merge/FAM/cache_activation_new.py \
+  --gpus 0 \
+  --hf-llm-id /path/to/Llama-2-7b-hf \
+  --hf-dataset meta \
+  --hf-offline \
+  --req-act input output \
+  --module-regex "mlp\.|self_attn\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
+  --include-types Linear \
+  --probe-batch-size 1 \
+  --llm-max-length 512 \
+  --llm-dtype float16 \
+  --llm-device-map auto \
+  --fai-compute \
+  --fai-mi-mode mi \
+  --fai-max-samples-per-module 4096 \
+  --work-dir ./work
