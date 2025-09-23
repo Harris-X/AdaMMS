@@ -1,6 +1,6 @@
 python merge/FAM/cache_activation_new.py \
   --gpus 0,1,2,3 \
-  --model mPLUG-Owl2 \
+  --model llava_v1.5_7b \
   --hf-dataset meta \
   --hf-offline \
   --req-act input output \

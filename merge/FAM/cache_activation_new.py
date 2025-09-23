@@ -1140,7 +1140,12 @@ def main():
                     # sklearn expects X: [N, d]; y: [N]
                     X = x_signal.reshape(-1, 1)
                     for i in range(H):
-                        mi[i] = float(_mi_reg(X, Y[:, i], discrete_features=False))
+                        val = _mi_reg(X, Y[:, i], discrete_features=False)
+                        # mutual_info_regression can return 0-d np arrays; extract scalar explicitly
+                        try:
+                            mi[i] = float(val.item())  # type: ignore[attr-defined]
+                        except Exception:
+                            mi[i] = float(np.asarray(val))
                     return mi
                 except Exception:
                     pass  # fallback below
