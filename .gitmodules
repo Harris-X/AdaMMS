@@ -7,3 +7,6 @@
 [submodule "mPLUG-Owl"]
 	path = mPLUG-Owl
 	url = https://github.com/X-PLUG/mPLUG-Owl
+[submodule "LLaVA"]
+	path = LLaVA
+	url = https://github.com/haotian-liu/LLaVA
