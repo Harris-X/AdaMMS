@@ -16,6 +16,13 @@ import torch, safetensors.torch
 from tqdm import tqdm
 from utils import load_weights, need_merge  # type: ignore
 
+def _load_subspaces(path: str):
+    try:
+        obj = torch.load(path, map_location='cpu')
+        return obj.get('subspaces', obj)
+    except Exception:
+        return None
+
 EPS=1e-8
 
 def _canon_param_key(param_key: str) -> str:
@@ -79,7 +86,11 @@ def dgsm_merge(args: argparse.Namespace):
     print("\n--- [DGSM Stage-3: Dynamic Subspace Fusion Merge] ---")
     weights_A=load_weights(args.base_model); weights_B=load_weights(args.donor_model)
     stage2=torch.load(args.stage2, map_location='cpu'); modules_info=stage2.get('modules', stage2)
+    base_subs = _load_subspaces(args.base_subs) if args.base_subs else None
+    if base_subs is not None:
+        print(f"[Info] Reusing Stage-1 base subspaces: {len(base_subs)} entries")
     merged=weights_A.copy(); stat_layers=stat_used=0
+    reuse_ok=reuse_fail=svd_fallback=0
     for k in tqdm(list(weights_A.keys()), desc='DGSM Merge'):
         if not need_merge(k): continue
         if k.endswith('.weight') and weights_A[k].ndim==2:
@@ -90,9 +101,21 @@ def dgsm_merge(args: argparse.Namespace):
             if blk is not None:
                 gwd_cost=float(blk['gwd_cost']); cost_norm=min(1.0, gwd_cost/max(EPS,float(args.cost_scale)))
                 lam=_sigmoid(float(args.gamma)*(1.0-cost_norm)); ortho_scale=float(args.ortho_scale)
-                r=int(blk['rank_A']); svdA=_svd_trunc(W_A, r)
-                if svdA is None: continue
-                U_A,S_A=svdA
+                r=int(blk['rank_A'])
+                U_A=None
+                if base_subs is not None and mod in base_subs:
+                    try:
+                        U_full = base_subs[mod]['U']  # d_out x r_full
+                        if U_full.shape[0] == W_A.shape[0]:
+                            U_A = U_full[:, :r].contiguous().float(); reuse_ok += 1
+                        else:
+                            reuse_fail += 1
+                    except Exception:
+                        reuse_fail += 1
+                if U_A is None:
+                    svdA=_svd_trunc(W_A, r)
+                    if svdA is None: continue
+                    U_A,_=svdA; svd_fallback += 1
                 tau=W_B-W_A
                 tau_proj=U_A @ (U_A.T @ tau)
                 # 动态 M 处理 (可选): 若提供且启用, 将差分在子空间基底方向上按 M 再混合
@@ -116,11 +139,12 @@ def dgsm_merge(args: argparse.Namespace):
     meta=dict(base_model=args.base_model, donor_model=args.donor_model, stage2=args.stage2,
               cost_scale=float(args.cost_scale), gamma=float(args.gamma), ortho_scale=float(args.ortho_scale),
               fallback_alpha=float(args.fallback_alpha), bias_alpha=float(args.bias_alpha),
-              use_dynamic_m=bool(args.use_dynamic_m), stat_layers=stat_layers, stat_used=stat_used)
+              use_dynamic_m=bool(args.use_dynamic_m), stat_layers=stat_layers, stat_used=stat_used,
+              base_subs=args.base_subs, reuse_ok=reuse_ok, reuse_fail=reuse_fail, svd_fallback=svd_fallback)
     base_dir=osp.basename(args.base_model.rstrip(os.sep))
     out_root=osp.join(args.output_dir, base_dir, 'dgsm_merged'); os.makedirs(out_root, exist_ok=True)
     with open(osp.join(out_root,'merge_meta_dgsm.json'),'w') as f: json.dump(meta,f,indent=2)
-    print(f"[Done] DGSM merge complete: layers={stat_layers}, used={stat_used}")
+    print(f"[Done] DGSM merge complete: layers={stat_layers}, used={stat_used}, reuse_U={reuse_ok}, svd_fallback={svd_fallback}, reuse_fail={reuse_fail}")
 
 
 def parse_args():
@@ -135,6 +159,7 @@ def parse_args():
     ap.add_argument('--fallback-alpha', type=float, default=0.5)
     ap.add_argument('--bias-alpha', type=float, default=0.5)
     ap.add_argument('--use-dynamic-m', action='store_true')
+    ap.add_argument('--base-subs', type=str, default=None, help='Stage-1 base 子空间文件 (含 U)，提供可跳过重复 SVD')
     return ap.parse_args()
 
 if __name__=='__main__':
