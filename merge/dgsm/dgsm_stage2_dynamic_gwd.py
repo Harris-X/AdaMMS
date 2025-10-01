@@ -27,6 +27,50 @@ except Exception:
 
 EPS=1e-8
 
+# =============================================
+# Entropic / Differentiable GW helpers
+# =============================================
+
+def _einsum_cost(L: torch.Tensor, pi: torch.Tensor) -> torch.Tensor:
+    """Compute GW cost = sum_{i,j,k,l} L_{i,j,k,l} pi_{i,k} pi_{j,l}
+    Using einsum for clarity. L shape: (r,r,r,r), pi: (r,r).
+    """
+    return torch.einsum('ijkl,ik,jl->', L, pi, pi)
+
+def _entropic_gw_torch(CA: torch.Tensor, CB: torch.Tensor, eps: float, iters: int = 20, sinkhorn_it: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable entropic GW (approx) in pure torch.
+
+    Simplified iterative scheme:
+      1. Initialize uniform pi.
+      2. Loop T times: build 4D cost tensor L=(CA_ij - CB_kl)^2.
+      3. Compute gradient surrogate G_{i,k} = 2 * sum_{j,l} L_{i,j,k,l} * pi_{j,l}.
+      4. Update pi_raw = exp(-G/eps); perform a few Sinkhorn scalings to enforce approx uniform marginals.
+      5. (Optional) Early stability if change small (skipped for simplicity / determinism).
+    Return (pi, cost) where cost is differentiable wrt CB (and thus UB params).
+
+    NOTE: O(r^4) memory; advisable to keep r<=128.
+    """
+    r = CA.shape[0]
+    device = CA.device
+    pi = torch.full((r, r), 1.0 / (r * r), device=device, dtype=CA.dtype, requires_grad=False)
+    for _ in range(iters):
+        L = (CA[:, :, None, None] - CB[None, None, :, :]) ** 2  # (r,r,r,r)
+        # gradient surrogate G (factor 2 is conventional; can omit)
+        # G_{i,k} = 2 * sum_{j,l} L_{i,j,k,l} pi_{j,l}
+        G = 2.0 * torch.einsum('ijkl,jl->ik', L, pi)
+        K = torch.exp(-G / max(eps, 1e-6))  # (r,r)
+        # Sinkhorn for uniform marginals
+        u = torch.ones(r, device=device, dtype=CA.dtype)
+        v = torch.ones(r, device=device, dtype=CA.dtype)
+        for _s in range(sinkhorn_it):
+            u = (1.0 / r) / (K @ v).clamp_min(EPS)
+            v = (1.0 / r) / (K.T @ u).clamp_min(EPS)
+        pi = torch.diag(u) @ K @ torch.diag(v)
+        pi = pi / pi.sum().clamp_min(EPS)
+    # Final cost (differentiable): reuse last L to avoid recompute
+    cost = _einsum_cost(L, pi)
+    return pi, cost
+
 def _load_subspaces(path:str)->Dict[str,Dict[str,torch.Tensor]]:
     obj=torch.load(path,map_location='cpu'); return obj.get('subspaces',obj)
 
@@ -50,14 +94,13 @@ def _pairwise_sqdist(U: torch.Tensor, S: Optional[torch.Tensor], mode:str)->torc
     return D.clamp_min(0.)
 
 def _gwd_cost(CA:torch.Tensor, CB:torch.Tensor, pi:torch.Tensor)->float:
-    rA,rB=CA.shape[0],CB.shape[0]
-    cost=0.0
-    for i in range(rA):
-        CA_i=CA[i]; pi_i=pi[i]
-        for j in range(rA):
-            dA=CA_i[j]; pi_j=pi[j]
-            diff2=(dA-CB).pow(2)
-            cost += (pi_i.unsqueeze(1)*pi_j.unsqueeze(0)*diff2).sum().item()
+    """Vectorized GW cost under square loss.
+    cost = Σ_{i,j,k,l} (CA_{i,j} - CB_{k,l})^2 * pi_{i,k} * pi_{j,l}
+    """
+    # Shapes: CA (r,r), CB (r,r), pi (r,r)
+    L = (CA[:, :, None, None] - CB[None, None, :, :]).pow(2)  # (r,r,r,r)
+    # Weight tensor factorizes: w_{i,j,k,l} = pi_{i,k} * pi_{j,l}
+    cost = (L * (pi[:, None, :, None] * pi[None, :, None, :])).sum().item()
     return float(cost)
 
 def _lambda_from_cost(cost:float,gamma:float,cost_scale:float)->float:
@@ -183,22 +226,30 @@ def stage2(args: argparse.Namespace):
                     M = _attention_M(UA, UB, Wq, Wk)  # r x r
                     UB_prime = _apply_dynamic(UB, M)  # d_out x r
                     CBp = _pairwise_sqdist(UB_prime, SB, args.dist_mode)
-                    # NOTE: 这里使用近似 GW 得到的标量 cost_tmp 是 "离散" 求解结果, 与 Wq/Wk 不可微（无梯度路径）。
-                    # 为了让动态映射真正可学习, 需要一个可微代理损失；暂时加入一个简单 Frobenius 代理 cost_proxy。
-                    pi_tmp, cost_tmp, _ = _approx_gw(CA.detach(), CBp.detach(), steps=min(4,args.iters), reg=args.sink_reg, tol=args.tol, patience=args.patience, verbose=False)
-                    # Frobenius 代理 (可微): 差分距离矩阵直接匹配
-                    cost_proxy = ( (CA - CBp).pow(2).mean() )
-                    loss = cost_proxy
+                    if args.dyn_loss == 'frob':
+                        # Frobenius 代理 (简单 / 稳定)
+                        pi_tmp, cost_tmp, _ = _approx_gw(CA.detach(), CBp.detach(), steps=min(4,args.iters), reg=args.sink_reg, tol=args.tol, patience=args.patience, verbose=False)
+                        loss_core = (CA - CBp).pow(2).mean()
+                        gw_metric = cost_tmp
+                    else:  # entropic differentiable GW surrogate
+                        eps = args.entropic_eps
+                        inner_it = args.entropic_iters
+                        pi_ent, cost_ent = _entropic_gw_torch(CA, CBp, eps=eps, iters=inner_it, sinkhorn_it=args.entropic_sinkhorn)
+                        # detach metric for model selection; cost_ent keeps graph for gradients
+                        gw_metric = float(cost_ent.detach().cpu())
+                        loss_core = cost_ent
+                        pi_tmp = pi_ent.detach()
+                    loss = loss_core
                     # 加正则
                     reg = args.dynamic_reg * ((Wq - torch.eye(r, device=device)).pow(2).sum() + (Wk - torch.eye(r, device=device)).pow(2).sum())
                     loss = loss + reg
                 loss.backward()
                 opt.step()
                 if args.dynamic_report and step % max(1,args.dynamic_steps//5)==0:
-                    print(f"  [DynMap {name}] step={step} loss={loss.item():.6f} gw_cost≈{cost_tmp:.6f}")
-                # 用近似 GW cost 仍作为度量挑选最优 M (虽然梯度来自 proxy)
-                if best_cost is None or cost_tmp < best_cost:
-                    best_cost=cost_tmp; best_state=(Wq.detach().clone(), Wk.detach().clone())
+                    print(f"  [DynMap {name}] step={step} loss={loss.item():.6f} gw≈{gw_metric:.6f}")
+                # 使用 gw_metric (近似 GW 或 entropic cost) 选择最优映射
+                if best_cost is None or gw_metric < best_cost:
+                    best_cost=gw_metric; best_state=(Wq.detach().clone(), Wk.detach().clone())
             if best_state is not None:
                 Wq,Wk = best_state
                 with torch.no_grad():
@@ -209,9 +260,15 @@ def stage2(args: argparse.Namespace):
         if args.use_pot and _HAVE_POT:
             try:
                 p = torch.full((r,),1.0/r,dtype=torch.float64); q = torch.full((r,),1.0/r,dtype=torch.float64)
-                cost_val, pi_np = gromov_wasserstein2(CA.double().cpu().numpy(), CB.double().cpu().numpy(), p.numpy(), q.numpy(), 'square_loss', log=False, armijo=False, return_transport=True)
-                pi = torch.from_numpy(pi_np).float()
-                gwd_cost = float(cost_val)
+                if args.pot_entropic_eps is not None:
+                    # Entropic POT (returns transport only)
+                    pi_np = gromov_wasserstein(CA.double().cpu().numpy(), CB.double().cpu().numpy(), p.numpy(), q.numpy(), loss_fun='square_loss', epsilon=args.pot_entropic_eps, verbose=False, log=False, armijo=False)
+                    # Recompute cost in torch for consistency
+                    pi = torch.from_numpy(pi_np).float()
+                    gwd_cost = _gwd_cost(CA.cpu(), CB.cpu(), pi)
+                else:
+                    cost_val, pi_np = gromov_wasserstein2(CA.double().cpu().numpy(), CB.double().cpu().numpy(), p.numpy(), q.numpy(), 'square_loss', log=False, armijo=False, return_transport=True)
+                    pi = torch.from_numpy(pi_np).float(); gwd_cost = float(cost_val)
             except Exception:
                 pi, gwd_cost, _ = _approx_gw(CA, CB, args.iters, args.sink_reg, args.tol, args.patience, args.verbose)
         else:
@@ -282,6 +339,12 @@ def parse_args():
     ap.add_argument('--dynamic-lr', type=float, default=5e-3)
     ap.add_argument('--dynamic-reg', type=float, default=1e-3)
     ap.add_argument('--dynamic-report', action='store_true')
+    ap.add_argument('--dyn-loss', default='entropic', choices=['frob','entropic'], help='动态阶段优化目标: Frobenius 或 可微 entropic GW 近似')
+    ap.add_argument('--entropic-eps', dest='entropic_eps', type=float, default=0.1, help='动态可微 entropic GW 的温度/epsilon')
+    ap.add_argument('--entropic-iters', dest='entropic_iters', type=int, default=5, help='动态阶段 entropic GW 迭代次数')
+    ap.add_argument('--entropic-sinkhorn', dest='entropic_sinkhorn', type=int, default=5, help='每次 entropic GW 内部 Sinkhorn 步数')
+    # POT entropic final
+    ap.add_argument('--pot-entropic-eps', type=float, default=None, help='若设置则最终对齐使用 POT entropic GW (epsilon)')
     ap.add_argument('--cpu', action='store_true')
     ap.add_argument('--verbose', action='store_true')
     return ap.parse_args()
