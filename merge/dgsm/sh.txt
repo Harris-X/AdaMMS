@@ -1,1 +1,1 @@
-bash -lc "set -x; GPU=${GPU:-0} TASK_LIST='mme ocrbench gqa' bash run/tune_dgsm_tefm.sh"
+bash -lc "GPU=${GPU:-0} TASK_LIST='mmmu_val mme ocrbench' bash run/tune_dgsm_tefm.sh"
