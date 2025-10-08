@@ -16,10 +16,10 @@ fi
 # 默认使用 0 号卡（如未指定）
 GPUS=${GPUS:-1}
 
-# 模型路径现在已在 VLMEvalKit 的 config.py 中设置，此处仅用于存在性检查/展示
-# 注意：SAFE 合并后的默认输出目录为 /root/autodl-tmp/AdaMMS/merge/SAFE/output
-MODEL_PATH="/root/autodl-tmp/AdaMMS/merged_models_stage3/mplug-owl2-llama2-7b/dgsm_merged"
-EVAL_DIR="${EVAL_DIR:-./mplug_owl2_dgsm_1006_1208_a0_5_eval_results}"  # 评测结果保存目录
+# 模型路径现在已在 config.py 中设置，此处仅作记录
+MODEL_PATH="/root/autodl-tmp/AdaMMS/merged_models_stage3/Qwen2-VL-7B-Instruct/dgsm_merged"
+EVAL_DIR="${EVAL_DIR:-./Qwen2_VL_7B_dgsm_1006_2258_a0_5_eval_results}"  # 评测结果保存目录
+
 
 # 自动定位 VLMEvalKit 目录（以当前脚本所在目录为基准）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,9 +54,7 @@ SECONDS=0
 # --- 4. 进入VLMEvalKit目录并运行评测 ---
 cd "$VLMKIT_DIR"
 
-# 修正：确保安装 mplug-owl2 所需的、且唯一的 transformers 版本
-# echo "--- 正在检查并设置正确的 transformers 版本 (4.33.0) ---"
-# pip install -q transformers==4.33.0
+
 
 # --- 3.1 启动方式：根据 GPU 数量自动选择 python 或 torchrun ---
 export CUDA_VISIBLE_DEVICES="$GPUS"
@@ -92,7 +90,7 @@ for task in $TASK_LIST; do
     # run.py 会自动从 config.py 中读取 'mPLUG-Owl2' 的路径。
     "${LAUNCHER[@]}" run.py \
         --data $task \
-        --model mPLUG-Owl2 \
+        --model Qwen2-VL-7B-Instruct \
         --work-dir $EVAL_DIR \
         --verbose \
         --mode all
@@ -106,7 +104,7 @@ for task in $TASK_LIST; do
             LAUNCHER_FALLBACK=(python)
             "${LAUNCHER_FALLBACK[@]}" run.py \
                 --data $task \
-                --model mPLUG-Owl2 \
+                --model Qwen2-VL-7B-Instruct \
                 --work-dir $EVAL_DIR \
                 --verbose \
                 --mode all

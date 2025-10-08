@@ -14,7 +14,10 @@ from collections import defaultdict
 from typing import Dict
 import torch, safetensors.torch
 from tqdm import tqdm
-from utils import load_weights, need_merge  # type: ignore
+try:
+    from .utils import load_weights, need_merge  # type: ignore
+except Exception:
+    from utils import load_weights, need_merge  # type: ignore
 
 def _load_subspaces(path: str):
     try:
@@ -35,6 +38,20 @@ def _module_from_param_key(param_key:str)->str:
     k=_canon_param_key(param_key); parts=k.split('.')
     if len(parts)>=2: parts=parts[:-1]
     return '.'.join(parts)
+
+def _alt_donor_key(donor:dict, base_key:str)->str | None:
+    """在 donor 权重字典里为 base_key 寻找兼容命名的键。
+    规则：
+      1) 原样匹配 base_key
+      2) 尝试在前面加 "language_model." 前缀（OneVision/QwenVL 常见命名）
+    命中则返回匹配到的键，否则返回 None
+    """
+    if base_key in donor:
+        return base_key
+    alt = f"language_model.{base_key}"
+    if alt in donor:
+        return alt
+    return None
 
 def _sigmoid(x:float)->float:
     try: return 1.0/(1.0+math.exp(-x))
@@ -96,11 +113,35 @@ def dgsm_merge(args: argparse.Namespace):
         if k.endswith('.weight') and weights_A[k].ndim==2:
             mod=_module_from_param_key(k); blk=modules_info.get(mod)
             W_A=weights_A[k].float(); W_B=weights_B.get(k, None)
-            if W_B is None: continue
+            if W_B is None:
+                alt_k = _alt_donor_key(weights_B, k)
+                if alt_k is None:
+                    continue
+                W_B = weights_B[alt_k]
             W_B=W_B.float(); stat_layers+=1
             if blk is not None:
                 gwd_cost=float(blk['gwd_cost']); cost_norm=min(1.0, gwd_cost/max(EPS,float(args.cost_scale)))
-                lam=_sigmoid(float(args.gamma)*(1.0-cost_norm)); ortho_scale=float(args.ortho_scale)
+                # 优先使用 Stage-2 层级 lambda 估计（若启用并可用），否则用全局 gamma/cost_scale 计算
+                if bool(getattr(args, 'use_lambda_est', False)) and ('lambda_est' in blk):
+                    lam = float(blk['lambda_est'])
+                    if getattr(args, 'lam_scale', None) is not None:
+                        lam = max(0.0, min(1.0, lam * float(args.lam_scale)))
+                else:
+                    lam=_sigmoid(float(args.gamma)*(1.0-cost_norm))
+                # 基于 Stage-2 的 psi_A 熵自适应调整正交项权重（越确定性，越小的正交注入）
+                base_ortho=float(args.ortho_scale)
+                if bool(getattr(args, 'ortho_adapt', False)) and ('psi_A' in blk):
+                    psiA = blk['psi_A']  # [bar_s, bar_h, bar_d]
+                    bar_h = float(psiA[1]) if torch.is_tensor(psiA) else float(psiA[1])
+                    # 归一化熵: 经验范围 ~ [0, ln(r)]，用 r 的对数进行归一
+                    r_eff = int(blk.get('rank_A', torch.tensor(1)))
+                    import math as _m
+                    h_max = max(1e-6, _m.log(max(2, r_eff)))
+                    h_norm = min(1.0, max(0.0, bar_h / h_max))
+                    # 低熵(更确定) -> 减小正交注入；高熵 -> 增大到 base_ortho
+                    ortho_scale = base_ortho * h_norm
+                else:
+                    ortho_scale=base_ortho
                 r=int(blk['rank_A'])
                 U_A=None
                 if base_subs is not None and mod in base_subs:
@@ -132,7 +173,11 @@ def dgsm_merge(args: argparse.Namespace):
                 alpha=float(args.fallback_alpha); merged[k]=(1-alpha)*W_A + alpha*W_B
         elif k.endswith('.bias') and weights_A[k].ndim==1:
             W_A=weights_A[k].float(); W_B=weights_B.get(k, None)
-            if W_B is None: continue
+            if W_B is None:
+                alt_k = _alt_donor_key(weights_B, k)
+                if alt_k is None:
+                    continue
+                W_B = weights_B[alt_k]
             W_B=W_B.float(); alpha=float(args.bias_alpha)
             merged[k]=(1-alpha)*W_A + alpha*W_B
     _save_model(args, merged)
@@ -160,6 +205,9 @@ def parse_args():
     ap.add_argument('--bias-alpha', type=float, default=0.5)
     ap.add_argument('--use-dynamic-m', action='store_true')
     ap.add_argument('--base-subs', type=str, default=None, help='Stage-1 base 子空间文件 (含 U)，提供可跳过重复 SVD')
+    ap.add_argument('--use-lambda-est', action='store_true', help='使用 Stage-2 中每层的 lambda_est 作为融合强度')
+    ap.add_argument('--lam-scale', type=float, default=None, help='对 per-layer lambda_est 进行缩放的系数, 可微调融合强度')
+    ap.add_argument('--ortho-adapt', action='store_true', help='根据 Stage-2 的 psi 熵自适应调整正交项注入强度')
     return ap.parse_args()
 
 if __name__=='__main__':

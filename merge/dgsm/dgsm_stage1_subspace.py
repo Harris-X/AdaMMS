@@ -8,7 +8,8 @@ import os
 import os.path as osp
 from typing import Dict
 import torch
-from utils import load_weights, need_merge  # type: ignore
+from tqdm import tqdm
+from .utils import load_weights, need_merge  # type: ignore
 
 def _canon_module_from_param(key: str) -> str:
     k = key.replace("language_model.model.", "model.").replace("language_model.", "model.")
@@ -26,11 +27,12 @@ def extract(args: argparse.Namespace):
     rank = int(args.rank)
     out: Dict[str, Dict[str, torch.Tensor]] = {}
     total=kept=0
-    for k,W in weights.items():
+    use_cuda = bool(getattr(args, 'cuda', False)) and torch.cuda.is_available()
+    for k,W in tqdm(list(weights.items()), desc='Stage-1 SVD'):
         if not (k.endswith('.weight') and W.ndim==2 and need_merge(k)):
             continue
         total+=1
-        Wf = W.float()
+        Wf = W.float().cuda() if use_cuda else W.float()
         d_out,d_in = Wf.shape
         r_use = min(rank,d_out,d_in)
         if r_use<=0: continue
@@ -46,6 +48,8 @@ def extract(args: argparse.Namespace):
         except RuntimeError as e:
             print(f"[Warn] SVD fail {k}: {e}"); continue
         U,S = U[:,:r_use].contiguous(), S[:r_use].contiguous()
+        if use_cuda:
+            U = U.cpu(); S = S.cpu()
         mod = _canon_module_from_param(k)
         out[mod] = {'U':U.cpu(),'S':S.cpu(),'rank_used':torch.tensor(int(r_use)),'shape':torch.tensor([d_out,d_in])}
         kept+=1
@@ -60,6 +64,7 @@ def parse_args():
     ap.add_argument('--save',required=True)
     ap.add_argument('--rank',type=int,default=64)
     ap.add_argument('--verbose',action='store_true')
+    ap.add_argument('--cuda',action='store_true', help='在可用时使用 CUDA 加速 SVD')
     return ap.parse_args()
 
 if __name__=='__main__':
