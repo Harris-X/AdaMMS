@@ -1,0 +1,206 @@
+RAPT_VERSION=0.3.27
+SCHEMA_VERSION=rapt-v2.1
+
+# 版本规范:
+#   1) 每个版本独占目录 merge/rapt_V0_<major>/, 目录内文件带 v<major> 前缀。
+#   2) VERSION 记录 RAPT_VERSION 与缓存 SCHEMA_VERSION; 缓存不匹配必须报错, 不得静默复用。
+#   3) 任何公式/超参/产物命名变化都要递增 RAPT_VERSION, 并在方法说明 md 追加变更记录。
+#   4) RAPT_VERSION 与方法说明 md 的 doc_revision 从此对齐 (2026-09-14 起)。
+#
+# 0.1.0  rapt_V0_1 : operator mapping + component gate (E0), 七任务历史结果
+# 0.2.0  rapt_V0_2 : Stage-2 双 target (E0/E1); Stage-3 target x gate 解耦; NormMatch; identity-mapping
+# 0.2.1  rapt_V0_2 : E3 (完整 donor 响应); --injection subspace; --direct-full; 修 donor 索引 bug
+# 0.3.0  rapt_V0_3 : 新增 T17「算子传输 + 失配正则收缩」
+#                    - Stage-2 产出 q_raw = Σ_j P_ij S_ij (保留符号, 不截正部) 与 c_op = 2(1-q)
+#                    - 新增 gate: mismatch_module (G6) / mismatch_component (G7) / mismatch_component_norm (C3)
+#                      g = 1/(1+c_op) = 1/(3-2q) ∈ [1/5, 1]
+#                    - 保留 APT 原盈余 E0 与 host 非负对角注入 J0, 只替换"失配指标及其粒度"
+#                    - Stage-1 沿用精确截断 SVD (执行方案 §4.1), 缓存 schema 升为 rapt-v2.1
+#
+# ---- 以下为补记: 0.3.1–0.3.12 期间代码确有改动, 但当时只更新了方法说明 md 的 doc_revision,
+# ---- 未同步本文件 (记账缺口, 2026-09-14 补齐)。本次起两者对齐。
+# 0.3.1  §6.4 根因诊断; 启用 E3; r=256 分支; alpha 网格
+# 0.3.2  新增 --injection subspace; E3 判否; 路径判决表
+# 0.3.3  merge_meta 修正: mode=direct / injection=subspace 分支标记 target_used / gate_used,
+#        未使用的字段置 null (修「把默认值当有效诊断上报」)
+# 0.3.4  (仅评测与文档: HYB 8 任务; 可达性随 r 标定)
+# 0.3.5–0.3.9  (仅文档: 方向诊断 / 合并范围 / τ 设计缺陷 / SCOPEALIGN / DRP 自我纠正 / 文档重定位)
+# 0.3.10 新增 --target calibrated_transport (E2-M) 与 hard_transport; 新增 _linear_assignment();
+#        新增 --score-norm {none,center_scale}; sinkhorn() 增加 anneal 参数
+# 0.3.11 target 计算抽为生产函数 compute_surplus_h(), 加生产路径单测 (逐 target 对照 + 笔误回归防护);
+#        dtype 鲁棒化; 新增 calib_baseline_gap_mean 观测字段
+# 0.3.12 alpha 由「盈余位移系数」改为「相对扰动预算」: 新增 --inject-budget {raw,rel}
+#        与生产函数 normalize_injection_budget(); ‖dW‖_F/‖W_A‖_F ≡ alpha 精确成立
+# 0.3.13 TA 分支 (task-anchor APT, 方法说明 §13):
+#        - Stage-1 新增 --anchor-model: 分解对象由绝对权重 W 改为 task vector τ = W − W_0
+#          (缓存新增 decomp_object / anchor_model / anchor_missing_modules 字段; 旧缓存缺字段时
+#           按 absolute_weight 处理, 语义正确, 故 SCHEMA_VERSION 不升)
+#        - Stage-3 新增 --target task_delta: h = diag(U^T (W_B − W_A) V^T), 自合并精确为 0
+#        - Stage-3 新增 donor_component_gate() 与 --gate mismatch_component_donor
+#          (同一运输计划按 donor 列读取, 修正「用 host 分量失配门控 donor 分量」的索引错配)
+#        - 产物名前缀 ta_ (由 base_subs 的 decomp_object 自动加); meta 新增
+#          base_decomp_object / base_anchor_model / donor_decomp_object / donor_anchor_model /
+#          decomp_tag / g7_donor_mean
+#        - 新增单测: test_ta_stage1_anchor_subtraction / test_ta_basis_reachability_mechanism /
+#          test_ta_zero_hypothesis_and_confinement / test_task_delta_and_donor_gate
+#        - 新增诊断: diag_taskvector.py / diag_taskvector2.py; 新增 run_ta_gen.sh
+#        - 目录不变 (仍为 rapt_V0_3): 按本文件规范 1), 目录按 **major** 划分, 0.3.x 同属 V0_3。
+#
+# 0.3.18 §19 对齐 vs 性能 (**有代码改动 + 新评测队列**):
+#        - **§19.1 判据测量**: 用 diag_alignment.py 测 ‖sinΘ(U_A,U*)‖_F (§15.3 预登记口径):
+#            TA_apt_0p011  0.459/dense  -> 213.457 (✅保对齐)
+#            BTI_0p011     0.650/dense  -> 214.607 (✅)
+#            稠密插值       1.000        -> 214.482 (分母)
+#            TA_hyb        1.153/dense  -> 216.731 (❌ 比稠密插值更破坏对齐)
+#          => **TA_hyb 不能声称"保对齐", 也不是"APT 的另一种实现"**; 是各向异性插值。
+#        - **§19.5 预登记预测被证伪**: 曾从 4 点看出"sinΘ 越高分数越高"并预测
+#          BULK512_only(sinΘ 1.226) >= 216.731; 实测 **214.314** -> 预测失败。
+#          => **sinΘ 是第四个被证伪的权重侧代理量**(前三个: §16.3 sinΘ选型 /
+#             §17.7 cos(ΔW,Δ) / §11.10.8 方向对准度)。§19.3 的"定量 trade-off"降级为
+#             "机制上冲突成立, 强度未知"。
+#        - **§19.6 §18 目标部分达成/部分失败**:
+#            ❌ 低秩 bulk 不能替代稠密插值 (同预算 214.314 < 214.482)
+#            ✅ 秩很重要 (r128 213.086 -> r512 214.314, 差 1.23)
+#            ✅ **BULK512_only_0p02 = 214.794**, 第一个"无稠密项、达到 AdaMMS 水平"的实现
+#               (差 0.08; 高于稠密插值 0.31; 高于 BTI 0.19) —— §18.1 重述机制上成立
+#            ⚠️ 预算非单调: rel 0.02 -> 214.794, rel 0.0276 -> 214.314 (-0.48)
+#        - **§19.7 第一要求现状: 未达成**。严格保对齐约束下最好 214.607(BTI) < AdaMMS;
+#          无稠密项约束下最好 214.794 < AdaMMS; 唯一超线者 TA_hyb 须放弃保对齐声明。
+#        - **新增 §19.4 行为对齐队列** (screen_align.sh + run_align_queue.sh): 项目从未测过
+#          行为对齐, 只测过代理量且四个全被证伪 => 用 lmms-eval 的 **ifeval**(指令遵循)
+#          直接测 base/AdaMMS/TA_apt/BULK512_only/TA_hyb 五点。判决: 若 TA_hyb 的 ifeval
+#          ~= AdaMMS 则"冲突"在行为层面不存在, 可合法报告 +1.86; 否则必须降级。
+#        - 新增脚本: diag_alignment.py / screen_align.sh / run_align_queue.sh / run_bulk_gen.sh
+#
+# 0.3.17 §17.7 更正 + §18 方法自洽化方案 (**本轮只加诊断脚本, 未改 Stage-3 代码**):
+#        - **§17.7 更正**: cos(ΔW,Δ) **也不是**有效预测指标。TA_hyb (cos≈0.997) 与
+#          稠密插值 (cos=1.000) 的 cos 几乎相同, 分数却差 2.25 (216.731 vs 214.482)
+#          => §17.6(b) 的"唯一与分数单调对应"是过度解读, §17.6(d) 的外推表作废。
+#          累计结论: sinΘ / cos(ΔW,Δ) / 方向对准度 cos(h₊,d*₊) 三个权重侧代理量
+#          **全部与分数不单调** => 本模型对上迄今无可替代评测的代理量。
+#        - **§18 方法自洽化**: ① HYB 等价重述 —— d_B≈σ_τB 且 Δ=τ_B−τ_A, 故
+#          TA_hyb ≈ W_A + ia(τ_B−τ_A) + 0.232·LR_r(τ_B), 即"AdaMMS 同口径插值 +
+#          放大 donor 任务向量前 r 部分"。矛盾消解: **受保护域限制的是"强调项"而非整个更新**,
+#          且强调基底应是 **donor 任务基**而非 host 基。
+#          ② 新方案: 把唯一稠密项 ia·Δ 换成 **ia·LR_r(Δ)** (Eckart–Young 保证 U_Δ 是
+#          rank-r 中 reach 最大者) => 全更新 rank ≤ 2r, 无稠密项。
+#          ③ 判据: f_r = ‖LR_r(Δ)‖/‖Δ‖ = sqrt(Δ 前 r 能量占比); **f_128 > 0.8 才实现**。
+#          ④ 与 APT 原始评测的差异: 不沿用其四件套消融, 改测 APT 完全没有的维度
+#          —— "bulk 基的选择"(U_W vs U_τB vs U_Δ vs 稠密, 同 ia 同预算)。
+#        - 新增脚本: diag_delta_spectrum.py (A Δ谱集中度 / B 各基 reach 对照 /
+#          C HYB 分解与 band 放大倍数)。**未改 Stage-3, 未生成新候选。**
+#
+# 0.3.16 §17: 逐阶段替代实现选型 + 决定性诊断 (**有代码改动**):
+#        - 候选 A (host_overlap 门控) **判否**: CandA_0p011 = 208.160 (-6.71),
+#          CandA_0p022 = **199.103 (-15.77, 比 base 还低 13.09)** —— 门控+加倍预算=灾难。
+#        - 归因 (diag_gate_corr.py): corr(a_j, σ_τB) = **+0.5301** (正相关, 原假设 H1 被否定);
+#          有效方向数 121.19 -> 73.63 => 门控等价于**谱锐化**, 不是"压制 donor 强项"。
+#        - **决定性诊断: cos(ΔW, Δ) 才是预测分数的量** (§17.6(b)):
+#          E0 0.0143 / TA 0.2683 / A-only 0.6992 / BTI 0.7581 (6 个 k_proj 模块);
+#          生产路径全 196 模块: BTI cos = **0.5030** (TA 约 0.18, E0 0.014)。
+#          三点已测数据在 cos 上**单调**: 0.014->213.195, 0.18->213.457, 1.0->214.482;
+#          而 sinΘ 与分数**不单调** => §16.3 用 sinΘ 作判据选错了量 (判据修订, 见 §17.6(c))。
+#        - **BTI 重新纳入** (原判据只否决"保对齐"这一卖点, 不是达标条件); 原结论保留:
+#          BTI 不保对齐 (bti/dense = 1.24/1.37 > 1), 不得声称保对齐。
+#        - 新增代码: `--injection bidir` (BTI: 联合基有符号对角) + `--tau-a-subs` +
+#          `--bidir-a-weight` + meta 新增 `tau_a_subs`/`bidir_a_weight`/**`cos_delta_mean`**
+#          (per_module 逐模块 cos(ΔW,Δ) 诊断, 对所有 inject 模式生效)。
+#        - 被否决方案汇总 (§17.6(f)): host_overlap 门控 / 逐模块自适应秩 (r*=32 在 12/12 模块,
+#          γ 与 reach 反相关) / 完整块 (diag_energy 0.906) / 非负锥 (τ 基下 pos_ratio=1.0, 冗余)
+#          / τ 空间 OT 与温度锐化 / sinΘ 作为选型判据。
+#        - 外推 (§17.6(d)): 纯结构化注入的 cos 上界 < 1 => 分数上界约等于插值基线;
+#          BTI (cos 0.503) 外推 ≈ 213.9, 仍低于 AdaMMS 214.87。
+#        - 新增脚本: diag_gate_corr.py; 生成 BTI 三档 (rel 0.011/0.022/0.0276)。
+#
+# 0.3.15 §15/§16: TA 维度重规划 + P0 诊断 + 候选 A 落地 (**有代码改动**):
+#        - §15 (设计分析): TA 的增益只在混合模式下出现 (纯注入 +0.26 噪声内 / 混合 +2.62);
+#          三点对照: 纯插值 214.482 -> +E0 注入 214.115 (有害 -0.37) -> +TA 注入 216.731 (+2.25)。
+#          TA 定位为**基底维度**; 给出路线重排矩阵; 提出 BTI (后被 P0-a 否决)。
+#        - §16 P0 诊断 (diag_bti.py): reach(r) 曲线 / a_j 信息量 / BTI 对齐保持性。
+#        - 新增代码: --host-subs, --gate host_overlap, host_overlap_gate(), meta.host_subs,
+#          per_module.host_overlap_raw_mean。
+#        - 新增脚本: diag_bti.py, run_ta_r256.sh。
+#        - 已生成 5 个候选入队 (CandA_0p011/0p022, CandA_r256_0p011/0p022, TA_r256_gapt)。
+#        - 队列停跑 E2-M 族 9 项 (注释保留)。
+#
+# 0.3.14 结果登记 + 规划 (本轮 **未改代码**, 仅方法说明 md 与 VERSION):
+#        - §13.12: TA_best_TA_hyb_full8 SUM8 = 559.54 (+4.08 vs AdaMMS 555.46;
+#          +4.34 vs 历史最优 HYB_apt_opmap 555.201); 8 任务 6 正 2 负
+#        - §13.13 稳健性: paired_bootstrap.py 扩展 RAPT_TASKS=8 / RAPT_REF_DIR
+#          (seedbench 用 seed_image 的 pred==answer)。TA_hyb vs AdaMMS
+#          Δ=+3.365, 95% CI [+1.260,+5.447] 显著; vs HYB_apt_opmap Δ=+3.567,
+#          CI [+1.375,+5.669] 显著。OKVQA 专项 +2.271 (CI [+1.669,+2.897]),
+#          净翻转 +95 题。口径勘误: OKVQA 实为官方 VQA 软分数 min(1,#匹配/3)。
+#        - §13.14 同架构第二组对照 (InternVL2_5-1B VQA←OCR, 精确锚点) 上
+#          pos_diag(U_τA)=0.0000 / pos_diag(U_τB)=0.9998 / diag_energy 0.866 vs 0.084
+#        - §14 规划: ① **修正并降级归档 §13.14** —— InternVL VQA/OCR 属**同架构**
+#          任务微调, 不满足跨架构; 该节标题改为「同架构第二组对照(非跨架构, 已归档)」,
+#          正文折入 <details>, 仅保留两条仍有效的结论 (机制性质可复现; 锚点精度显著影响
+#          可达性测量, 故 §13.3 的 Qwen 对数字是保守的)。跨架构证据改用本地
+#          LLaVA-v1.5 / mPLUG-Owl2 / CogVLM + Llama-2-7b-hf 锚点
+#          (对应论文 Appendix B Group I/II 六向) 重建。② 复盘所有纯注入候选
+#          无一打过 AdaMMS (最高 TA_apt_0p011 = 213.457, 差 1.41)。③ 登记两个
+#          Stage-2/Stage-3 均与既有变体不同的纯 APT 候选: A 几何可靠性桥接
+#          (主夹角 κ_m 作模块级可靠性)、B Union 子空间符号感知注入。
+#          ④ 对齐 APT 论文实验的映射表与 P0→P2 执行顺序。
+#        - §13.15 队列补跑结果 + 两处结论降级:
+#          ① **合并范围(scope alignment)不是稳健增益** —— 同一操作在 HYB_apt_opmap 上
+#             +0.59, 在 TA_hyb 上 **-0.90** (SCOPEALIGN_TA_HYB 215.829 vs TA_hyb 216.731),
+#             符号相反且都小于三任务标准误(±1.7) => §8.6 的「+0.59 最大单项提升」
+#             降级为未证实的单次波动 (§8.6 已加降级注记)。另: SCOPEALIGN_HYB_full8
+#             目录为空, 该候选从未有过 8 任务证据。
+#          ② **E2-M 校准族(tcal/hard)全线失败**: 纯注入下比同预算 E0 低 2.2-2.5 分
+#             (RELB_tcal_0p0114 210.968 / RELB_thard_0p0114 210.719 vs E0 213.195),
+#             预算翻倍再掉 2.5 分 (RELB_tcal_0p02 208.493), 混合模式下也全部 <=214.96
+#             < TA_hyb 216.731 => §11.10.8 预登记第 2 分支现有 5 个数据点支持, 可判否。
+#          ③ 硬事实: **所有纯注入候选仍无一打过 AdaMMS**, 最高 TA_apt_0p011 = 213.457 (-1.41)。
+#        - §15 以 TA 为默认维度重新规划全部路线 (设计分析, 无新实验):
+#          ① **关键澄清**: TA 的增益**只在混合模式下出现** —— 纯注入下 TA vs E0 仅 +0.26
+#             (噪声内), 混合下 +2.62 (显著); 三点对照更清楚: 纯插值 214.482 →
+#             +E0 注入 214.115 (**-0.37 有害**) → +TA 注入 216.731 (**+2.25 有益**)。
+#             机制: pos_diag(U_τB)=1.0 使非负截断从不生效, 故 TA 注入 ≈ Δ 在 donor
+#             任务子空间的对角投影, **与插值同向** => TA_hyb 的真实身份是「各向异性插值」,
+#             不是"更好的保护性注入"。=> **不能把 TA 当成可叠加到任何路线的万能增益**。
+#          ② **TA 是基底维度**, 与 target/gate/预算正交。路线重排矩阵:
+#             必须加 TA 重测: E3 (当年被非负锥切光, τ_B 基下 pos_diag=1.0 不会被切)、
+#                             r 敏感性 (τ 谱衰减与 W 谱不同, reach(U_τB,r) 未知);
+#             不必重测: SUB 完整块 (diag_energy(U_τB)=0.906 → 完整块只多 1.05x 容量)、
+#                       DRP (在 τ_B 基下退化为 TA 本身);
+#             不应加 TA: 温度锐化 / E2-M 校准 / G6-G7 逐组件门控 (均依赖 τ 空间已退化的对应);
+#             独立维度: 合并范围 scope; 预算 α 最优点已左移 (0.011 优于 0.022)。
+#          ③ **新主候选 BTI (Bidirectional Task-aligned Injection)**: 用"减 host 任务方向"
+#             (pos_diag(U_τA)=0 ⇒ diag 全负 ⇒ 取 [-diag]_+ 作非负幅度) 替代插值项的
+#             (1-ia) 半边, 支撑域达联合基 reach=0.553 (单侧 0.192 的 2.9x), 仍为两个
+#             rank-r 对角非负受限更新, 不含稠密插值。**Prop.1 不自动适用** (减法项作用在
+#             U_τA 而非 W_A 主基), 保对齐须靠 sinΘ 实测, 不得引用定理宣称。
+#          ④ 候选 B 的"完整块"部分先验否决; 候选 A (主夹角) 降为精修项并改为逐组件 a_j,
+#             预登记判据: a_j 标准差不显著 > 0 则直接放弃。
+#          ⑤ 执行顺序 P0-a/b/c (免评测诊断) → P1-a (BTI) / P1-b (E3 在 τ_B 基重测) → P2 (跨架构);
+#             建议停止队列剩余 7 项 (全属已判否的 E2-M 族)。
+#        - §16 P0 诊断结果 (diag_bti.py, 24 模块 / r0=128):
+#          ① **P0-c reach(r) 曲线 —— r 是被低估的杠杆**:
+#             reach(U_τB) = 0.149/0.192/0.250/0.334 @ r=64/128/256/512, **不饱和**;
+#             有效对角 reach (= reach×√对角占比) = 0.145/0.183/0.229/0.285 (+96%);
+#             正部恒为 1.0000; 对角占比 0.943→0.725; τB/W 比值 2.76→1.45。
+#             §6.4 在 W 基上的「次线性收益」结论在 τ_B 基上不成立。
+#          ② **P0-b 候选 A 通过预登记判据**: a_j mean 0.00691 / std 0.00380 /
+#             min 0.00306 / max 0.03482 (11x 跨度) / 随机基线 0.00267 / CV 0.7864
+#             => donor 任务方向与 host 主子空间有超随机重叠 (2.6x) 且逐组件有区分度。
+#          ③ **P0-a BTI 未通过对齐保持判据 => 放弃实现**: 同预算 sinΘ(U_W,U*) =
+#             dense 0.390/0.665, aptW **0.261/0.259**, ta_single 0.424/0.824,
+#             bti **0.484/0.911** @ rel=0.011/0.0276; bti/dense = 1.24/1.37 (>1, 判据要求 <1)。
+#          ④ **本节最重要的发现: τ 基用"牺牲对齐"换"预算"** —— W 基 sinΘ 0.259 且
+#             几乎不随预算变化 (Prop.1 实证), τ_B 基 sinΘ 0.42-0.82 **比稠密插值还差**
+#             (U_τB 不是 W_A 的主子空间)。这解释了纯注入下 TA(213.457) 只比 E0(213.195)
+#             高 0.26 (噪声内) —— 多出的 33x 预算被更差的对齐抵消。
+#          ⑤ **P1-b (E3 在 τ_B 基重测) 取消**: task_delta 在 τ_B 基下**就是** E3 机制的
+#             正确形态; §15.2 把它列为独立待测项是重复计数。
+#        - 新增代码 (候选 A): --host-subs (W_A 的 Stage-1 分解) + --gate host_overlap
+#          + 生产函数 host_overlap_gate() (逐模块 max 归一); per_module 新增
+#          host_overlap_raw_mean; meta 新增 host_subs。
+#          实测生产路径: gate_mean 0.2865 (std 0.1648, 0.0136-0.6805), a_j raw mean
+#          0.00840 (std 0.00910), posSurp 1.0000, rel_pert 0.01097 @ alpha=0.011。
+#        - 已生成: ta_raptv3_r128_a{0p011,0p022}_ttd_ghost_overlaprel (候选 A 两档);
+#          正在生成 r=256 流水线 (run_ta_r256.sh: τ Stage-1 r256 -> Stage-2 -> 3 个 Stage-3)。
+#        - 队列已停 E2-M 族余项 (9 项全部注释保留备查), 新增 P-1 候选 A 两项。
+#        - 目录不变 (仍为 rapt_V0_3): 0.3.x 同属 V0_3。
