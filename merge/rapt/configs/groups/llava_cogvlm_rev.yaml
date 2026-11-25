@@ -1,0 +1,26 @@
+# 模型组配置: llava_cogvlm_rev
+#
+# 反向异构融合: LLaVA-v1.5-7B (host) <- CogVLM-grounding-generalist (donor)
+#   * 输出以 LLaVA 为骨架, 视觉塔保持 LLaVA 的 CLIP ViT
+#   * 只吸收 donor 的语言侧 (CogVLM 的 language expert 权重)
+#   * 与 cogvlm_llava_fwd 相同的命名/形状适配限制, 见该文件注释
+#
+# status=needs-adapter; 强制运行请设 ALLOW_UNREADY=1.
+name: llava_cogvlm_rev
+description: "llava-v1.5-7b <- cogvlm-grounding-generalist-hf (异构视觉塔; 只吸收 donor 语言侧)"
+status: needs-adapter
+
+family: llava
+anchor: Llama-2-7b-hf
+host: llava-v1.5-7b
+donor: cogvlm-grounding-generalist-hf
+
+interp_alpha: 0.1
+mrc_interp_alpha: 0.1
+backend: pipeline
+merge:
+  rank: 128
+  alpha: 0.5
+  target: task_delta
+  gate: apt
+  mode: hybrid

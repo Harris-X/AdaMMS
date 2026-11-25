@@ -1,0 +1,13 @@
+# 模型组配置: g3_fwd (LLaVA-v1.5 骨架, 吸收 mPLUG-Owl2)
+name: g3_fwd
+description: "llava-v1.5-7b <- mplug-owl2-llama2-7b (跨架构; 共同语言基座 Llama-2/Vicuna)"
+status: ready
+
+family: llava
+anchor: Llama-2-7b-hf
+host: llava-v1.5-7b
+donor: mplug-owl2-llama2-7b
+
+interp_alpha: 0.1
+mrc_interp_alpha: 0.3
+backend: ta_hyb

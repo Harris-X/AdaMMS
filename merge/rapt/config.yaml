@@ -1,10 +1,14 @@
 # ==============================================================================
-# RAPT (V0.3 迁移版) 统一配置 —— 唯一事实来源
+# RAPT (V0.3 迁移版) 全局默认配置
 #
-# 所有 merge/ 与 eval/ 脚本默认从这里读取; 环境变量仅用于单次临时覆盖,
-# 实际生效值会写入产物 meta / 评测 manifest, 便于事后对齐与审计。
+# 配置分两层:
+#   1) 本文件: paths / merge / eval 的全局默认
+#   2) configs/groups/<group>.yaml: 单个模型组 (anchor/host/donor/family + 可选覆盖)
 #
-# 路径均相对项目根 (/root/autodl-tmp/AdaMMS); 换机器只需改 paths 与 groups。
+# 所有 merge/ 与 eval/ 脚本通过 tools/cfg.py 合并两层后读取;
+# 环境变量仅用于单次临时覆盖, 实际生效值写入产物 meta / 评测 manifest。
+#
+# 路径均相对项目根 (/root/autodl-tmp/AdaMMS); 换机器只需改 paths 与模型组文件。
 # ==============================================================================
 version: rapt-v0.3
 
@@ -21,11 +25,12 @@ paths:
 
 # ------------------------------------------------------------------------------
 # 合并超参 (TA_hyb 已确认最优点, 见方法说明 §21.6)
-# 这些参数对三组模型**完全一致**, 不同组只改 groups.<g>.interp_alpha
+# 这里是**全局默认**; 单个模型组可在 configs/groups/<g>.yaml 的 merge: 段覆盖。
+# 模型组定义不在本文件: 见 merge/rapt/configs/groups/*.yaml (每组一个文件)。
 # ------------------------------------------------------------------------------
 merge:
-  backend: ta_hyb                      # ta_hyb | pipeline
-  groups: [g1, g3_fwd, g3_rev]         # run_merge_all.sh 默认跑这三组
+  backend: ta_hyb                      # ta_hyb | pipeline (可被组配置覆盖)
+  groups: [g1, g3_fwd, g3_rev]         # run_merge_all.sh 默认组列表
   rank: 128
   alpha: 0.5                           # band 注入强度
   interp_alpha: 0.1                    # 插值系数 (hybrid)
@@ -42,33 +47,6 @@ merge:
   variants:                            # 零新超参方案开关 (默认全关 = TA_hyb)
     ortho_scale: false                 # 方案 B (MRC)
     conflict_filter: false             # 方案 C
-  mrc_interp_alpha:                    # MRC 用 R3 自主选出的 ia (方案 B 开启时生效)
-    g1: 0.2
-    g3_fwd: 0.3
-    g3_rev: 0.3
-
-# ------------------------------------------------------------------------------
-# 模型组 (anchor / host / donor 均为 paths.models 下的目录名)
-# ------------------------------------------------------------------------------
-groups:
-  g1:
-    anchor: Qwen2-7B
-    host: Qwen2-VL-7B-Instruct
-    donor: llava-onevision-qwen2-7b-si-hf
-    family: qwen2vl                    # lmms-eval / VLMEvalKit 的模型族
-    interp_alpha: 0.1                  # TA_hyb 最优
-  g3_fwd:
-    anchor: Llama-2-7b-hf
-    host: llava-v1.5-7b
-    donor: mplug-owl2-llama2-7b
-    family: llava
-    interp_alpha: 0.1
-  g3_rev:
-    anchor: Llama-2-7b-hf
-    host: mplug-owl2-llama2-7b
-    donor: llava-v1.5-7b
-    family: mplug
-    interp_alpha: 0.1
 
 # ------------------------------------------------------------------------------
 # 评测超参 (固定; base 与 merged 必须使用同一套)

@@ -1,0 +1,33 @@
+# 模型组配置: cogvlm_llava_fwd
+#
+# 异构融合示例: CogVLM-grounding-generalist (host) <- LLaVA-v1.5-7B (donor)
+#   * 视觉塔完全不同 (CogVLM: EVA2 + 视觉专家; LLaVA: CLIP ViT-L/14)
+#   * 语言侧同属 Llama-2 / Vicuna-7B 系, 因此可用 Llama-2-7b-hf 作共同 anchor
+#   * 语言侧命名不同:
+#       CogVLM  model.layers.N.self_attn.language_expert_query_key_value / language_expert_dense
+#               model.layers.N.mlp.language_mlp.*
+#       LLaVA   model.layers.N.self_attn.{q,k,v,o}_proj / mlp.{gate,up,down}_proj
+#
+# status=needs-adapter: RAPT 的 Stage-1 anchor 匹配与 TA_hyb 单文件实现目前按
+# canon 名 + 形状精确配对; 上述 expert 命名与 qkv 拼接形状 (3h×h vs h×h) 需要
+# 语言侧适配器 (expert qkv 拆分/拼接) 才能完整合并。当前可运行 pipeline,
+# 但只会覆盖命名与形状都匹配的模块; 结果不应作为完整 CogVLM 合并且报.
+# 强制运行请设 ALLOW_UNREADY=1.
+name: cogvlm_llava_fwd
+description: "cogvlm-grounding-generalist-hf <- llava-v1.5-7b (异构视觉塔; 语言侧 Llama-2/Vicuna 系)"
+status: needs-adapter
+
+family: cogvlm
+anchor: Llama-2-7b-hf
+host: cogvlm-grounding-generalist-hf
+donor: llava-v1.5-7b
+
+interp_alpha: 0.1
+mrc_interp_alpha: 0.1
+backend: pipeline          # ta_hyb 单文件没有语言侧别名映射, CogVLM 组必须走三阶段
+merge:
+  rank: 128
+  alpha: 0.5
+  target: task_delta
+  gate: apt
+  mode: hybrid

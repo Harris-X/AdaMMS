@@ -2,8 +2,8 @@
 # ==============================================================================
 # RAPT V0.3 Stage-2: 免训练算子对应 + 双 target 谱/算子系数 (迁移自 rapt_V0_3)
 #
-# 默认值来自 merge/rapt/config.yaml:
-#   merge.stage2.tau / sinkhorn_iters / merge.rank / paths.work
+# 默认值来自 merge/rapt/config.yaml + configs/groups/<group>.yaml:
+#   merge.stage2.tau / sinkhorn_iters / merge.rank / paths.work (组可覆盖)
 #
 # 用法:
 #   bash merge/rapt/merge/run_stage2.sh --group g1
@@ -15,20 +15,18 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-ROOT=$(cd "${HERE}/../../.." &>/dev/null && pwd)
-CFG_FILE=${RAPT_CONFIG:-"${ROOT}/merge/rapt/config.yaml"}
-CFG_PY="${HERE}/../tools/cfg.py"
+source "${HERE}/../tools/cfg_bootstrap.sh" "$@"
 
-BOOT_PY=${PY:-python3}
-PY=${PY:-$("$BOOT_PY" "$CFG_PY" --get paths.python 2>/dev/null || echo python3)}
-[ -x "$PY" ] || PY=python3
-eval "$("$PY" "$CFG_PY" --shell "$CFG_FILE")" || { echo "[ERROR] 读取配置失败: $CFG_FILE" >&2; exit 1; }
-
-GROUP=${GROUP:-g1}
-RANK=${RANK:-$CFG_merge_rank}
+GROUP=${GROUP:-${CFG_GROUP_ARG:-g1}}
+GROUP_NAME=${CFG_GROUP:-$GROUP}
+CFG_GET_GROUP() {  # <field>
+  "$PY" "$CFG_PY" --file "$CFG_FILE" "${GROUP_ARGS[@]}" --get "groups.${GROUP_NAME}.$1" 2>/dev/null || true
+}
+RANK=${RANK:-$(CFG_GET_GROUP rank)}
+[ -n "$RANK" ] || RANK=$CFG_merge_rank
 TAU=${TAU:-$CFG_merge_stage2_tau}
 ITERS=${ITERS:-$CFG_merge_stage2_sinkhorn_iters}
-WORK=${WORK:-"${ROOT}/${CFG_paths_work}/$GROUP"}
+WORK=${WORK:-"${ROOT}/${CFG_paths_work}/$GROUP_NAME"}
 SUBS_A=${SUBS_A:-}
 SUBS_B=${SUBS_B:-}
 SAVE=${SAVE:-}
@@ -72,22 +70,24 @@ done
 SUBS_A=${SUBS_A:-"$WORK/stage1_A_r${RANK}_tau.pt"}
 SUBS_B=${SUBS_B:-"$WORK/stage1_B_r${RANK}_tau.pt"}
 SAVE=${SAVE:-"$WORK/stage2_dual_r${RANK}_tau${TAU}_ta.pt"}
-for f in "$SUBS_A" "$SUBS_B"; do
-  [ -f "$f" ] || { echo "[ERROR] 缓存不存在: $f (先跑 run_stage1.sh)" >&2; exit 1; }
-done
-mkdir -p "$(dirname "$SAVE")"
 
 EXTRA=()
 [ "$VERBOSE" = "1" ] && EXTRA+=(--verbose)
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "[DRY_RUN] Stage-2 group=${GROUP} config=${CFG_FILE}"
+  echo "[DRY_RUN] Stage-2 group=${GROUP_NAME:-$GROUP} config=${CFG_FILE}"
+  echo "  work=$WORK"
   echo "  subs-a=$SUBS_A"
   echo "  subs-b=$SUBS_B"
   echo "  save=$SAVE"
   echo "  tau=$TAU  iters=$ITERS  max_rank=$RANK  score_norm=$SCORE_NORM"
   exit 0
 fi
+
+for f in "$SUBS_A" "$SUBS_B"; do
+  [ -f "$f" ] || { echo "[ERROR] 缓存不存在: $f (先跑 run_stage1.sh)" >&2; exit 1; }
+done
+mkdir -p "$(dirname "$SAVE")"
 
 echo "=============================================="
 echo "  RAPT Stage-2  group=${GROUP}  config=${CFG_FILE}"

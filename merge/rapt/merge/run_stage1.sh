@@ -21,29 +21,27 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-ROOT=$(cd "${HERE}/../../.." &>/dev/null && pwd)
-CFG_FILE=${RAPT_CONFIG:-"${ROOT}/merge/rapt/config.yaml"}
-CFG_PY="${HERE}/../tools/cfg.py"
+source "${HERE}/../tools/cfg_bootstrap.sh" "$@"
 
-BOOT_PY=${PY:-python3}
-PY=${PY:-$("$BOOT_PY" "$CFG_PY" --get paths.python 2>/dev/null || echo python3)}
-[ -x "$PY" ] || PY=python3
-eval "$("$PY" "$CFG_PY" --shell "$CFG_FILE")" || { echo "[ERROR] 读取配置失败: $CFG_FILE" >&2; exit 1; }
-
-GROUP=${GROUP:-g1}
+GROUP=${GROUP:-${CFG_GROUP_ARG:-g1}}
+GROUP_NAME=${CFG_GROUP:-$GROUP}
 DM=${DM:-"${ROOT}/${CFG_paths_models}"}
-RANK=${RANK:-$CFG_merge_rank}
+CFG_GET_GROUP() {  # <field>
+  "$PY" "$CFG_PY" --file "$CFG_FILE" "${GROUP_ARGS[@]}" --get "groups.${GROUP_NAME}.$1" 2>/dev/null || true
+}
+RANK=${RANK:-$(CFG_GET_GROUP rank)}
+[ -n "$RANK" ] || RANK=$CFG_merge_rank
 CUDA=${CUDA:-0}
 NO_PROGRESS=${NO_PROGRESS:-1}
 ANCHOR=${ANCHOR:-}
 HOST=${HOST:-}
 DONOR=${DONOR:-}
-WORK=${WORK:-"${ROOT}/${CFG_paths_work}/$GROUP"}
+WORK=${WORK:-"${ROOT}/${CFG_paths_work}/$GROUP_NAME"}
 
 usage() {
   cat <<EOF
 用法: bash merge/rapt/merge/run_stage1.sh [选项]
-  --group STR     g1 | g3_fwd | g3_rev  (默认: g1; 决定 host/donor/anchor)
+  --group STR     组名 (g1/g3_fwd/...) 或 YAML 路径 (默认: g1)
   --host   PATH   host 模型目录        (默认取 config groups.<g>.host)
   --donor  PATH   donor 模型目录       (默认取 config groups.<g>.donor)
   --anchor PATH   预训练锚点 W_0       (默认取 config groups.<g>.anchor; none=绝对权重)
@@ -72,11 +70,11 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$HOST" ] || [ -z "$DONOR" ] || [ -z "$ANCHOR" ]; then
-  HOST_NAME=$("$PY" "$CFG_PY" --get "groups.${GROUP}.host" 2>/dev/null || true)
-  DONOR_NAME=$("$PY" "$CFG_PY" --get "groups.${GROUP}.donor" 2>/dev/null || true)
-  ANCHOR_NAME=$("$PY" "$CFG_PY" --get "groups.${GROUP}.anchor" 2>/dev/null || true)
+  HOST_NAME=$(CFG_GET_GROUP host)
+  DONOR_NAME=$(CFG_GET_GROUP donor)
+  ANCHOR_NAME=$(CFG_GET_GROUP anchor)
   [ -n "$HOST_NAME" ] && [ -n "$DONOR_NAME" ] || {
-    echo "[ERROR] config 中不存在 groups.${GROUP}" >&2; exit 1; }
+    echo "[ERROR] 未找到模型组 '$GROUP' (配置目录: merge/rapt/configs/groups/)" >&2; exit 1; }
   HOST=${HOST:-"$DM/$HOST_NAME"}
   DONOR=${DONOR:-"$DM/$DONOR_NAME"}
   ANCHOR=${ANCHOR:-"$DM/$ANCHOR_NAME"}

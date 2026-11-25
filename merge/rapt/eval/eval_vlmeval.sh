@@ -24,15 +24,7 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-ROOT=$(cd "${HERE}/../../.." &>/dev/null && pwd)
-CFG_FILE=${RAPT_CONFIG:-"${ROOT}/merge/rapt/config.yaml"}
-CFG_PY="${HERE}/../tools/cfg.py"
-
-BOOT_PY=${PY:-python3}
-PY=${PY:-$("$BOOT_PY" "$CFG_PY" --get paths.python 2>/dev/null || echo python3)}
-[ -x "$PY" ] || PY=python3
-eval "$("$PY" "$CFG_PY" --shell "$CFG_FILE")" || { echo "[ERROR] 读取配置失败: $CFG_FILE" >&2; exit 1; }
-CFG_SHA=$("$PY" "$CFG_PY" --sha256 "$CFG_FILE")
+source "${HERE}/../tools/cfg_bootstrap.sh" "$@"
 
 MODEL_PATH=${1:-}
 RUN_NAME=${2:-}

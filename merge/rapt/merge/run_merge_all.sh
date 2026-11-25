@@ -1,107 +1,107 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# RAPT V0.3 多组模型一键合并
+# RAPT 多模型组一键合并 (每组一个配置文件)
 #
-# 组与超参全部来自 merge/rapt/config.yaml:
-#   merge.groups / backend / rank / alpha / interp_alpha / variants / multiway / device
-#   groups.<g>.anchor / host / donor
-#
-# 两种后端:
-#   BACKEND=ta_hyb   (config 默认) 单文件实现, 无 Stage-1/2 缓存
-#   BACKEND=pipeline       完整 Stage-1 -> Stage-2 -> Stage-3 三阶段管线
+# 组定义: merge/rapt/configs/groups/<name>.yaml
+#   每个组文件自带 anchor / host / donor / family / interp_alpha /
+#   mrc_interp_alpha / backend, 并可覆盖主 config 的 merge 段。
 #
 # 用法:
-#   bash merge/rapt/merge/run_merge_all.sh
-#   bash merge/rapt/merge/run_merge_all.sh --group g1
-#   BACKEND=pipeline bash merge/rapt/merge/run_merge_all.sh
-#   ORTHO_SCALE=1 bash merge/rapt/merge/run_merge_all.sh      # MRC (方案 B)
-#   RANK=256 bash merge/rapt/merge/run_merge_all.sh           # 临时覆盖
+#   bash merge/rapt/merge/run_merge_all.sh                          # 默认组列表
+#   bash merge/rapt/merge/run_merge_all.sh --group g1               # 单组
+#   bash merge/rapt/merge/run_merge_all.sh --groups "g1 g3_rev"     # 多组
+#   bash merge/rapt/merge/run_merge_all.sh --group ./my_group.yaml  # 任意实验配置
+#   bash merge/rapt/merge/run_merge_all.sh --group cogvlm_llava_fwd --allow-unready
+#
+# 后端: 每组配置的 backend 优先 (ta_hyb | pipeline); 未写则用主 config merge.backend。
+#   可用 --backend 全局强制 (一般不推荐, 会覆盖组自身选择)。
+#
+# 超参: 不在本脚本传; 各组从自己的 YAML 读取。临时覆盖用环境变量, 例如
+#   RANK=256 ALPHA=0.4 bash merge/rapt/merge/run_merge_all.sh --group g1
 # ==============================================================================
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-ROOT=$(cd "${HERE}/../../.." &>/dev/null && pwd)
-CFG_FILE=${RAPT_CONFIG:-"${ROOT}/merge/rapt/config.yaml"}
-CFG_PY="${HERE}/../tools/cfg.py"
+source "${HERE}/../tools/cfg_bootstrap.sh" "$@"
 
-BOOT_PY=${PY:-python3}
-PY=${PY:-$("$BOOT_PY" "$CFG_PY" --get paths.python 2>/dev/null || echo python3)}
-[ -x "$PY" ] || PY=python3
-eval "$("$PY" "$CFG_PY" --shell "$CFG_FILE")" || { echo "[ERROR] 读取配置失败: $CFG_FILE" >&2; exit 1; }
-
-GROUPS=${GROUP:-${GROUPS:-$CFG_merge_groups}}
-BACKEND=${BACKEND:-$CFG_merge_backend}
-RANK=${RANK:-$CFG_merge_rank}
-ALPHA=${ALPHA:-$CFG_merge_alpha}
-ORTHO_SCALE=${ORTHO_SCALE:-}
-CONFLICT_FILTER=${CONFLICT_FILTER:-}
-MULTIWAY=${MULTIWAY:-$CFG_merge_multiway}
-DEVICE=${DEVICE:-$CFG_merge_device}
-DM=${DM:-"${ROOT}/${CFG_paths_models}"}
-OUT_ROOT=${OUT_ROOT:-"${ROOT}/${CFG_paths_merged_models}"}
-WORK_ROOT=${WORK_ROOT:-"${ROOT}/${CFG_paths_work}"}
-NO_PROGRESS=${NO_PROGRESS:-1}
+# 注意: bash 有内置只读数组 GROUPS (用户组 ID), 不能用 GROUPS 作环境变量
+GROUPS_LIST=${RAPT_GROUPS:-$CFG_merge_groups}
+BACKEND_OVERRIDE=""
+ALLOW_UNREADY=${ALLOW_UNREADY:-0}
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --group) GROUPS=$2; shift 2 ;;
-    --backend) BACKEND=$2; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    --group) GROUPS_LIST=$2; shift 2 ;;
+    --groups) GROUPS_LIST=$2; shift 2 ;;
+    --group=*) GROUPS_LIST=${1#--group=}; shift ;;
+    --groups=*) GROUPS_LIST=${1#--groups=}; shift ;;
+    --backend) BACKEND_OVERRIDE=$2; shift 2 ;;
+    --allow-unready) ALLOW_UNREADY=1; shift ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "[ERROR] 未知参数: $1" >&2; exit 1 ;;
   esac
 done
 
+CFG_GROUP_FIELD() {  # <group> <field>
+  "$PY" "$CFG_PY" --file "$CFG_FILE" --group "$1" --get "groups.$("$PY" "$CFG_PY" --file "$CFG_FILE" --group "$1" --get active_group).$2" 2>/dev/null || true
+}
+
 echo "================================================================"
-echo "  RAPT 一键合并  groups='$GROUPS'  backend=$BACKEND"
-echo "  config=$CFG_FILE  sha=$("$PY" "$CFG_PY" --sha256 "$CFG_FILE" | cut -c1-12)"
-echo "  rank=$RANK alpha=$ALPHA variants.ortho=$ORTHO_SCALE conflict=$CONFLICT_FILTER"
-echo "  output_root=$OUT_ROOT"
+echo "  RAPT 一键合并  groups='$GROUPS_LIST'"
+echo "  config=$CFG_FILE  sha=${CFG_SHA:0:12}"
+echo "  override backend=${BACKEND_OVERRIDE:-<per-group>}  allow_unready=$ALLOW_UNREADY"
 echo "================================================================"
 
 RUN_ONE() {
-  local g=$1
-  if [ "$BACKEND" = "ta_hyb" ]; then
-    local args=(--group "$g" --rank "$RANK" --alpha "$ALPHA"
-                --multiway "$MULTIWAY" --device "$DEVICE")
-    [ -n "$ORTHO_SCALE" ] && args+=(--ortho-scale)
-    [ -n "$CONFLICT_FILTER" ] && args+=(--conflict-filter)
-    [ "$NO_PROGRESS" = "1" ] && args+=(--no-progress)
-    bash "$HERE/run_ta_hyb.sh" "${args[@]}"
-  else
-    local anchor_name host_name donor_name anchor host donor
-    anchor_name=$("$PY" "$CFG_PY" --get "groups.${g}.anchor")
-    host_name=$("$PY" "$CFG_PY" --get "groups.${g}.host")
-    donor_name=$("$PY" "$CFG_PY" --get "groups.${g}.donor")
-    anchor="$DM/$anchor_name"; host="$DM/$host_name"; donor="$DM/$donor_name"
-    local work="$WORK_ROOT/$g" out="$OUT_ROOT/$g"
-    for d in "$anchor" "$host" "$donor"; do
-      [ -d "$d" ] || { echo "[ERROR][$g] 模型目录不存在: $d" >&2; return 1; }
-    done
-    mkdir -p "$work" "$out"
-    bash "$HERE/run_stage1.sh" --host "$host" --donor "$donor" --anchor "$anchor" \
-        --rank "$RANK" --work "$work"
-    bash "$HERE/run_stage2.sh" \
-        --subs-a "$work/stage1_A_r${RANK}_tau.pt" \
-        --subs-b "$work/stage1_B_r${RANK}_tau.pt" \
-        --save "$work/stage2_dual_r${RANK}_tau0.15_ta.pt" \
-        --tau "$CFG_merge_stage2_tau" --iters "$CFG_merge_stage2_sinkhorn_iters" --rank "$RANK"
-    local ia
-    ia=$("$PY" "$CFG_PY" --get "groups.${g}.interp_alpha")
-    bash "$HERE/run_stage3.sh" --host "$host" --donor "$donor" --work "$work" \
-        --output-dir "$out" --rank "$RANK" \
-        --mode "$CFG_merge_mode" --target "$CFG_merge_target" --gate "$CFG_merge_gate" \
-        --alpha "$ALPHA" --interp-alpha "$ia"
+  local g=$1 active status backend
+  active=$("$PY" "$CFG_PY" --file "$CFG_FILE" --group "$g" --get active_group 2>/dev/null || true)
+  if [ -z "$active" ]; then
+    echo "[ERROR] 组 '$g' 无法解析 (缺 configs/groups/<name>.yaml 或文件格式错误)" >&2
+    return 1
   fi
-}
+  status=$("$PY" "$CFG_PY" --file "$CFG_FILE" --group "$g" --get "groups.${active}.status" 2>/dev/null || true)
+  backend=$("$PY" "$CFG_PY" --file "$CFG_FILE" --group "$g" --get "groups.${active}.backend" 2>/dev/null || true)
+  [ -n "$BACKEND_OVERRIDE" ] && backend=$BACKEND_OVERRIDE
+  [ -n "$backend" ] || backend=$CFG_merge_backend
 
-for g in $GROUPS; do
   echo ""
   echo "################################################################"
-  echo "# [$g] backend=$BACKEND"
+  echo "# group=$active  backend=$backend  status=${status:-unknown}"
   echo "################################################################"
-  RUN_ONE "$g" || echo "[ERROR] 组 $g 合并失败, 继续下一组" >&2
+
+  if [ -n "$status" ] && [ "$status" != "ready" ] && [ "$ALLOW_UNREADY" != "1" ]; then
+    echo "[SKIP] 组 '$active' status=$status, 默认不运行。" >&2
+    echo "       该组需要额外适配; 强制运行请加 --allow-unready (结果不应作为完整合并且报)。" >&2
+    return 2
+  fi
+  if [ -n "$status" ] && [ "$status" != "ready" ]; then
+    echo "[WARN] 组 '$active' status=$status, 已按 ALLOW_UNREADY=1 强制运行" >&2
+  fi
+
+  case "$backend" in
+    ta_hyb)
+      bash "$HERE/run_ta_hyb.sh" --group "$g"
+      ;;
+    pipeline)
+      bash "$HERE/run_stage1.sh" --group "$g" || return 1
+      bash "$HERE/run_stage2.sh" --group "$g" || return 1
+      bash "$HERE/run_stage3.sh" --group "$g" || return 1
+      ;;
+    *)
+      echo "[ERROR] 组 '$active' 的 backend 非法: $backend (仅支持 ta_hyb|pipeline)" >&2
+      return 1
+      ;;
+  esac
+}
+
+RC=0
+for g in $GROUPS_LIST; do
+  RUN_ONE "$g"
+  rc=$?
+  [ $rc -eq 0 ] || RC=1
 done
 
 echo ""
-echo "[ALL DONE] 产物根目录: $OUT_ROOT"
-ls -d "$OUT_ROOT"/*/* 2>/dev/null | head -20 || true
+echo "[DONE] rc=$RC  产物根目录: ${ROOT}/${CFG_paths_merged_models}"
+ls -d "${ROOT}/${CFG_paths_merged_models}"/*/* 2>/dev/null | head -20 || true
+exit $RC

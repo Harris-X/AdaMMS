@@ -8,10 +8,9 @@
 # 单文件等价实现见 merge/rapt/ta_hyb_standalone.py; 本脚本保留完整三阶段管线,
 # 用于需要换 target / gate / budget 的消融。
 #
-# 默认值来自 merge/rapt/config.yaml:
-#   merge.mode / target / gate / alpha / interp_alpha / identity_mapping
-#   merge.rank / paths.work / paths.merged_models
-#   groups.<group>.{host,donor}
+# 默认值来自 merge/rapt/config.yaml + configs/groups/<group>.yaml:
+#   groups.<g>.{host,donor,interp_alpha} / paths.work / paths.merged_models
+#   merge.mode / target / gate / alpha / identity_mapping / rank (组 yaml 可覆盖)
 #
 # 用法:
 #   bash merge/rapt/merge/run_stage3.sh --group g1
@@ -20,24 +19,23 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-ROOT=$(cd "${HERE}/../../.." &>/dev/null && pwd)
-CFG_FILE=${RAPT_CONFIG:-"${ROOT}/merge/rapt/config.yaml"}
-CFG_PY="${HERE}/../tools/cfg.py"
+source "${HERE}/../tools/cfg_bootstrap.sh" "$@"
 
-BOOT_PY=${PY:-python3}
-PY=${PY:-$("$BOOT_PY" "$CFG_PY" --get paths.python 2>/dev/null || echo python3)}
-[ -x "$PY" ] || PY=python3
-eval "$("$PY" "$CFG_PY" --shell "$CFG_FILE")" || { echo "[ERROR] 读取配置失败: $CFG_FILE" >&2; exit 1; }
-
-GROUP=${GROUP:-g1}
+GROUP=${GROUP:-${CFG_GROUP_ARG:-g1}}
+GROUP_NAME=${CFG_GROUP:-$GROUP}
 DM=${DM:-"${ROOT}/${CFG_paths_models}"}
-RANK=${RANK:-$CFG_merge_rank}
+CFG_GET_GROUP() {  # <field>
+  "$PY" "$CFG_PY" --file "$CFG_FILE" "${GROUP_ARGS[@]}" --get "groups.${GROUP_NAME}.$1" 2>/dev/null || true
+}
+RANK=${RANK:-$(CFG_GET_GROUP rank)}
+[ -n "$RANK" ] || RANK=$CFG_merge_rank
 MODE=${MODE:-$CFG_merge_mode}
 INJECTION=${INJECTION:-}
 TARGET=${TARGET:-$CFG_merge_target}
 GATE=${GATE:-$CFG_merge_gate}
 ALPHA=${ALPHA:-$CFG_merge_alpha}
-IA=${IA:-$CFG_merge_interp_alpha}
+IA=${IA:-$(CFG_GET_GROUP interp_alpha)}
+[ -n "$IA" ] || IA=$CFG_merge_interp_alpha
 BUDGET=${BUDGET:-}
 INJECT_BUDGET=${INJECT_BUDGET:-}
 TAG_SUFFIX=${TAG_SUFFIX:-}
@@ -106,17 +104,16 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$HOST" ] || [ -z "$DONOR" ]; then
-  HOST_NAME=$("$PY" "$CFG_PY" --get "groups.${GROUP}.host" 2>/dev/null || true)
-  DONOR_NAME=$("$PY" "$CFG_PY" --get "groups.${GROUP}.donor" 2>/dev/null || true)
+  HOST_NAME=$(CFG_GET_GROUP host)
+  DONOR_NAME=$(CFG_GET_GROUP donor)
   [ -n "$HOST_NAME" ] && [ -n "$DONOR_NAME" ] || {
-    echo "[ERROR] config 中不存在 groups.${GROUP}" >&2; exit 1; }
+    echo "[ERROR] 未找到模型组 '$GROUP' (配置目录: merge/rapt/configs/groups/)" >&2; exit 1; }
   HOST=${HOST:-"$DM/$HOST_NAME"}
   DONOR=${DONOR:-"$DM/$DONOR_NAME"}
 fi
 for d in "$HOST" "$DONOR"; do
   [ -d "$d" ] || { echo "[ERROR] 模型目录不存在: $d" >&2; exit 1; }
 done
-[ -d "$WORK" ] || { echo "[ERROR] 缓存目录不存在: $WORK (先跑 run_stage1.sh / run_stage2.sh)" >&2; exit 1; }
 mkdir -p "$OUT"
 
 # TA 分支: 注入基 = donor 的 τ 分解, host τ 仅用于门控/诊断
@@ -128,9 +125,6 @@ else
   DONOR_SUBS="$WORK/stage1_B_r${RANK}_tau.pt"
 fi
 STAGE2="$WORK/stage2_dual_r${RANK}_tau${CFG_merge_stage2_tau}_ta.pt"
-for f in "$BASE_SUBS" "$DONOR_SUBS" "$STAGE2"; do
-  [ -f "$f" ] || { echo "[ERROR] 缺少缓存: $f" >&2; exit 1; }
-done
 
 ARGS=(
   --base-model "$HOST"
@@ -150,7 +144,7 @@ ARGS=(
 [ "$NO_PROGRESS" = "1" ] && ARGS+=(--no-progress)
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "[DRY_RUN] Stage-3 group=${GROUP} config=${CFG_FILE}"
+  echo "[DRY_RUN] Stage-3 group=${GROUP_NAME:-$GROUP} config=${CFG_FILE}"
   echo "  host=$HOST  donor=$DONOR  work=$WORK"
   echo "  mode=$MODE target=$TARGET gate=$GATE alpha=$ALPHA interp_alpha=$IA"
   echo "  identity_mapping=$IDENTITY_MAPPING  subs_a_side=$SUBS_A_SIDE"
@@ -159,8 +153,13 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
   exit 0
 fi
 
+[ -d "$WORK" ] || { echo "[ERROR] 缓存目录不存在: $WORK (先跑 run_stage1.sh / run_stage2.sh)" >&2; exit 1; }
+for f in "$BASE_SUBS" "$DONOR_SUBS" "$STAGE2"; do
+  [ -f "$f" ] || { echo "[ERROR] 缺少缓存: $f" >&2; exit 1; }
+done
+
 echo "=============================================="
-echo "  RAPT Stage-3  group=${GROUP}  config=${CFG_FILE}"
+echo "  RAPT Stage-3  group=${GROUP_NAME:-$GROUP}  config=${CFG_FILE}"
 echo "  mode=${MODE} target=${TARGET} gate=${GATE}"
 echo "  alpha=${ALPHA} interp_alpha=${IA} rank=${RANK}"
 echo "  host=$(basename "$HOST")  donor=$(basename "$DONOR")"

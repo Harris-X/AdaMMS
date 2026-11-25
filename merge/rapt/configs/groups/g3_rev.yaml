@@ -1,0 +1,13 @@
+# 模型组配置: g3_rev (mPLUG-Owl2 骨架, 吸收 LLaVA-v1.5)
+name: g3_rev
+description: "mplug-owl2-llama2-7b <- llava-v1.5-7b (跨架构; 共同语言基座 Llama-2/Vicuna)"
+status: ready
+
+family: mplug
+anchor: Llama-2-7b-hf
+host: mplug-owl2-llama2-7b
+donor: llava-v1.5-7b
+
+interp_alpha: 0.1
+mrc_interp_alpha: 0.3
+backend: ta_hyb

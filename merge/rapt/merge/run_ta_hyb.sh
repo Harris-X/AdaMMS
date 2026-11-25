@@ -22,16 +22,10 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-ROOT=$(cd "${HERE}/../../.." &>/dev/null && pwd)
-CFG_FILE=${RAPT_CONFIG:-"${ROOT}/merge/rapt/config.yaml"}
-CFG_PY="${HERE}/../tools/cfg.py"
+source "${HERE}/../tools/cfg_bootstrap.sh" "$@"
 
-BOOT_PY=${PY:-python3}
-PY=${PY:-$("$BOOT_PY" "$CFG_PY" --get paths.python 2>/dev/null || echo python3)}
-[ -x "$PY" ] || PY=python3
-eval "$("$PY" "$CFG_PY" --shell "$CFG_FILE")" || { echo "[ERROR] 读取配置失败: $CFG_FILE" >&2; exit 1; }
-
-GROUP=${GROUP:-g1}
+GROUP=${GROUP:-${CFG_GROUP_ARG:-g1}}
+GROUP_NAME=${CFG_GROUP:-$GROUP}
 RANK=${RANK:-$CFG_merge_rank}
 ALPHA=${ALPHA:-$CFG_merge_alpha}
 TAG_SUFFIX=${TAG_SUFFIX:-}
@@ -51,8 +45,8 @@ fi
 usage() {
   cat <<EOF
 用法: bash merge/rapt/merge/run_ta_hyb.sh [选项]
-  --group STR         g1 | g3_fwd | g3_rev (默认: g1)
-  --anchor PATH       预训练锚点 W_0 (默认取 config groups.<g>.anchor)
+  --group STR         组名 (g1/g3_fwd/...) 或组 YAML 路径 (默认: g1)
+  --anchor PATH       预训练锚点 W_0 (默认取组配置 anchor)
   --host PATH         host 模型目录    (默认取 config groups.<g>.host)
   --donor PATH        donor 模型目录   (默认取 config groups.<g>.donor)
   --output DIR        产物根目录 (默认: merge/rapt/merged_models/<group>)
@@ -96,23 +90,43 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# 组预设: 唯一来源 = config.yaml
-ANCHOR_NAME=$("$PY" "$CFG_PY" --get "groups.${GROUP}.anchor" 2>/dev/null || true)
-HOST_NAME=$("$PY" "$CFG_PY" --get "groups.${GROUP}.host" 2>/dev/null || true)
-DONOR_NAME=$("$PY" "$CFG_PY" --get "groups.${GROUP}.donor" 2>/dev/null || true)
+# 组预设: 唯一来源 = configs/groups/<group>.yaml (经 cfg.py 合并后注入 groups.<name>)
+CFG_GET_GROUP() {  # <field>
+  "$PY" "$CFG_PY" --file "$CFG_FILE" "${GROUP_ARGS[@]}" --get "groups.${GROUP_NAME}.$1" 2>/dev/null || true
+}
+ANCHOR_NAME=$(CFG_GET_GROUP anchor)
+HOST_NAME=$(CFG_GET_GROUP host)
+DONOR_NAME=$(CFG_GET_GROUP donor)
 [ -n "$ANCHOR_NAME" ] && [ -n "$HOST_NAME" ] && [ -n "$DONOR_NAME" ] || {
-  echo "[ERROR] config 中不存在 groups.${GROUP} (仅支持 g1 | g3_fwd | g3_rev)" >&2; exit 1;
+  echo "[ERROR] 未找到模型组 '$GROUP' 的 anchor/host/donor" >&2
+  echo "        期望配置文件: $(cfg 提示 2>/dev/null || true) merge/rapt/configs/groups/<name>.yaml" >&2
+  echo "        可用组: $("$PY" "$CFG_PY" --file "$CFG_FILE" --list-groups | tail -n +2 | awk '{print $1}' | tr '\n' ' ')" >&2
+  exit 1;
 }
 ANCHOR=${ANCHOR:-"$DM/$ANCHOR_NAME"}
 HOST=${HOST:-"$DM/$HOST_NAME"}
 DONOR=${DONOR:-"$DM/$DONOR_NAME"}
-OUT=${OUT:-"$OUT_ROOT/$GROUP"}
+OUT=${OUT:-"$OUT_ROOT/$GROUP_NAME"}
 
-# ia: TA_hyb 用 merge.interp_alpha; MRC(ortho) 用 merge.mrc_interp_alpha.<group>
+GROUP_BACKEND=$(CFG_GET_GROUP backend)
+if [ "$GROUP_BACKEND" = "pipeline" ]; then
+  echo "[ERROR] 组 '$GROUP_NAME' 配置为 backend=pipeline, 不能走 TA_hyb 单文件入口。" >&2
+  echo "        请用: bash merge/rapt/merge/run_merge_all.sh --group ${CFG_GROUP_ARG:-$GROUP_NAME}" >&2
+  echo "        或:   bash merge/rapt/merge/run_stage1.sh --group ... && run_stage2.sh && run_stage3.sh" >&2
+  exit 1
+fi
+GROUP_STATUS=$(CFG_GET_GROUP status)
+if [ -n "$GROUP_STATUS" ] && [ "$GROUP_STATUS" != "ready" ] && [ "${ALLOW_UNREADY:-0}" != "1" ]; then
+  echo "[WARN] 组 '$GROUP_NAME' status=$GROUP_STATUS (非 ready): 结果可能只覆盖命名/形状匹配的模块。" >&2
+  echo "       如需强制运行: ALLOW_UNREADY=1 ..." >&2
+fi
+
+# ia: 优先取组配置; TA_hyb 用 interp_alpha, MRC(ortho) 用 mrc_interp_alpha
 if [ -z "$IA" ]; then
   if [ "$ORTHO_SCALE" = "1" ]; then
-    IA=$("$PY" "$CFG_PY" --get "merge.mrc_interp_alpha.${GROUP}" 2>/dev/null || true)
+    IA=$(CFG_GET_GROUP mrc_interp_alpha)
   fi
+  [ -n "$IA" ] || IA=$(CFG_GET_GROUP interp_alpha)
   [ -n "$IA" ] || IA=$CFG_merge_interp_alpha
 fi
 
@@ -136,7 +150,7 @@ ARGS=(
 [ "$NO_PROGRESS" = "1" ] && ARGS+=(--no-progress)
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "[DRY_RUN] TA_hyb  group=${GROUP}  config=${CFG_FILE}"
+  echo "[DRY_RUN] TA_hyb  group=${GROUP_NAME}  config=${CFG_FILE}"
   echo "  anchor=$ANCHOR"
   echo "  host  =$HOST"
   echo "  donor =$DONOR"

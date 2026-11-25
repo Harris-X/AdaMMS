@@ -46,9 +46,9 @@ fi
 usage() {
   cat <<EOF
 用法: bash merge/rapt/eval/run_base_and_merged.sh [选项]
-  --group STR    g1 | g3_fwd | g3_rev           (默认: g1)
+  --group STR    组名 (g1/g3_fwd/...) 或组 YAML 路径 (默认: g1)
   --merged PATH  merged 模型目录 (必填)
-  --base PATH    base 模型目录 (默认 = config 的 groups.<group>.host)
+  --base PATH    base 模型目录 (默认 = 组配置的 host)
   --evals STR    "lmms" | "vlmeval" | "lmms vlmeval"
   --tag STR      输出目录前缀 (默认 = group)
   --gpu ID       显卡编号 (默认取 config)
@@ -72,15 +72,15 @@ done
 [ -n "$MERGED" ] || { echo "[ERROR] --merged 为必填" >&2; usage; exit 1; }
 [ -d "$MERGED" ] || { echo "[ERROR] merged 目录不存在: $MERGED" >&2; exit 1; }
 
-# base = 该组的 host (config 唯一来源)
-HOST_NAME=$("$PY" "$CFG_PY" --get "groups.${GROUP}.host" 2>/dev/null || true)
-[ -n "$HOST_NAME" ] || { echo "[ERROR] config 中不存在 groups.${GROUP}.host" >&2; exit 1; }
+# base = 该组的 host (组配置文件唯一来源)
+HOST_NAME=$("$PY" "$CFG_PY" --file "$CFG_FILE" "${GROUP_ARGS[@]}" --get "groups.${GROUP_NAME}.host" 2>/dev/null || true)
+[ -n "$HOST_NAME" ] || { echo "[ERROR] 未找到模型组 '$GROUP' 的 host" >&2; exit 1; }
 BASE=${BASE:-"$DM/$HOST_NAME"}
 [ -d "$BASE" ] || { echo "[ERROR] base 目录不存在: $BASE" >&2; exit 1; }
 
 echo "================================================================"
-echo "  配对评测 group=$GROUP  tag=$PAIR_TAG  evals='$EVALS'  gpu=$GPU"
-echo "  config=$CFG_FILE  sha=$("$PY" "$CFG_PY" --sha256 "$CFG_FILE" | cut -c1-12)"
+echo "  配对评测 group=$GROUP_NAME  tag=$PAIR_TAG  evals='$EVALS'  gpu=$GPU"
+echo "  config=$CFG_FILE  sha=${CFG_SHA:0:12}"
 echo "  base  =$BASE"
 echo "  merged=$MERGED"
 echo "  (base/merged 均从同一 config 读取超参, 无任何角色相关分支)"
